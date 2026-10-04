@@ -2,11 +2,13 @@ package com.realzza.biliaccelerator.hook
 
 import android.app.AndroidAppHelper
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import com.google.gson.Gson
 import com.realzza.biliaccelerator.core.AcceleratorConfig
 import com.realzza.biliaccelerator.core.RewriteResult
 import com.realzza.biliaccelerator.provider.StatsProvider
+import com.realzza.biliaccelerator.receiver.StatsReceiver
 import de.robv.android.xposed.XSharedPreferences
 import de.robv.android.xposed.XposedBridge
 import java.util.concurrent.Executors
@@ -117,9 +119,13 @@ object RemoteClient {
                 XposedBridge.log("$TAG: 统计上报失败：目标进程 Context 为空（Application 未捕获且 AndroidAppHelper 不可用）")
                 return@execute
             }
+            val json = gson.toJson(result)
+            var reported = false
+
+            // 1. 优先尝试 ContentProvider IPC
             try {
                 val extras = Bundle().apply {
-                    putString(StatsProvider.EXTRA_REWRITE_RESULT, gson.toJson(result))
+                    putString(StatsProvider.EXTRA_REWRITE_RESULT, json)
                 }
                 val response = context.contentResolver.call(
                     StatsProvider.CONTENT_URI,
@@ -127,13 +133,26 @@ object RemoteClient {
                     null,
                     extras
                 )
-                val ok = response?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true
-                XposedBridge.log("$TAG: 统计上报 ${result.originalHost} -> ${result.targetHost} [${result.reason}] success=$ok")
+                if (response?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true) {
+                    reported = true
+                    XposedBridge.log("$TAG: [Provider] 统计上报成功: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
+                }
             } catch (t: Throwable) {
-                if (t is IllegalArgumentException && t.message?.contains("Unknown authority") == true) {
-                    XposedBridge.log("$TAG: 统计上报失败: Provider 暂不可达 [Unknown authority]。请确保 BiliAccelerator 模块安装后已在桌面点击打开过至少一次（退出系统 Stopped 状态）")
-                } else {
-                    XposedBridge.log("$TAG: 统计上报异常: $t")
+                XposedBridge.log("$TAG: [Provider] 暂不可达: ${t.javaClass.simpleName} (${t.message})")
+            }
+
+            // 2. 兜底通道：若 Provider 不可达（如高版本 Android 包可见性拦截），发送带唤醒标志的显式广播
+            if (!reported) {
+                try {
+                    val intent = Intent(StatsReceiver.ACTION_RECORD_REWRITE).apply {
+                        setPackage("com.realzza.biliaccelerator")
+                        addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                        putExtra(StatsReceiver.EXTRA_REWRITE_RESULT, json)
+                    }
+                    context.sendBroadcast(intent)
+                    XposedBridge.log("$TAG: [Broadcast] 备用通道已发送: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
+                } catch (t: Throwable) {
+                    XposedBridge.log("$TAG: [Broadcast] 发送异常: $t")
                 }
             }
         }

@@ -63,6 +63,15 @@
             android:authorities="com.realzza.biliaccelerator.provider"
             android:exported="true" />
 
+        <!-- Fallback Broadcast Receiver for Cross-Process Stats -->
+        <receiver
+            android:name=".receiver.StatsReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.realzza.biliaccelerator.ACTION_RECORD_REWRITE" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

@@ -57,6 +57,18 @@ class MainActivity : AppCompatActivity() {
         refreshStats()
         refreshHandler.removeCallbacks(refreshRunnable)
         refreshHandler.postDelayed(refreshRunnable, 2000L)
+        pingTargetAppsForImplicitAccess()
+    }
+
+    private fun pingTargetAppsForImplicitAccess() {
+        for (pkg in com.realzza.biliaccelerator.core.BiliAcceleratorCore.TARGET_PACKAGES) {
+            try {
+                val pingIntent = android.content.Intent("com.realzza.biliaccelerator.ACTION_PING").apply {
+                    setPackage(pkg)
+                }
+                sendBroadcast(pingIntent)
+            } catch (_: Throwable) {}
+        }
     }
 
     override fun onPause() {
