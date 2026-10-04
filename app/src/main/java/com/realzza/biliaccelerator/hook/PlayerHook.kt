@@ -134,8 +134,6 @@ object PlayerHook {
             param.args[strIndex] = result.finalUrl
             RemoteClient.notifyRewrite(result)
             XposedBridge.log("$TAG: Rewrote media url: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
-        } else {
-            XposedBridge.log("$TAG: 捕获到媒体流无需重定向: ${result.originalHost} [原因: ${result.reason}]")
         }
     }
 
@@ -155,8 +153,6 @@ object PlayerHook {
                         param.args[0] = result.finalUrl
                         RemoteClient.notifyRewrite(result)
                         XposedBridge.log("$TAG: Rewrote IjkMediaPlayer dataSource: ${result.originalHost} -> ${result.targetHost}")
-                    } else {
-                        XposedBridge.log("$TAG: 捕获到 IjkMediaPlayer 媒体流无需重定向: ${result.originalHost} [原因: ${result.reason}]")
                     }
                 }
             })
@@ -179,8 +175,6 @@ object PlayerHook {
                             param.args[1] = android.net.Uri.parse(result.finalUrl)
                             RemoteClient.notifyRewrite(result)
                             XposedBridge.log("$TAG: Rewrote IjkMediaPlayer Uri dataSource: ${result.originalHost} -> ${result.targetHost}")
-                        } else {
-                            XposedBridge.log("$TAG: 捕获到 IjkMediaPlayer Uri 媒体流无需重定向: ${result.originalHost} [原因: ${result.reason}]")
                         }
                     }
                 })
