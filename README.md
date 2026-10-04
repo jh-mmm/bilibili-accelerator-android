@@ -66,7 +66,6 @@
 3. 或者在终端运行以下命令：
    ```bash
    ./gradlew assembleDebug
-
 ```
 
 4. 编译成功后，在 `app/build/outputs/apk/debug/` 目录下获取 `app-debug.apk` 并安装。
