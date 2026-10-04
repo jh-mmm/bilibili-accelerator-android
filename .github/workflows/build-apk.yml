@@ -7,6 +7,10 @@ on:
       - master
     tags:
       - 'v*'
+    paths-ignore:
+      - '**.md'      # 忽略所有 markdown 文件的更改
+      - 'LICENSE'    # 忽略许可文件的更改
+      - 'docs/**'    # 忽略文档目录
   pull_request:
     branches:
       - main
