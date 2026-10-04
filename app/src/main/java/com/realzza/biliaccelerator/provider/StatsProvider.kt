@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
 import android.os.Process
+import android.util.Log
 import com.google.gson.Gson
 import com.realzza.biliaccelerator.core.AcceleratorConfig
 import com.realzza.biliaccelerator.core.BiliAcceleratorCore
@@ -38,6 +39,13 @@ class StatsProvider : ContentProvider() {
         const val EXTRA_SUCCESS = "success"
 
         private val gson = Gson()
+
+        private fun log(msg: String) {
+            Log.i("BiliAccelerator-Stats", msg)
+            try {
+                de.robv.android.xposed.XposedBridge.log("BiliAccelerator-Stats: $msg")
+            } catch (_: Throwable) {}
+        }
 
         fun loadConfig(context: android.content.Context): AcceleratorConfig {
             val sp = context.getSharedPreferences(PREFS_CONFIG, android.content.Context.MODE_PRIVATE)
@@ -72,7 +80,11 @@ class StatsProvider : ContentProvider() {
     }
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
-        val ctx = context ?: return null
+        val ctx = context
+        if (ctx == null) {
+            log("调用失败：Provider Context 为空 (method=$method)")
+            return null
+        }
 
         // 校验调用方 UID，仅允许模块自身与目标 B 站应用访问
         val uid = Binder.getCallingUid()
@@ -94,6 +106,7 @@ class StatsProvider : ContentProvider() {
                     }
                 }
                 if (!matchesTargetUid) {
+                    log("拒绝调用：method=$method uid=$uid pkgs=${pkgs.joinToString()}")
                     return null
                 }
             }
@@ -108,10 +121,15 @@ class StatsProvider : ContentProvider() {
                     try {
                         val result = gson.fromJson(json, RewriteResult::class.java)
                         StatsManager.recordRequest(result, ctx)
-                        response.putBoolean("success", true)
+                        response.putBoolean(EXTRA_SUCCESS, true)
+                        log("已记录重定向：${result.originalHost} -> ${result.targetHost} [${result.reason}] (来自 uid=$uid)")
                     } catch (e: Exception) {
-                        response.putBoolean("success", false)
+                        response.putBoolean(EXTRA_SUCCESS, false)
+                        log("记录重定向失败：$e")
                     }
+                } else {
+                    response.putBoolean(EXTRA_SUCCESS, false)
+                    log("记录重定向失败：extras 为空 (来自 uid=$uid)")
                 }
             }
             METHOD_GET_STATS -> {

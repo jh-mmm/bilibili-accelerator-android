@@ -130,8 +130,7 @@ object BiliAcceleratorCore {
         return h.endsWith(".bilivideo.com") ||
                 h.endsWith(".bilivideo.cn") ||
                 h.endsWith(".bilivideo.net") ||
-                h.endsWith(".akamaized.net") ||
-                h.endsWith(".bstarstatic.com")
+                h.endsWith(".akamaized.net")
     }
 
     data class ParsedUri(
@@ -287,9 +286,10 @@ object BiliAcceleratorCore {
 
         // 3. PCDN 拦截 / Force 模式统一重定向到优质 UPOS 镜像
         val isAkamai = hostname.endsWith(".akamaized.net", ignoreCase = true)
+        val isBstar = hostname.endsWith(".bstarstatic.com", ignoreCase = true)
         val shouldRewrite = (isPcdn && config.blockPcdn) ||
                 (isMcdn && !config.proxyMcdn) ||
-                (config.forceUpos && isBiliCdnHost(hostname) && !isAkamai)
+                (config.forceUpos && isBiliCdnHost(hostname) && !isAkamai && !isBstar)
 
         if (shouldRewrite) {
             val cleanedTarget = cleanHost(config.targetHost)

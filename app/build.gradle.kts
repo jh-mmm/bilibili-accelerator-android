@@ -11,27 +11,43 @@ android {
         applicationId = "com.realzza.biliaccelerator"
         minSdk = 26
         targetSdk = 34
-        versionCode = 101
-        versionName = "1.0.1"
+        versionCode = 102
+        versionName = "1.0.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    val defaultSigningKeystore = file("signing/release.jks")
+
     val releaseSigningConfig = signingConfigs.create("release") {
-        val keystorePath = System.getenv("KEYSTORE_FILE")
-        val keystorePassword = System.getenv("KEYSTORE_PASSWORD")
-        val keyAlias = System.getenv("KEY_ALIAS")
-        val keyPassword = System.getenv("KEY_PASSWORD")
+        val envKeystorePath = System.getenv("KEYSTORE_FILE")
+        val envKeystorePassword = System.getenv("KEYSTORE_PASSWORD")
+        val envKeyAlias = System.getenv("KEY_ALIAS")
+        val envKeyPassword = System.getenv("KEY_PASSWORD")
 
-        val keystoreFile = if (!keystorePath.isNullOrBlank()) file(keystorePath) else null
+        val customKeystore = if (!envKeystorePath.isNullOrBlank()) file(envKeystorePath) else null
 
-        if (keystoreFile != null && keystoreFile.exists() && keystoreFile.length() > 0L &&
-            !keystorePassword.isNullOrBlank() && !keyAlias.isNullOrBlank()
+        if (customKeystore != null && customKeystore.exists() && customKeystore.length() > 0L &&
+            !envKeystorePassword.isNullOrBlank() && !envKeyAlias.isNullOrBlank()
         ) {
-            storeFile = keystoreFile
-            storePassword = keystorePassword
-            this.keyAlias = keyAlias
-            this.keyPassword = if (!keyPassword.isNullOrBlank()) keyPassword else keystorePassword
+            storeFile = customKeystore
+            storePassword = envKeystorePassword
+            keyAlias = envKeyAlias
+            keyPassword = if (!envKeyPassword.isNullOrBlank()) envKeyPassword else envKeystorePassword
+        } else if (defaultSigningKeystore.exists() && defaultSigningKeystore.length() > 0L) {
+            storeFile = defaultSigningKeystore
+            storePassword = "biliaccelerator"
+            keyAlias = "biliaccelerator"
+            keyPassword = "biliaccelerator"
+        }
+    }
+
+    signingConfigs.getByName("debug") {
+        if (defaultSigningKeystore.exists() && defaultSigningKeystore.length() > 0L) {
+            storeFile = defaultSigningKeystore
+            storePassword = "biliaccelerator"
+            keyAlias = "biliaccelerator"
+            keyPassword = "biliaccelerator"
         }
     }
 

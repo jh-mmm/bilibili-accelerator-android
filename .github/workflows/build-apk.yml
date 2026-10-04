@@ -5,6 +5,8 @@ on:
     branches:
       - main
       - master
+      - 'fix/**'
+      - 'feature/**'
     tags:
       - 'v*'
     paths-ignore:
@@ -43,12 +45,14 @@ jobs:
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
             echo "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > app/release.jks 2>/dev/null || true
-            if [ ! -s app/release.jks ]; then
-              echo "::warning::release.jks is empty or decoding failed; removing file to use debug signing fallback"
-              rm -f app/release.jks
+            if [ -s app/release.jks ]; then
+              echo "Successfully decoded release.jks from GitHub Secrets ($(wc -c < app/release.jks) bytes)"
             else
-              echo "Successfully decoded release.jks ($(wc -c < app/release.jks) bytes)"
+              echo "::error::Failed to decode release.jks from KEYSTORE_BASE64 secret"
+              exit 1
             fi
+          else
+            echo "::warning::KEYSTORE_BASE64 is not set; falling back to debug signing"
           fi
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}

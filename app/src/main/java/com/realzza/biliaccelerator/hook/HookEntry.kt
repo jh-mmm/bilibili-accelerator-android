@@ -1,8 +1,10 @@
 package com.realzza.biliaccelerator.hook
 
+import android.content.Context
 import com.realzza.biliaccelerator.core.BiliAcceleratorCore
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
+import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XC_MethodReplacement
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -43,11 +45,45 @@ class HookEntry : IXposedHookLoadPackage {
 
             XposedBridge.log("BiliAccelerator: Injecting into ${lpparam.packageName} (process: $proc)")
 
+            // 尽早捕获 Application 实例，供统计上报（跨进程 ContentProvider 调用）使用
+            captureApplicationContext(lpparam.classLoader)
+
             // Media Player Hook
             PlayerHook.init(lpparam.classLoader)
 
             // gRPC Protocol Hook
             MossGrpcHook.init(lpparam.classLoader)
         }
+    }
+
+    private fun captureApplicationContext(classLoader: ClassLoader) {
+        // Application.attach(Context) 由框架调用且应用无法覆写，是最可靠的捕获点
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.app.Application",
+                classLoader,
+                "attach",
+                Context::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        (param.thisObject as? Context)?.let { RemoteClient.setAppContext(it) }
+                    }
+                }
+            )
+        } catch (_: Throwable) {}
+
+        // 兜底：部分 ROM 的 attach 签名有差异时改用 onCreate
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.app.Application",
+                classLoader,
+                "onCreate",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        (param.thisObject as? Context)?.let { RemoteClient.setAppContext(it) }
+                    }
+                }
+            )
+        } catch (_: Throwable) {}
     }
 }

@@ -132,4 +132,13 @@ class BiliAcceleratorCoreTest {
         assertTrue(BiliAcceleratorCore.hasMediaSignal("http://unknown.com/upgcxcode/123"))
         assertFalse(BiliAcceleratorCore.hasMediaSignal("http://api.bilibili.com/x/v2/reply"))
     }
+
+    @Test
+    fun testBstarOverseasNotRewrittenInForceMode() {
+        val bstarUrl = "https://video-sea.bstarstatic.com/upgcxcode/54/12/34567.m4s?sign=abc"
+        val forceConfig = defaultConfig.copy(forceUpos = true)
+        val result = BiliAcceleratorCore.rewriteUrl(bstarUrl, forceConfig)
+        assertFalse("Bstar overseas stream should not be rewritten to mainland UPOS in force mode", result.changed)
+        assertEquals("ok", result.reason)
+    }
 }

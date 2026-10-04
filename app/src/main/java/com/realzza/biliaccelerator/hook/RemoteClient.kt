@@ -8,11 +8,14 @@ import com.realzza.biliaccelerator.core.AcceleratorConfig
 import com.realzza.biliaccelerator.core.RewriteResult
 import com.realzza.biliaccelerator.provider.StatsProvider
 import de.robv.android.xposed.XSharedPreferences
+import de.robv.android.xposed.XposedBridge
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 object RemoteClient {
+
+    private const val TAG = "BiliAccelerator-Remote"
 
     private val gson = Gson()
     private val executor = Executors.newSingleThreadExecutor { runnable ->
@@ -44,7 +47,20 @@ object RemoteClient {
         }
     }
 
+    // 由 HookEntry 在目标进程 Application 创建时注入，作为最可靠的 Context 来源
+    @Volatile
+    private var appContext: Context? = null
+
+    fun setAppContext(context: Context) {
+        appContext = try {
+            context.applicationContext ?: context
+        } catch (_: Throwable) {
+            context
+        }
+    }
+
     fun getContext(): Context? {
+        appContext?.let { return it }
         return try {
             AndroidAppHelper.currentApplication()
         } catch (_: Throwable) {
@@ -66,6 +82,7 @@ object RemoteClient {
                 try {
                     val context = getContext()
                     if (context == null) {
+                        XposedBridge.log("$TAG: 配置拉取跳过：目标进程 Context 为空")
                         lastConfigFetchTime.set(System.currentTimeMillis() - CONFIG_CACHE_TTL + 5_000L)
                         return@execute
                     }
@@ -95,18 +112,26 @@ object RemoteClient {
 
     fun notifyRewrite(result: RewriteResult) {
         executor.execute {
-            val context = getContext() ?: return@execute
+            val context = getContext()
+            if (context == null) {
+                XposedBridge.log("$TAG: 统计上报失败：目标进程 Context 为空（Application 未捕获且 AndroidAppHelper 不可用）")
+                return@execute
+            }
             try {
                 val extras = Bundle().apply {
                     putString(StatsProvider.EXTRA_REWRITE_RESULT, gson.toJson(result))
                 }
-                context.contentResolver.call(
+                val response = context.contentResolver.call(
                     StatsProvider.CONTENT_URI,
                     StatsProvider.METHOD_RECORD_REWRITE,
                     null,
                     extras
                 )
-            } catch (_: Throwable) {}
+                val ok = response?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true
+                XposedBridge.log("$TAG: 统计上报 ${result.originalHost} -> ${result.targetHost} [${result.reason}] success=$ok")
+            } catch (t: Throwable) {
+                XposedBridge.log("$TAG: 统计上报异常: $t")
+            }
         }
     }
 }
