@@ -130,7 +130,11 @@ object RemoteClient {
                 val ok = response?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true
                 XposedBridge.log("$TAG: 统计上报 ${result.originalHost} -> ${result.targetHost} [${result.reason}] success=$ok")
             } catch (t: Throwable) {
-                XposedBridge.log("$TAG: 统计上报异常: $t")
+                if (t is IllegalArgumentException && t.message?.contains("Unknown authority") == true) {
+                    XposedBridge.log("$TAG: 统计上报失败: Provider 暂不可达 [Unknown authority]。请确保 BiliAccelerator 模块安装后已在桌面点击打开过至少一次（退出系统 Stopped 状态）")
+                } else {
+                    XposedBridge.log("$TAG: 统计上报异常: $t")
+                }
             }
         }
     }
