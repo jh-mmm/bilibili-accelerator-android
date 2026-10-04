@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bili_blue">#00AEEC</color>
+    <color name="bili_pink">#FB7299</color>
+    <color name="background_light">#F6F7F9</color>
+    <color name="card_background">#FFFFFF</color>
+    <color name="text_primary">#18191C</color>
+    <color name="text_secondary">#61666D</color>
+    <color name="text_faint">#9499A0</color>
+    <color name="tag_pcdn">#E53935</color>
+    <color name="tag_mcdn">#FB8C00</color>
+    <color name="tag_upos">#43A047</color>
+    <color name="status_green">#2ECC71</color>
+    <color name="status_red">#E74C3C</color>
+</resources>

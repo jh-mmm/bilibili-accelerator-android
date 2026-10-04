@@ -1,0 +1,28 @@
+<resources>
+    <string name="app_name">Bili Accelerator</string>
+    <string name="xposed_description">Bilibili 视频加速与 PCDN 过滤模块，移植自 bilibili-accelerator</string>
+    <string name="title_statistics">拦截与加速统计</string>
+    <string name="stat_total_rewrites">总重定向次数</string>
+    <string name="stat_pcdn_blocked">PCDN 拦截次数</string>
+    <string name="stat_mcdn_proxied">MCDN 代理次数</string>
+    <string name="stat_avoided_hosts">已规避慢速节点数</string>
+    <string name="title_settings">线路与拦截设置</string>
+    <string name="label_module_enabled">总开关：启用视频加速与防卡顿</string>
+    <string name="label_target_host">首选 UPOS 镜像</string>
+    <string name="label_enable_pcdn_block">拦截 PCDN 节点</string>
+    <string name="label_enable_mcdn_proxy">MCDN 官方代理中继</string>
+    <string name="label_force_upos">全局强制统一 UPOS 线路</string>
+    <string name="label_port_heuristic">端口启发式拦截（非标端口视为 PCDN）</string>
+    <string name="title_recent_logs">近期加速拦截日志</string>
+    <string name="btn_clear_stats">清空统计</string>
+    <string name="btn_export_diag">复制诊断报告</string>
+    <string name="status_active">LSPosed 模块已激活</string>
+    <string name="status_inactive">模块未激活（请在 LSPosed 中勾选本模块与目标作用域并重启 B 站）</string>
+    <string name="status_badge_inactive">未激活</string>
+    <string name="dialog_clear_title">确认清空</string>
+    <string name="dialog_clear_message">确定要清空当前的拦截与重定向统计数据吗？</string>
+    <string name="dialog_confirm">清空</string>
+    <string name="dialog_cancel">取消</string>
+    <string name="toast_stats_cleared">统计数据已清空</string>
+    <string name="toast_diag_copied">诊断报告已复制到剪贴板！</string>
+</resources>

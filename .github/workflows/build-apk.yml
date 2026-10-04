@@ -1,0 +1,99 @@
+name: Build & Release APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x gradlew
+
+      - name: Setup Release Keystore
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > app/release.jks 2>/dev/null || true
+            if [ ! -s app/release.jks ]; then
+              echo "::warning::release.jks is empty or decoding failed; removing file to use debug signing fallback"
+              rm -f app/release.jks
+            else
+              echo "Successfully decoded release.jks ($(wc -c < app/release.jks) bytes)"
+            fi
+          fi
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+
+      - name: Run Unit Tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Build Release APK
+        run: ./gradlew assembleRelease --stacktrace
+        env:
+          KEYSTORE_FILE: release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Prepare APK Artifacts
+        id: prepare_artifact
+        run: |
+          mkdir -p outputs
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          VERSION_TAG="${{ github.ref_name }}"
+          if [[ "$VERSION_TAG" == v* ]]; then
+            NAME="BiliAccelerator-${VERSION_TAG}.apk"
+          else
+            NAME="BiliAccelerator-${SHORT_SHA}.apk"
+          fi
+          APK_FILE=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$APK_FILE" ]; then
+            echo "Error: No release APK found in app/build/outputs/apk/release"
+            exit 1
+          fi
+          cp "$APK_FILE" "outputs/${NAME}"
+          echo "artifact_name=${NAME}" >> $GITHUB_OUTPUT
+          echo "Generated APK: outputs/${NAME}"
+
+      - name: Upload APK to Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare_artifact.outputs.artifact_name }}
+          path: outputs/*.apk
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: outputs/*.apk
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

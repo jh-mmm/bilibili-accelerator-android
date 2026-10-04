@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Android 11+ (API 30+) Package Visibility Declaration -->
+    <queries>
+        <package android:name="tv.danmaku.bili" />
+        <package android:name="com.bilibili.app.in" />
+        <package android:name="com.bstar.intl" />
+        <package android:name="tv.danmaku.bilipr" />
+        <package android:name="tv.danmaku.bilibilihd" />
+        <package android:name="com.bilibili.app.blue" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.BiliAccelerator">
+
+        <!-- Xposed Module Metadata -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="@string/xposed_description" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+
+        <!-- Main Dashboard Activity -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Cross-Process Statistics Content Provider -->
+        <provider
+            android:name=".provider.StatsProvider"
+            android:authorities="com.realzza.biliaccelerator.provider"
+            android:exported="true" />
+
+    </application>
+
+</manifest>
