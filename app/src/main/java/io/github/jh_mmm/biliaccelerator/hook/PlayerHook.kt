@@ -1,6 +1,6 @@
-package com.realzza.biliaccelerator.hook
+﻿package io.github.jh_mmm.biliaccelerator.hook
 
-import com.realzza.biliaccelerator.core.BiliAcceleratorCore
+import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers

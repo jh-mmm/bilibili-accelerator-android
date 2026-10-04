@@ -1,4 +1,4 @@
-package com.realzza.biliaccelerator.core
+﻿package io.github.jh_mmm.biliaccelerator.core
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse

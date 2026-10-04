@@ -47,8 +47,8 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="biliaccelerator.realzza.com" />
-                <data android:scheme="http" android:host="biliaccelerator.realzza.com" />
+                <data android:scheme="https" android:host="biliaccelerator.jh-mmm.github.io" />
+                <data android:scheme="http" android:host="biliaccelerator.jh-mmm.github.io" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
@@ -60,7 +60,7 @@
         <!-- Cross-Process Statistics Content Provider -->
         <provider
             android:name=".provider.StatsProvider"
-            android:authorities="com.realzza.biliaccelerator.provider"
+            android:authorities="io.github.jh_mmm.biliaccelerator.provider"
             android:exported="true" />
 
         <!-- Fallback Broadcast Receiver for Cross-Process Stats -->
@@ -68,7 +68,7 @@
             android:name=".receiver.StatsReceiver"
             android:exported="true">
             <intent-filter>
-                <action android:name="com.realzza.biliaccelerator.ACTION_RECORD_REWRITE" />
+                <action android:name="io.github.jh_mmm.biliaccelerator.ACTION_RECORD_REWRITE" />
             </intent-filter>
         </receiver>
 

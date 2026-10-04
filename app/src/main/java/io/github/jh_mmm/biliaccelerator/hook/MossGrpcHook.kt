@@ -1,4 +1,4 @@
-package com.realzza.biliaccelerator.hook
+﻿package io.github.jh_mmm.biliaccelerator.hook
 
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge

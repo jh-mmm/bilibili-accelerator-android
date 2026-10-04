@@ -1,14 +1,14 @@
-package com.realzza.biliaccelerator.hook
+﻿package io.github.jh_mmm.biliaccelerator.hook
 
 import android.app.AndroidAppHelper
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import com.google.gson.Gson
-import com.realzza.biliaccelerator.core.AcceleratorConfig
-import com.realzza.biliaccelerator.core.RewriteResult
-import com.realzza.biliaccelerator.provider.StatsProvider
-import com.realzza.biliaccelerator.receiver.StatsReceiver
+import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.RewriteResult
+import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
+import io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver
 import de.robv.android.xposed.XSharedPreferences
 import de.robv.android.xposed.XposedBridge
 import java.util.concurrent.Executors
@@ -32,7 +32,7 @@ object RemoteClient {
 
     private fun tryLoadXSharedPrefs(): AcceleratorConfig? {
         return try {
-            val xsp = XSharedPreferences("com.realzza.biliaccelerator", StatsProvider.PREFS_CONFIG)
+            val xsp = XSharedPreferences("io.github.jh_mmm.biliaccelerator", StatsProvider.PREFS_CONFIG)
             xsp.reload()
             if (xsp.file.canRead()) {
                 AcceleratorConfig(
@@ -145,7 +145,7 @@ object RemoteClient {
             if (!reported) {
                 try {
                     val intent = Intent(StatsReceiver.ACTION_RECORD_REWRITE).apply {
-                        setPackage("com.realzza.biliaccelerator")
+                        setPackage("io.github.jh_mmm.biliaccelerator")
                         addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
                         putExtra(StatsReceiver.EXTRA_REWRITE_RESULT, json)
                     }

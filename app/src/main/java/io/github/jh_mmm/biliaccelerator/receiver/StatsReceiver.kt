@@ -1,17 +1,17 @@
-package com.realzza.biliaccelerator.receiver
+﻿package io.github.jh_mmm.biliaccelerator.receiver
 
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
 import com.google.gson.Gson
-import com.realzza.biliaccelerator.core.RewriteResult
-import com.realzza.biliaccelerator.core.StatsManager
+import io.github.jh_mmm.biliaccelerator.core.RewriteResult
+import io.github.jh_mmm.biliaccelerator.core.StatsManager
 
 class StatsReceiver : BroadcastReceiver() {
 
     companion object {
-        const val ACTION_RECORD_REWRITE = "com.realzza.biliaccelerator.ACTION_RECORD_REWRITE"
+        const val ACTION_RECORD_REWRITE = "io.github.jh_mmm.biliaccelerator.ACTION_RECORD_REWRITE"
         const val EXTRA_REWRITE_RESULT = "extra_rewrite_result"
         private val gson = Gson()
     }

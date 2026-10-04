@@ -1,4 +1,4 @@
-package com.realzza.biliaccelerator.ui
+﻿package io.github.jh_mmm.biliaccelerator.ui
 
 import android.graphics.Color
 import android.view.LayoutInflater
@@ -6,8 +6,8 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
-import com.realzza.biliaccelerator.R
-import com.realzza.biliaccelerator.core.RewriteLogEntry
+import io.github.jh_mmm.biliaccelerator.R
+import io.github.jh_mmm.biliaccelerator.core.RewriteLogEntry
 
 class LogAdapter(private var logs: List<RewriteLogEntry>) : RecyclerView.Adapter<LogAdapter.LogViewHolder>() {
 

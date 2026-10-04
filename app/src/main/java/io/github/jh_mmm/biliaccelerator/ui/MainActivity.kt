@@ -1,4 +1,4 @@
-package com.realzza.biliaccelerator.ui
+﻿package io.github.jh_mmm.biliaccelerator.ui
 
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -15,11 +15,11 @@ import androidx.annotation.Keep
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
-import com.realzza.biliaccelerator.R
-import com.realzza.biliaccelerator.core.AcceleratorConfig
-import com.realzza.biliaccelerator.core.StatsManager
-import com.realzza.biliaccelerator.databinding.ActivityMainBinding
-import com.realzza.biliaccelerator.provider.StatsProvider
+import io.github.jh_mmm.biliaccelerator.R
+import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.StatsManager
+import io.github.jh_mmm.biliaccelerator.databinding.ActivityMainBinding
+import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
 
 class MainActivity : AppCompatActivity() {
 
@@ -61,9 +61,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun pingTargetAppsForImplicitAccess() {
-        for (pkg in com.realzza.biliaccelerator.core.BiliAcceleratorCore.TARGET_PACKAGES) {
+        for (pkg in io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.TARGET_PACKAGES) {
             try {
-                val pingIntent = android.content.Intent("com.realzza.biliaccelerator.ACTION_PING").apply {
+                val pingIntent = android.content.Intent("io.github.jh_mmm.biliaccelerator.ACTION_PING").apply {
                     setPackage(pkg)
                 }
                 sendBroadcast(pingIntent)

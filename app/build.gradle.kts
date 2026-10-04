@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.realzza.biliaccelerator"
+    namespace = "io.github.jh_mmm.biliaccelerator"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.realzza.biliaccelerator"
+        applicationId = "io.github.jh_mmm.biliaccelerator"
         minSdk = 26
         targetSdk = 34
         versionCode = 103

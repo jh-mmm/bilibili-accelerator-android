@@ -1,7 +1,7 @@
-package com.realzza.biliaccelerator.hook
+﻿package io.github.jh_mmm.biliaccelerator.hook
 
 import android.content.Context
-import com.realzza.biliaccelerator.core.BiliAcceleratorCore
+import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
@@ -13,7 +13,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 class HookEntry : IXposedHookLoadPackage {
 
     companion object {
-        private const val MODULE_PACKAGE = "com.realzza.biliaccelerator"
+        private const val MODULE_PACKAGE = "io.github.jh_mmm.biliaccelerator"
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {

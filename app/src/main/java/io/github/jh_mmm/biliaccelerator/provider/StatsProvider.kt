@@ -1,4 +1,4 @@
-package com.realzza.biliaccelerator.provider
+﻿package io.github.jh_mmm.biliaccelerator.provider
 
 import android.content.ContentProvider
 import android.content.ContentValues
@@ -9,15 +9,15 @@ import android.os.Bundle
 import android.os.Process
 import android.util.Log
 import com.google.gson.Gson
-import com.realzza.biliaccelerator.core.AcceleratorConfig
-import com.realzza.biliaccelerator.core.BiliAcceleratorCore
-import com.realzza.biliaccelerator.core.RewriteResult
-import com.realzza.biliaccelerator.core.StatsManager
+import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
+import io.github.jh_mmm.biliaccelerator.core.RewriteResult
+import io.github.jh_mmm.biliaccelerator.core.StatsManager
 
 class StatsProvider : ContentProvider() {
 
     companion object {
-        const val AUTHORITY = "com.realzza.biliaccelerator.provider"
+        const val AUTHORITY = "io.github.jh_mmm.biliaccelerator.provider"
         val CONTENT_URI: Uri = Uri.parse("content://$AUTHORITY")
 
         const val METHOD_RECORD_REWRITE = "recordRewrite"
