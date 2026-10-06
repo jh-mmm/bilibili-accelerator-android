@@ -1,8 +1,12 @@
-# Keep Xposed entry and callback methods
+# Keep LibXposed API 101 entry point and module rules
+-keep,allowoptimization,allowobfuscation public class * extends io.github.libxposed.api.XposedModule {
+    public <init>();
+}
+-adaptresourcefilecontents META-INF/xposed/java_init.list
+-dontwarn io.github.libxposed.**
+
+# Keep module hook implementations
 -keep class io.github.jh_mmm.biliaccelerator.hook.** { *; }
--keep class de.robv.android.xposed.** { *; }
--dontwarn de.robv.android.xposed.**
--dontwarn android.app.AndroidAppHelper
 
 # Keep models for Gson serialization & cross-process IPC
 -keep class io.github.jh_mmm.biliaccelerator.core.** { *; }

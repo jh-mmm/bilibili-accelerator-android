@@ -1,16 +1,14 @@
-﻿package io.github.jh_mmm.biliaccelerator.hook
+package io.github.jh_mmm.biliaccelerator.hook
 
-import android.app.AndroidAppHelper
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.util.Log
 import com.google.gson.Gson
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
 import io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver
-import de.robv.android.xposed.XSharedPreferences
-import de.robv.android.xposed.XposedBridge
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -25,29 +23,10 @@ object RemoteClient {
     }
 
     @Volatile
-    private var cachedConfig: AcceleratorConfig = tryLoadXSharedPrefs() ?: AcceleratorConfig()
+    private var cachedConfig: AcceleratorConfig = AcceleratorConfig()
     private val lastConfigFetchTime = AtomicLong(0L)
     private val isFetching = AtomicBoolean(false)
     private const val CONFIG_CACHE_TTL = 30_000L // 30 seconds
-
-    private fun tryLoadXSharedPrefs(): AcceleratorConfig? {
-        return try {
-            val xsp = XSharedPreferences("io.github.jh_mmm.biliaccelerator", StatsProvider.PREFS_CONFIG)
-            xsp.reload()
-            if (xsp.file.canRead()) {
-                AcceleratorConfig(
-                    enabled = xsp.getBoolean(StatsProvider.KEY_ENABLED, true),
-                    targetHost = xsp.getString(StatsProvider.KEY_TARGET_HOST, "upos-sz-mirrorcos.bilivideo.com") ?: "upos-sz-mirrorcos.bilivideo.com",
-                    blockPcdn = xsp.getBoolean(StatsProvider.KEY_BLOCK_PCDN, true),
-                    proxyMcdn = xsp.getBoolean(StatsProvider.KEY_PROXY_MCDN, true),
-                    forceUpos = xsp.getBoolean(StatsProvider.KEY_FORCE_UPOS, false),
-                    portHeuristic = xsp.getBoolean(StatsProvider.KEY_PORT_HEURISTIC, true)
-                )
-            } else null
-        } catch (_: Throwable) {
-            null
-        }
-    }
 
     // 由 HookEntry 在目标进程 Application 创建时注入，作为最可靠的 Context 来源
     @Volatile
@@ -64,7 +43,13 @@ object RemoteClient {
     fun getContext(): Context? {
         appContext?.let { return it }
         return try {
-            AndroidAppHelper.currentApplication()
+            val activityThreadClass = Class.forName("android.app.ActivityThread")
+            val currentAppMethod = activityThreadClass.getMethod("currentApplication")
+            val app = currentAppMethod.invoke(null) as? Context
+            if (app != null) {
+                setAppContext(app)
+                app
+            } else null
         } catch (_: Throwable) {
             null
         }
@@ -84,7 +69,7 @@ object RemoteClient {
                 try {
                     val context = getContext()
                     if (context == null) {
-                        XposedBridge.log("$TAG: 配置拉取跳过：目标进程 Context 为空")
+                        Log.w(TAG, "配置拉取跳过：目标进程 Context 为空")
                         lastConfigFetchTime.set(System.currentTimeMillis() - CONFIG_CACHE_TTL + 5_000L)
                         return@execute
                     }
@@ -101,7 +86,8 @@ object RemoteClient {
                     } else {
                         lastConfigFetchTime.set(System.currentTimeMillis() - CONFIG_CACHE_TTL + 5_000L)
                     }
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
+                    Log.d(TAG, "拉取配置异常: ${t.message}")
                     lastConfigFetchTime.set(System.currentTimeMillis() - CONFIG_CACHE_TTL + 5_000L)
                 } finally {
                     isFetching.set(false)
@@ -116,7 +102,7 @@ object RemoteClient {
         executor.execute {
             val context = getContext()
             if (context == null) {
-                XposedBridge.log("$TAG: 统计上报失败：目标进程 Context 为空（Application 未捕获且 AndroidAppHelper 不可用）")
+                Log.w(TAG, "统计上报失败：目标进程 Context 为空")
                 return@execute
             }
             val json = gson.toJson(result)
@@ -135,10 +121,10 @@ object RemoteClient {
                 )
                 if (response?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true) {
                     reported = true
-                    XposedBridge.log("$TAG: [Provider] 统计上报成功: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
+                    Log.i(TAG, "[Provider] 统计上报成功: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
                 }
             } catch (t: Throwable) {
-                XposedBridge.log("$TAG: [Provider] 暂不可达: ${t.javaClass.simpleName} (${t.message})")
+                Log.d(TAG, "[Provider] 暂不可达: ${t.javaClass.simpleName} (${t.message})")
             }
 
             // 2. 兜底通道：若 Provider 不可达（如高版本 Android 包可见性拦截），发送带唤醒标志的显式广播
@@ -150,9 +136,9 @@ object RemoteClient {
                         putExtra(StatsReceiver.EXTRA_REWRITE_RESULT, json)
                     }
                     context.sendBroadcast(intent)
-                    XposedBridge.log("$TAG: [Broadcast] 备用通道已发送: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
+                    Log.i(TAG, "[Broadcast] 备用通道已发送: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
                 } catch (t: Throwable) {
-                    XposedBridge.log("$TAG: [Broadcast] 发送异常: $t")
+                    Log.w(TAG, "[Broadcast] 发送异常: $t")
                 }
             }
         }

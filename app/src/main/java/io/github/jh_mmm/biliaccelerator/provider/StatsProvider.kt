@@ -1,4 +1,4 @@
-﻿package io.github.jh_mmm.biliaccelerator.provider
+package io.github.jh_mmm.biliaccelerator.provider
 
 import android.content.ContentProvider
 import android.content.ContentValues
@@ -42,9 +42,6 @@ class StatsProvider : ContentProvider() {
 
         private fun log(msg: String) {
             Log.i("BiliAccelerator-Stats", msg)
-            try {
-                de.robv.android.xposed.XposedBridge.log("BiliAccelerator-Stats: $msg")
-            } catch (_: Throwable) {}
         }
 
         fun loadConfig(context: android.content.Context): AcceleratorConfig {

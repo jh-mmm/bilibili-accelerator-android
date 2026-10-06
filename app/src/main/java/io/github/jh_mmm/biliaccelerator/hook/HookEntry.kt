@@ -1,89 +1,72 @@
-﻿package io.github.jh_mmm.biliaccelerator.hook
+package io.github.jh_mmm.biliaccelerator.hook
 
 import android.content.Context
+import android.util.Log
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
-import de.robv.android.xposed.IXposedHookLoadPackage
-import de.robv.android.xposed.IXposedHookZygoteInit
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XC_MethodReplacement
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.libxposed.api.XposedModule
+import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 
-class HookEntry : IXposedHookLoadPackage {
+class HookEntry : XposedModule() {
 
     companion object {
+        private const val TAG = "BiliAccelerator"
         private const val MODULE_PACKAGE = "io.github.jh_mmm.biliaccelerator"
     }
 
-    override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+    override fun onPackageLoaded(param: PackageLoadedParam) {
+        val packageName = param.packageName
+        val classLoader = param.defaultClassLoader ?: Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader()
+
         // 1. Self activation check in module UI
-        if (lpparam.packageName == MODULE_PACKAGE) {
+        if (packageName == MODULE_PACKAGE) {
             try {
-                val mainActivity = XposedHelpers.findClassIfExists(
-                    "$MODULE_PACKAGE.ui.MainActivity",
-                    lpparam.classLoader
-                )
-                if (mainActivity != null) {
-                    XposedHelpers.findAndHookMethod(
-                        mainActivity,
-                        "isModuleActive",
-                        XC_MethodReplacement.returnConstant(true)
-                    )
+                val mainActivity = classLoader.loadClass("$MODULE_PACKAGE.ui.MainActivity")
+                val isModuleActiveMethod = mainActivity.getDeclaredMethod("isModuleActive")
+                hook(isModuleActiveMethod).intercept {
+                    true
                 }
-            } catch (_: Throwable) {}
+            } catch (t: Throwable) {
+                Log.w(TAG, "Self hook failed", t)
+            }
             return
         }
 
         // 2. Target Bilibili Apps
-        if (BiliAcceleratorCore.TARGET_PACKAGES.contains(lpparam.packageName)) {
-            val proc = lpparam.processName
-            // 过滤已知纯后台/非播放进程，减小无谓的反射查找与内存开销
-            if (proc.endsWith(":push") || proc.endsWith(":channel") || proc.endsWith(":web") || proc.contains(":isolated")) {
-                return
-            }
-
-            XposedBridge.log("BiliAccelerator: Injecting into ${lpparam.packageName} (process: $proc)")
+        if (BiliAcceleratorCore.TARGET_PACKAGES.contains(packageName)) {
+            Log.i(TAG, "Injecting into $packageName via LibXposed API 101")
 
             // 尽早捕获 Application 实例，供统计上报（跨进程 ContentProvider 调用）使用
-            captureApplicationContext(lpparam.classLoader)
+            captureApplicationContext(classLoader)
 
             // Media Player Hook
-            PlayerHook.init(lpparam.classLoader)
+            PlayerHook.init(this, classLoader)
 
             // gRPC Protocol Hook
-            MossGrpcHook.init(lpparam.classLoader)
+            MossGrpcHook.init(this, classLoader)
         }
     }
 
     private fun captureApplicationContext(classLoader: ClassLoader) {
         // Application.attach(Context) 由框架调用且应用无法覆写，是最可靠的捕获点
         try {
-            XposedHelpers.findAndHookMethod(
-                "android.app.Application",
-                classLoader,
-                "attach",
-                Context::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        (param.thisObject as? Context)?.let { RemoteClient.setAppContext(it) }
-                    }
-                }
-            )
+            val appClass = classLoader.loadClass("android.app.Application")
+            val attachMethod = appClass.getDeclaredMethod("attach", Context::class.java)
+            hook(attachMethod).intercept { chain ->
+                val result = chain.proceed()
+                (chain.thisObject as? Context)?.let { RemoteClient.setAppContext(it) }
+                result
+            }
         } catch (_: Throwable) {}
 
         // 兜底：部分 ROM 的 attach 签名有差异时改用 onCreate
         try {
-            XposedHelpers.findAndHookMethod(
-                "android.app.Application",
-                classLoader,
-                "onCreate",
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        (param.thisObject as? Context)?.let { RemoteClient.setAppContext(it) }
-                    }
-                }
-            )
+            val appClass = classLoader.loadClass("android.app.Application")
+            val onCreateMethod = appClass.getDeclaredMethod("onCreate")
+            hook(onCreateMethod).intercept { chain ->
+                val result = chain.proceed()
+                (chain.thisObject as? Context)?.let { RemoteClient.setAppContext(it) }
+                result
+            }
         } catch (_: Throwable) {}
     }
 }

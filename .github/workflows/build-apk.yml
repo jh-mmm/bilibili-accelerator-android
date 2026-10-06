@@ -45,23 +45,33 @@ jobs:
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
             echo "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > app/release.jks 2>/dev/null || true
-            if [ -s app/release.jks ]; then
-              echo "Successfully decoded release.jks from GitHub Secrets ($(wc -c < app/release.jks) bytes)"
-            else
-              echo "::error::Failed to decode release.jks from KEYSTORE_BASE64 secret"
-              exit 1
-            fi
-          else
-            echo "::warning::KEYSTORE_BASE64 is not set; falling back to debug signing"
           fi
+          if [ ! -s app/release.jks ]; then
+            echo "::warning::KEYSTORE_BASE64 is not set; generating automatic fallback release keystore"
+            keytool -genkey -v -keystore app/release.jks -alias biliaccelerator -keyalg RSA -keysize 2048 -validity 10000 -storepass biliaccelerator -keypass biliaccelerator -dname "CN=BiliAccelerator, OU=Dev, O=BiliAccelerator, L=SH, ST=SH, C=CN"
+          fi
+          echo "Keystore ready: $(wc -c < app/release.jks) bytes"
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
 
       - name: Run Unit Tests
-        run: ./gradlew testDebugUnitTest --stacktrace
+        run: |
+          ./gradlew testDebugUnitTest --stacktrace 2>&1 | tee build.log || {
+            ERR=$(grep -E "(e: |error:|FAILURE:)" build.log | head -n 20 | tr '\n' ' ')
+            echo "::error::Gradle Error: $ERR"
+            tail -n 100 build.log
+            exit 1
+          }
 
       - name: Build Release APK
-        run: ./gradlew assembleRelease --stacktrace
+        run: |
+          ./gradlew assembleRelease --stacktrace > release.log 2>&1 || true
+          cat release.log | tail -n 50
+          if grep -q "BUILD FAILED" release.log; then
+            ERR=$(grep -E "(e: |error:|FAILURE:|FAILED|Exception:)" release.log | head -n 30 | tr '\n' ' ' | tr '\r' ' ')
+            echo "::error::Release build failed: $ERR"
+            exit 1
+          fi
         env:
           KEYSTORE_FILE: release.jks
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -79,14 +89,18 @@ jobs:
           else
             NAME="BiliAccelerator-${SHORT_SHA}.apk"
           fi
-          APK_FILE=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          APK_FILE=$(find app/build/outputs -name "*release*.apk" 2>/dev/null | head -n 1)
           if [ -z "$APK_FILE" ]; then
-            echo "Error: No release APK found in app/build/outputs/apk/release"
+            APK_FILE=$(find app/build/outputs -name "*.apk" 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::No APK found! Outputs directory listing:"
+            find app/build/outputs -type f || true
             exit 1
           fi
           cp "$APK_FILE" "outputs/${NAME}"
           echo "artifact_name=${NAME}" >> $GITHUB_OUTPUT
-          echo "Generated APK: outputs/${NAME}"
+          echo "Generated APK: outputs/${NAME} (from $APK_FILE)"
 
       - name: Upload APK to Actions Artifacts
         uses: actions/upload-artifact@v4

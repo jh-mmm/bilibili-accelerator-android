@@ -20,7 +20,7 @@
 
 ### 前置要求
 *   已 Root 的 Android 设备
-*   已安装并激活 [LSPosed](https://github.com/LSPosed/LSPosed) 框架
+*   已安装并激活支持现代 **LibXposed (API 101+)** 的 [LSPosed](https://github.com/LSPosed/LSPosed) 或 Vector 框架
 *   哔哩哔哩官方客户端（支持标准版 / 概念版 / 国际版 / HD 版等）
 
 ### 激活步骤

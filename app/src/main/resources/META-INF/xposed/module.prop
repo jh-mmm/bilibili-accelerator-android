@@ -1,0 +1,8 @@
+api=101
+min_api=101
+max_api=101
+name=Bili Accelerator
+version=1.0.5
+versionCode=105
+author=jh-mmm
+description=哔哩哔哩视频流加速与PCDN拦截模块

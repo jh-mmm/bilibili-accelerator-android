@@ -1,4 +1,4 @@
-﻿package io.github.jh_mmm.biliaccelerator.receiver
+package io.github.jh_mmm.biliaccelerator.receiver
 
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -25,9 +25,6 @@ class StatsReceiver : BroadcastReceiver() {
                     val result = gson.fromJson(json, RewriteResult::class.java)
                     StatsManager.recordRequest(result, context)
                     Log.i("BiliAccelerator-Stats", "通过 Broadcast 成功记录重定向: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
-                    try {
-                        de.robv.android.xposed.XposedBridge.log("BiliAccelerator-Stats: [Broadcast] 已记录重定向：${result.originalHost} -> ${result.targetHost} [${result.reason}]")
-                    } catch (_: Throwable) {}
                 } catch (e: Exception) {
                     Log.e("BiliAccelerator-Stats", "Broadcast 记录失败: $e")
                 }
