@@ -1,4 +1,4 @@
-﻿package io.github.jh_mmm.biliaccelerator.core
+package io.github.jh_mmm.biliaccelerator.core
 
 import android.content.Context
 import android.os.Build
@@ -14,6 +14,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 data class RewriteLogEntry(
@@ -62,7 +63,7 @@ object StatsManager {
     private val installTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
     private val gson = Gson()
 
-    private val isInitialized = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val isInitialized = AtomicBoolean(false)
 
     // 防抖异步持久化执行器，使用守护线程避免阻止进程退出
     private val saveScheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
@@ -70,6 +71,7 @@ object StatsManager {
     }
     private var pendingSaveFuture: ScheduledFuture<*>? = null
     private val saveLock = Any()
+    private val statsLock = Any()
 
     fun init(context: Context) {
         // 保证进程内单次幂等初始化，避免多处调用（Provider与Activity）导致日志翻倍与计数回退
@@ -77,38 +79,65 @@ object StatsManager {
             return
         }
 
-        val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        totalRequests.set(sp.getLong(KEY_TOTAL_REQUESTS, 0))
-        totalRewrites.set(sp.getLong(KEY_TOTAL_REWRITES, 0))
-        pcdnBlocked.set(sp.getLong(KEY_PCDN_BLOCKED, 0))
-        mcdnProxied.set(sp.getLong(KEY_MCDN_PROXIED, 0))
+        synchronized(statsLock) {
+            val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            totalRequests.set(sp.getLong(KEY_TOTAL_REQUESTS, 0))
+            totalRewrites.set(sp.getLong(KEY_TOTAL_REWRITES, 0))
+            pcdnBlocked.set(sp.getLong(KEY_PCDN_BLOCKED, 0))
+            mcdnProxied.set(sp.getLong(KEY_MCDN_PROXIED, 0))
 
-        installedAt = sp.getString(KEY_INSTALLED_AT, null) ?: run {
-            val now = LocalDateTime.now().format(installTimeFormatter)
-            sp.edit().putString(KEY_INSTALLED_AT, now).apply()
-            now
+            installedAt = sp.getString(KEY_INSTALLED_AT, null) ?: run {
+                val now = LocalDateTime.now().format(installTimeFormatter)
+                sp.edit().putString(KEY_INSTALLED_AT, now).apply()
+                now
+            }
+
+            val hostsJson = sp.getString(KEY_AVOIDED_HOSTS, null)
+            if (!hostsJson.isNullOrEmpty()) {
+                try {
+                    val list: List<String> = gson.fromJson(hostsJson, object : TypeToken<List<String>>() {}.type)
+                    avoidedHosts.clear()
+                    avoidedHosts.addAll(list.take(MAX_AVOIDED_HOSTS))
+                } catch (_: Exception) {}
+            }
+
+            val logsJson = sp.getString(KEY_RECENT_LOGS, null)
+            if (!logsJson.isNullOrEmpty()) {
+                try {
+                    val list: List<RewriteLogEntry> = gson.fromJson(logsJson, object : TypeToken<List<RewriteLogEntry>>() {}.type)
+                    recentLogs.clear()
+                    recentLogs.addAll(list.take(MAX_LOGS))
+                } catch (_: Exception) {}
+            }
         }
+    }
 
-        val hostsJson = sp.getString(KEY_AVOIDED_HOSTS, null)
-        if (!hostsJson.isNullOrEmpty()) {
-            try {
-                val list: List<String> = gson.fromJson(hostsJson, object : TypeToken<List<String>>() {}.type)
-                avoidedHosts.clear()
-                avoidedHosts.addAll(list.take(MAX_AVOIDED_HOSTS))
-            } catch (_: Exception) {}
-        }
-
-        val logsJson = sp.getString(KEY_RECENT_LOGS, null)
-        if (!logsJson.isNullOrEmpty()) {
-            try {
-                val list: List<RewriteLogEntry> = gson.fromJson(logsJson, object : TypeToken<List<RewriteLogEntry>>() {}.type)
-                recentLogs.clear()
-                recentLogs.addAll(list.take(MAX_LOGS))
-            } catch (_: Exception) {}
+    fun ensureInitialized(context: Context) {
+        if (!isInitialized.get()) {
+            init(context.applicationContext ?: context)
         }
     }
 
     fun recordRequest(result: RewriteResult, context: Context? = null) {
+        if (context != null) {
+            ensureInitialized(context)
+        }
+        recordSingleInternal(result)
+        context?.let { scheduleDebouncedSave(it) }
+    }
+
+    fun recordRequests(results: List<RewriteResult>, context: Context? = null) {
+        if (results.isEmpty()) return
+        if (context != null) {
+            ensureInitialized(context)
+        }
+        for (result in results) {
+            recordSingleInternal(result)
+        }
+        context?.let { scheduleDebouncedSave(it) }
+    }
+
+    private fun recordSingleInternal(result: RewriteResult) {
         totalRequests.incrementAndGet()
 
         if (result.changed) {
@@ -145,12 +174,10 @@ object StatsManager {
                 recentLogs.removeAt(recentLogs.lastIndex)
             }
         }
-
-        context?.let { scheduleDebouncedSave(it) }
     }
 
     private fun scheduleDebouncedSave(context: Context) {
-        val appContext = context.applicationContext
+        val appContext = context.applicationContext ?: context
         synchronized(saveLock) {
             pendingSaveFuture?.cancel(false)
             pendingSaveFuture = saveScheduler.schedule({
@@ -160,30 +187,38 @@ object StatsManager {
     }
 
     fun saveToPrefs(context: Context) {
-        try {
-            val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            sp.edit()
-                .putLong(KEY_TOTAL_REQUESTS, totalRequests.get())
-                .putLong(KEY_TOTAL_REWRITES, totalRewrites.get())
-                .putLong(KEY_PCDN_BLOCKED, pcdnBlocked.get())
-                .putLong(KEY_MCDN_PROXIED, mcdnProxied.get())
-                .putString(KEY_AVOIDED_HOSTS, gson.toJson(avoidedHosts.toList()))
-                .putString(KEY_RECENT_LOGS, gson.toJson(recentLogs.toList()))
-                .apply()
-        } catch (_: Exception) {}
+        synchronized(statsLock) {
+            try {
+                val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                sp.edit()
+                    .putLong(KEY_TOTAL_REQUESTS, totalRequests.get())
+                    .putLong(KEY_TOTAL_REWRITES, totalRewrites.get())
+                    .putLong(KEY_PCDN_BLOCKED, pcdnBlocked.get())
+                    .putLong(KEY_MCDN_PROXIED, mcdnProxied.get())
+                    .putString(KEY_AVOIDED_HOSTS, gson.toJson(avoidedHosts.toList()))
+                    .putString(KEY_RECENT_LOGS, gson.toJson(recentLogs.toList()))
+                    .apply()
+            } catch (_: Exception) {}
+        }
     }
 
     fun clearStats(context: Context) {
         synchronized(saveLock) {
             pendingSaveFuture?.cancel(false)
+            pendingSaveFuture = null
         }
-        totalRequests.set(0)
-        totalRewrites.set(0)
-        pcdnBlocked.set(0)
-        mcdnProxied.set(0)
-        avoidedHosts.clear()
-        recentLogs.clear()
-        saveToPrefs(context)
+        synchronized(statsLock) {
+            totalRequests.set(0)
+            totalRewrites.set(0)
+            pcdnBlocked.set(0)
+            mcdnProxied.set(0)
+            avoidedHosts.clear()
+            recentLogs.clear()
+            try {
+                val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                sp.edit().clear().putString(KEY_INSTALLED_AT, installedAt).apply()
+            } catch (_: Exception) {}
+        }
     }
 
     fun getSnapshot(): StatsSnapshot {
@@ -216,6 +251,14 @@ object StatsManager {
         sb.appendLine("PCDN 拦截: ${if (config.blockPcdn) "已开启" else "已关闭"}")
         sb.appendLine("强制统一线路: ${if (config.forceUpos) "开启" else "关闭"}")
         sb.appendLine("端口启发式: ${if (config.portHeuristic) "开启" else "关闭"}")
+        sb.appendLine("-----------------------------------------")
+        sb.appendLine("【Hook 挂载状态】")
+        try {
+            val hookReport = io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.formatReport()
+            sb.appendLine(hookReport)
+        } catch (_: Throwable) {
+            sb.appendLine("状态不可用")
+        }
         sb.appendLine("-----------------------------------------")
         sb.appendLine("【拦截统计】")
         sb.appendLine("累计媒体请求总数: ${snapshot.totalRequests}")

@@ -1,9 +1,14 @@
 # Keep LibXposed API 101 entry point and module rules
--keep,allowoptimization,allowobfuscation public class * extends io.github.libxposed.api.XposedModule {
+-keep public class * extends io.github.libxposed.api.XposedModule {
     public <init>();
 }
+-keep class io.github.jh_mmm.biliaccelerator.hook.HookEntry { *; }
 -adaptresourcefilecontents META-INF/xposed/java_init.list
 -dontwarn io.github.libxposed.**
+
+# Keep Application and Receiver components
+-keep class io.github.jh_mmm.biliaccelerator.BiliAcceleratorApp { *; }
+-keep class io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver { *; }
 
 # Keep module hook implementations
 -keep class io.github.jh_mmm.biliaccelerator.hook.** { *; }

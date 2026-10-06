@@ -10,7 +10,6 @@ class HookEntry : XposedModule() {
 
     companion object {
         private const val TAG = "BiliAccelerator"
-        private const val MODULE_PACKAGE = "io.github.jh_mmm.biliaccelerator"
     }
 
     override fun onPackageLoaded(param: PackageLoadedParam) {
@@ -18,9 +17,9 @@ class HookEntry : XposedModule() {
         val classLoader = param.defaultClassLoader ?: Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader()
 
         // 1. Self activation check in module UI
-        if (packageName == MODULE_PACKAGE) {
+        if (packageName == BiliAcceleratorCore.MODULE_PACKAGE) {
             try {
-                val mainActivity = classLoader.loadClass("$MODULE_PACKAGE.ui.MainActivity")
+                val mainActivity = classLoader.loadClass("${BiliAcceleratorCore.MODULE_PACKAGE}.ui.MainActivity")
                 val isModuleActiveMethod = mainActivity.getDeclaredMethod("isModuleActive")
                 hook(isModuleActiveMethod).intercept {
                     true
@@ -47,16 +46,24 @@ class HookEntry : XposedModule() {
     }
 
     private fun captureApplicationContext(classLoader: ClassLoader) {
+        var attachHooked = false
         // Application.attach(Context) 由框架调用且应用无法覆写，是最可靠的捕获点
         try {
             val appClass = classLoader.loadClass("android.app.Application")
             val attachMethod = appClass.getDeclaredMethod("attach", Context::class.java)
             hook(attachMethod).intercept { chain ->
                 val result = chain.proceed()
-                (chain.thisObject as? Context)?.let { RemoteClient.setAppContext(it) }
+                (chain.thisObject as? Context)?.let { ctx ->
+                    RemoteClient.setAppContext(ctx)
+                    HookStatusTracker.recordStatus("app_context", "Application.attach")
+                }
                 result
             }
-        } catch (_: Throwable) {}
+            attachHooked = true
+            Log.i(TAG, "Successfully hooked Application.attach")
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to hook Application.attach (ROM compatibility): ${t.message}")
+        }
 
         // 兜底：部分 ROM 的 attach 签名有差异时改用 onCreate
         try {
@@ -64,9 +71,17 @@ class HookEntry : XposedModule() {
             val onCreateMethod = appClass.getDeclaredMethod("onCreate")
             hook(onCreateMethod).intercept { chain ->
                 val result = chain.proceed()
-                (chain.thisObject as? Context)?.let { RemoteClient.setAppContext(it) }
+                (chain.thisObject as? Context)?.let { ctx ->
+                    RemoteClient.setAppContext(ctx)
+                    if (!attachHooked) {
+                        HookStatusTracker.recordStatus("app_context", "Application.onCreate")
+                    }
+                }
                 result
             }
-        } catch (_: Throwable) {}
+            Log.i(TAG, "Successfully hooked Application.onCreate")
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to hook Application.onCreate (ROM compatibility): ${t.message}")
+        }
     }
 }

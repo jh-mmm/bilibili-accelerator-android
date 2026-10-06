@@ -1,4 +1,4 @@
-﻿package io.github.jh_mmm.biliaccelerator.core
+package io.github.jh_mmm.biliaccelerator.core
 
 import android.net.Uri
 import java.net.URLDecoder
@@ -26,6 +26,8 @@ data class AcceleratorConfig(
 
 object BiliAcceleratorCore {
 
+    const val MODULE_PACKAGE = "io.github.jh_mmm.biliaccelerator"
+
     val TARGET_PACKAGES = setOf(
         "tv.danmaku.bili",
         "com.bilibili.app.in",
@@ -48,8 +50,22 @@ object BiliAcceleratorCore {
 
     private val HOSTNAME_REGEX = Regex("""^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(:[0-9]{1,5})?$""")
     private val MEDIA_PATH_REGEX = Regex("""\.(m4s|mp4|flv|m3u8)(?:$|[?#])""", RegexOption.IGNORE_CASE)
-    private val IP_REGEX = Regex("""^(?:\d{1,3}\.){3}\d{1,3}$""")
-    private val XY_MCDN_REGEX = Regex("""^xy(?:\d+x){3}\d+xy\.mcdn\.bilivideo\.(?:cn|com|net)$""", RegexOption.IGNORE_CASE)
+    private val IPV4_REGEX = Regex("""^(?:\d{1,3}\.){3}\d{1,3}$""")
+    private val IPV6_REGEX = Regex("""^\[?[0-9a-fA-F:]+\]?$""")
+
+    fun isIpAddress(rawHost: String): Boolean {
+        var h = cleanHost(rawHost).lowercase()
+        if (h.startsWith("[")) {
+            val closeBracket = h.indexOf(']')
+            if (closeBracket != -1) {
+                h = h.substring(1, closeBracket)
+            }
+        } else if (!h.contains("::") && h.count { it == ':' } == 1) {
+            h = h.substringBefore(':')
+        }
+        if (IPV4_REGEX.matches(h)) return true
+        return h.contains(':') && IPV6_REGEX.matches(h)
+    }
 
     fun cleanHost(raw: String?): String {
         if (raw.isNullOrBlank()) return ""
@@ -133,6 +149,15 @@ object BiliAcceleratorCore {
                 h.endsWith(".akamaized.net")
     }
 
+    fun isBiliFamilyHost(hostname: String): Boolean {
+        val h = cleanHost(hostname).lowercase().substringBefore(':')
+        return isBiliCdnHost(h) ||
+                isKnownP2pHost(h) ||
+                isMcdnHost(h) ||
+                h.endsWith(".bilibili.com") ||
+                h.endsWith(".bstarstatic.com")
+    }
+
     data class ParsedUri(
         val scheme: String,
         val host: String,
@@ -209,8 +234,17 @@ object BiliAcceleratorCore {
                 path.startsWith("/v1/resource/")
     }
 
-    fun isLiveMediaUrl(path: String): Boolean {
-        return path.contains("/live-bvc/")
+    fun isLiveMediaUrl(path: String, fullUrl: String = ""): Boolean {
+        val lowerPath = path.lowercase()
+        val lowerUrl = fullUrl.lowercase()
+        return lowerPath.contains("/live-bvc/") ||
+                lowerPath.contains("/live-stream/") ||
+                lowerPath.contains("/live-flv/") ||
+                lowerPath.contains("/live/") ||
+                lowerUrl.contains("gotcha") ||
+                lowerUrl.contains("live.bilibili.com") ||
+                lowerUrl.contains("live-play") ||
+                lowerUrl.contains("live_id=")
     }
 
     fun rewriteUrl(original: String, config: AcceleratorConfig): RewriteResult {
@@ -222,20 +256,28 @@ object BiliAcceleratorCore {
         val hostname = parsed.host.lowercase()
         val cleanProxyHost = cleanHost(config.proxyHost).ifBlank { "proxy-tf-all-ws.bilivideo.com" }
         if (hostname == cleanProxyHost) {
-            return noChange(original, "already-proxied")
+            return noChange(original, "already-proxied", isMcdn = true)
         }
 
-        if (isLiveMediaUrl(parsed.path)) {
+        if (isLiveMediaUrl(parsed.path, original)) {
             return noChange(original, "live-skip")
         }
 
         val port = parsed.port
+        val isBiliFamily = isBiliFamilyHost(hostname)
+        val hasBiliMediaSignature = parsed.path.contains("/upgcxcode/") ||
+                parsed.path.contains("/v1/resource/") ||
+                parsed.queryParam("xy_usource") != null ||
+                parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
+
+        val isIp = isIpAddress(hostname)
         val hasNonDefaultPort = config.portHeuristic && port != -1 && port != 80 && port != 443
         val queryMcdn = parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
-        val isMcdn = isMcdnHost(hostname) || XY_MCDN_REGEX.matches(hostname)
-        val isPcdn = IP_REGEX.matches(hostname) ||
+        val isMcdn = isMcdnHost(hostname)
+        // 端口和 IP 启发式仅在属于 B 站域名族或携带明确 B 站媒体特征时生效，防止误伤第三方外链视频或广告
+        val isPcdn = (isIp && (hasBiliMediaSignature || isKnownP2pHost(hostname))) ||
                 isKnownP2pHost(hostname) ||
-                hasNonDefaultPort ||
+                (hasNonDefaultPort && (isBiliFamily || hasBiliMediaSignature)) ||
                 queryMcdn
 
         // 1. szbdyd / mountaintoys 调度器：直接恢复 xy_usource 参数所携带的真实原生 CDN 域名
@@ -259,7 +301,7 @@ object BiliAcceleratorCore {
                         isMcdn = false
                     )
                 } else {
-                    return noChange(original, "ok")
+                    return noChange(original, "ok", isPcdn = true)
                 }
             }
             // 若 xy_usource 畸形、恶意域名或不在合法列表中，跳过恢复，流转至下方 PCDN 拦截规则
@@ -280,7 +322,7 @@ object BiliAcceleratorCore {
                     isMcdn = true
                 )
             } else {
-                return noChange(original, "ok")
+                return noChange(original, "ok", isMcdn = true)
             }
         }
 
@@ -312,14 +354,14 @@ object BiliAcceleratorCore {
                     isMcdn = isMcdn
                 )
             } else {
-                return noChange(original, "ok")
+                return noChange(original, "ok", isPcdn = isPcdn, isMcdn = isMcdn)
             }
         }
 
-        return noChange(original, "ok")
+        return noChange(original, "ok", isPcdn = isPcdn, isMcdn = isMcdn)
     }
 
-    private fun noChange(url: String, reason: String): RewriteResult {
+    fun noChange(url: String, reason: String, isPcdn: Boolean = false, isMcdn: Boolean = false): RewriteResult {
         val host = parseUri(url)?.host ?: ""
         return RewriteResult(
             changed = false,
@@ -328,8 +370,8 @@ object BiliAcceleratorCore {
             originalHost = host,
             targetHost = host,
             reason = reason,
-            isPcdn = false,
-            isMcdn = false
+            isPcdn = isPcdn,
+            isMcdn = isMcdn
         )
     }
 }

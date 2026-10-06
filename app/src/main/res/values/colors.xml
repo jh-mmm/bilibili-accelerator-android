@@ -11,5 +11,8 @@
     <color name="tag_mcdn">#FB8C00</color>
     <color name="tag_upos">#43A047</color>
     <color name="status_green">#2ECC71</color>
+    <color name="status_green_bg">#202ECC71</color>
     <color name="status_red">#E74C3C</color>
+    <color name="status_red_bg">#20E74C3C</color>
+    <color name="divider">#EAEAEA</color>
 </resources>

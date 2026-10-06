@@ -1,4 +1,4 @@
-﻿package io.github.jh_mmm.biliaccelerator.ui
+package io.github.jh_mmm.biliaccelerator.ui
 
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -57,18 +57,6 @@ class MainActivity : AppCompatActivity() {
         refreshStats()
         refreshHandler.removeCallbacks(refreshRunnable)
         refreshHandler.postDelayed(refreshRunnable, 2000L)
-        pingTargetAppsForImplicitAccess()
-    }
-
-    private fun pingTargetAppsForImplicitAccess() {
-        for (pkg in io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.TARGET_PACKAGES) {
-            try {
-                val pingIntent = android.content.Intent("io.github.jh_mmm.biliaccelerator.ACTION_PING").apply {
-                    setPackage(pkg)
-                }
-                sendBroadcast(pingIntent)
-            } catch (_: Throwable) {}
-        }
     }
 
     override fun onPause() {
@@ -81,12 +69,21 @@ class MainActivity : AppCompatActivity() {
         val active = isModuleActive()
         if (active) {
             binding.tvStatusBadge.text = getString(R.string.status_active)
-            binding.tvStatusBadge.setTextColor(Color.parseColor("#2ECC71"))
-            binding.tvStatusBadge.setBackgroundColor(Color.parseColor("#202ECC71"))
+            binding.tvStatusBadge.setTextColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green))
+            binding.tvStatusBadge.setBackgroundColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green_bg))
         } else {
             binding.tvStatusBadge.text = getString(R.string.status_badge_inactive)
-            binding.tvStatusBadge.setTextColor(Color.parseColor("#E74C3C"))
-            binding.tvStatusBadge.setBackgroundColor(Color.parseColor("#20E74C3C"))
+            binding.tvStatusBadge.setTextColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_red))
+            binding.tvStatusBadge.setBackgroundColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_red_bg))
+        }
+
+        binding.tvStatusBadge.setOnClickListener {
+            val hookReport = io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.formatReport()
+            AlertDialog.Builder(this)
+                .setTitle("Hook 挂载状态")
+                .setMessage(hookReport)
+                .setPositiveButton(R.string.dialog_confirm, null)
+                .show()
         }
 
         // RecyclerView

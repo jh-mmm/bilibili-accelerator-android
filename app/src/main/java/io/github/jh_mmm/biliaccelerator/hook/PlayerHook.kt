@@ -27,6 +27,7 @@ object PlayerHook {
 
             hookSegmentBuilder(module, builderClass)
             hooked = true
+            HookStatusTracker.recordStatus("player_segment", className)
             Log.i(TAG, "Successfully hooked player segment builder: $className")
         }
 
@@ -39,12 +40,17 @@ object PlayerHook {
     }
 
     private fun hookSegmentBuilder(module: XposedModule, clazz: Class<*>) {
-        // 1. Hook all constructors
-        for (constructor in clazz.declaredConstructors + clazz.constructors) {
+        // 1. Hook all constructors (distinct 防止 public 构造器重复注入)
+        val constructors = (clazz.declaredConstructors + clazz.constructors).distinct()
+        for (constructor in constructors) {
             try {
                 module.hook(constructor).intercept { chain ->
-                    rewriteArgIfMedia(chain.args)
-                    chain.proceed()
+                    val newArgs = rewriteArgIfMedia(chain.args)
+                    if (newArgs != null) {
+                        chain.proceed(newArgs)
+                    } else {
+                        chain.proceed()
+                    }
                 }
             } catch (t: Throwable) {
                 Log.d(TAG, "Could not hook constructor: ${t.message}")
@@ -58,8 +64,12 @@ object PlayerHook {
             if (m.name in setterNames) {
                 try {
                     module.hook(m).intercept { chain ->
-                        rewriteArgIfMedia(chain.args)
-                        chain.proceed()
+                        val newArgs = rewriteArgIfMedia(chain.args)
+                        if (newArgs != null) {
+                            chain.proceed(newArgs)
+                        } else {
+                            chain.proceed()
+                        }
                     }
                 } catch (_: Throwable) {}
             }
@@ -93,33 +103,37 @@ object PlayerHook {
                             RemoteClient.notifyRewrite(res)
                             filtered.add(res.finalUrl)
                         } else if (!res.isPcdn) {
+                            // 仅保留确认不是 PCDN 的干净官方线路
                             filtered.add(url)
                         }
                     }
 
-                    // Ensure we have backup mirrors in case the primary fails
-                    if (filtered.isEmpty() && target.isNotBlank()) {
-                        val first = rawList.firstOrNull()
-                        if (first != null) {
-                            for (candidate in BiliAcceleratorCore.CANDIDATE_POOL.take(3)) {
-                                if (candidate != target) {
-                                    val backupRes = BiliAcceleratorCore.rewriteUrl(first, config.copy(targetHost = candidate, forceUpos = true))
-                                    if (backupRes.changed) {
-                                        filtered.add(backupRes.finalUrl)
-                                    }
-                                }
+                    // 备用镜像池维护：若原始地址全部是 PCDN 导致过滤后无地址或只有单一边界节点，
+                    // 从 CANDIDATE_POOL 挑选不同云服务商（阿里/华为/腾讯等）生成备选直连镜像，确保播放器具备真实的高可用容灾能力
+                    val sampleUrl = rawList.firstOrNull()
+                    if (filtered.isEmpty() && sampleUrl != null) {
+                        val candidates = BiliAcceleratorCore.CANDIDATE_POOL.filter { it != target }
+                        for (candidate in candidates.take(3)) {
+                            val backupRes = BiliAcceleratorCore.rewriteUrl(
+                                sampleUrl,
+                                config.copy(targetHost = candidate, forceUpos = true)
+                            )
+                            if (backupRes.changed) {
+                                filtered.add(backupRes.finalUrl)
                             }
                         }
                     }
 
-                    // 只有在过滤出有效非空地址时才写入；若为空则保持原参数不动，防止播放器失去备用流或 NPE
-                    if (filtered.isNotEmpty()) {
+                    val distinctFiltered = filtered.distinct()
+                    if (distinctFiltered.isNotEmpty()) {
                         val paramType = method.parameterTypes[0]
-                        (chain.args as? MutableList<Any?>)?.set(0, when {
-                            paramType.isArray -> filtered.toTypedArray()
-                            java.util.Set::class.java.isAssignableFrom(paramType) -> filtered.toSet()
-                            else -> filtered
-                        })
+                        val convertedArg: Any = when {
+                            paramType.isArray -> distinctFiltered.toTypedArray()
+                            java.util.Set::class.java.isAssignableFrom(paramType) -> distinctFiltered.toSet()
+                            else -> distinctFiltered
+                        }
+                        val newArgs = chain.args.toTypedArray().apply { this[0] = convertedArg }
+                        return@intercept chain.proceed(newArgs)
                     }
                     chain.proceed()
                 }
@@ -129,20 +143,23 @@ object PlayerHook {
         }
     }
 
-    private fun rewriteArgIfMedia(args: List<Any?>) {
+    private fun rewriteArgIfMedia(args: List<Any?>): Array<Any?>? {
         val strIndex = args.indexOfFirst { it is String && BiliAcceleratorCore.hasMediaSignal(it) }
-        if (strIndex == -1) return
+        if (strIndex == -1) return null
 
         val originalUrl = args[strIndex] as String
         val config = RemoteClient.fetchConfig()
-        if (!config.enabled) return
+        if (!config.enabled) return null
 
         val result = BiliAcceleratorCore.rewriteUrl(originalUrl, config)
         if (result.changed) {
-            (args as? MutableList<Any?>)?.set(strIndex, result.finalUrl)
             RemoteClient.notifyRewrite(result)
             Log.i(TAG, "Rewrote media url: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
+            val newArgs = args.toTypedArray()
+            newArgs[strIndex] = result.finalUrl
+            return newArgs
         }
+        return null
     }
 
     private fun hookFallbackPlayer(module: XposedModule, classLoader: ClassLoader) {
@@ -151,6 +168,8 @@ object PlayerHook {
         } catch (_: Throwable) {
             null
         } ?: return
+
+        var fallbackHooked = false
 
         try {
             // 1. Hook setDataSource(String path)
@@ -163,14 +182,16 @@ object PlayerHook {
                         if (config.enabled) {
                             val result = BiliAcceleratorCore.rewriteUrl(original, config)
                             if (result.changed) {
-                                (chain.args as? MutableList<Any?>)?.set(0, result.finalUrl)
                                 RemoteClient.notifyRewrite(result)
                                 Log.i(TAG, "Rewrote IjkMediaPlayer dataSource: ${result.originalHost} -> ${result.targetHost}")
+                                val newArgs = chain.args.toTypedArray().apply { this[0] = result.finalUrl }
+                                return@intercept chain.proceed(newArgs)
                             }
                         }
                     }
                     chain.proceed()
                 }
+                fallbackHooked = true
             } catch (_: NoSuchMethodException) {}
 
             // 2. Hook setDataSource(Context context, Uri uri) 及重载
@@ -188,19 +209,24 @@ object PlayerHook {
                                 if (config.enabled) {
                                     val result = BiliAcceleratorCore.rewriteUrl(original, config)
                                     if (result.changed) {
-                                        (chain.args as? MutableList<Any?>)?.set(1, Uri.parse(result.finalUrl))
                                         RemoteClient.notifyRewrite(result)
                                         Log.i(TAG, "Rewrote IjkMediaPlayer Uri dataSource: ${result.originalHost} -> ${result.targetHost}")
+                                        val newArgs = chain.args.toTypedArray().apply { this[1] = Uri.parse(result.finalUrl) }
+                                        return@intercept chain.proceed(newArgs)
                                     }
                                 }
                             }
                         }
                         chain.proceed()
                     }
+                    fallbackHooked = true
                 } catch (_: Throwable) {}
             }
 
-            Log.i(TAG, "Successfully hooked IjkMediaPlayer setDataSource methods")
+            if (fallbackHooked) {
+                HookStatusTracker.recordStatus("player_fallback", "tv.danmaku.ijk.media.player.IjkMediaPlayer")
+                Log.i(TAG, "Successfully hooked IjkMediaPlayer setDataSource methods")
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "hookFallbackPlayer failed: ${t.message}")
         }

@@ -1,10 +1,11 @@
-﻿package io.github.jh_mmm.biliaccelerator.ui
+package io.github.jh_mmm.biliaccelerator.ui
 
 import android.graphics.Color
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
+import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
 import io.github.jh_mmm.biliaccelerator.R
 import io.github.jh_mmm.biliaccelerator.core.RewriteLogEntry
@@ -12,8 +13,25 @@ import io.github.jh_mmm.biliaccelerator.core.RewriteLogEntry
 class LogAdapter(private var logs: List<RewriteLogEntry>) : RecyclerView.Adapter<LogAdapter.LogViewHolder>() {
 
     fun updateLogs(newLogs: List<RewriteLogEntry>) {
+        if (this.logs == newLogs) return
+
+        val oldLogs = this.logs
+        val diffResult = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+            override fun getOldListSize(): Int = oldLogs.size
+            override fun getNewListSize(): Int = newLogs.size
+
+            override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+                val oldItem = oldLogs[oldItemPosition]
+                val newItem = newLogs[newItemPosition]
+                return oldItem.timestamp == newItem.timestamp && oldItem.originalHost == newItem.originalHost
+            }
+
+            override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+                return oldLogs[oldItemPosition] == newLogs[newItemPosition]
+            }
+        })
         this.logs = newLogs
-        notifyDataSetChanged()
+        diffResult.dispatchUpdatesTo(this)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): LogViewHolder {
@@ -51,7 +69,7 @@ class LogAdapter(private var logs: List<RewriteLogEntry>) : RecyclerView.Adapter
                     tvTag.setTextColor(Color.parseColor("#FB8C00"))
                     tvTag.setBackgroundColor(Color.parseColor("#20FB8C00"))
                 }
-                entry.reason == "szbdyd-source" -> {
+                entry.reason == "szbdyd-source" || entry.reason == "mountaintoys-source" -> {
                     tvTag.text = "SCHED"
                     tvTag.setTextColor(Color.parseColor("#00AEEC"))
                     tvTag.setBackgroundColor(Color.parseColor("#2000AEEC"))

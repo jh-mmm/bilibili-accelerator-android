@@ -7,12 +7,15 @@ android {
     namespace = "io.github.jh_mmm.biliaccelerator"
     compileSdk = 34
 
+    val appVersionCode = 105
+    val appVersionName = "1.0.5"
+
     defaultConfig {
         applicationId = "io.github.jh_mmm.biliaccelerator"
         minSdk = 26
         targetSdk = 34
-        versionCode = 105
-        versionName = "1.0.5"
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -22,10 +25,20 @@ android {
 
     val releaseSigningConfig = signingConfigs.create("release") {
         storeFile = candidateKeystore
-        storePassword = System.getenv("KEYSTORE_PASSWORD").takeIf { !it.isNullOrBlank() } ?: "biliaccelerator"
-        keyAlias = System.getenv("KEY_ALIAS").takeIf { !it.isNullOrBlank() } ?: "biliaccelerator"
-        val envKeyPassword = System.getenv("KEY_PASSWORD").takeIf { !it.isNullOrBlank() }
-        keyPassword = envKeyPassword ?: (System.getenv("KEYSTORE_PASSWORD").takeIf { !it.isNullOrBlank() } ?: "biliaccelerator")
+        val envStorePass = System.getenv("KEYSTORE_PASSWORD")
+        val envKeyAlias = System.getenv("KEY_ALIAS")
+        val envKeyPass = System.getenv("KEY_PASSWORD")
+
+        if (!envStorePass.isNullOrBlank()) {
+            storePassword = envStorePass
+            keyAlias = envKeyAlias.takeUnless { it.isNullOrBlank() } ?: "biliaccelerator"
+            keyPassword = envKeyPass.takeUnless { it.isNullOrBlank() } ?: envStorePass
+        } else {
+            // 本地未配置环境变量时，使用默认开发密钥口令
+            storePassword = "biliaccelerator"
+            keyAlias = envKeyAlias.takeUnless { it.isNullOrBlank() } ?: "biliaccelerator"
+            keyPassword = envKeyPass.takeUnless { it.isNullOrBlank() } ?: "biliaccelerator"
+        }
     }
 
     buildTypes {
@@ -45,8 +58,10 @@ android {
 
     lint {
         abortOnError = false
-        checkReleaseBuilds = false
+        checkReleaseBuilds = true
+        ignoreWarnings = false
     }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

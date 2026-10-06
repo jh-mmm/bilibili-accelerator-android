@@ -44,19 +44,25 @@ jobs:
       - name: Setup Release Keystore
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > app/release.jks 2>/dev/null || true
-          fi
-          if [ ! -s app/release.jks ]; then
-            echo "::warning::KEYSTORE_BASE64 is not set; generating automatic fallback release keystore"
+            echo "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > app/release.jks
+            if [ ! -s app/release.jks ]; then
+              echo "::error::KEYSTORE_BASE64 was provided but base64 decoding failed or produced an empty file!"
+              exit 1
+            fi
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "::error::Release tag build requires secret KEYSTORE_BASE64 to guarantee consistent APK signatures!"
+            exit 1
+          else
+            echo "::warning::KEYSTORE_BASE64 is not set; generating development fallback release keystore"
             keytool -genkey -v -keystore app/release.jks -alias biliaccelerator -keyalg RSA -keysize 2048 -validity 10000 -storepass biliaccelerator -keypass biliaccelerator -dname "CN=BiliAccelerator, OU=Dev, O=BiliAccelerator, L=SH, ST=SH, C=CN"
           fi
           echo "Keystore ready: $(wc -c < app/release.jks) bytes"
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
 
-      - name: Run Unit Tests
+      - name: Run Lint & Unit Tests
         run: |
-          ./gradlew testDebugUnitTest --stacktrace 2>&1 | tee build.log || {
+          ./gradlew lintDebug testDebugUnitTest --stacktrace 2>&1 | tee build.log || {
             ERR=$(grep -E "(e: |error:|FAILURE:)" build.log | head -n 20 | tr '\n' ' ')
             echo "::error::Gradle Error: $ERR"
             tail -n 100 build.log

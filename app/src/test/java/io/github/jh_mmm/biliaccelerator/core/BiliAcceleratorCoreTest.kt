@@ -1,4 +1,4 @@
-﻿package io.github.jh_mmm.biliaccelerator.core
+package io.github.jh_mmm.biliaccelerator.core
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -140,5 +140,38 @@ class BiliAcceleratorCoreTest {
         val result = BiliAcceleratorCore.rewriteUrl(bstarUrl, forceConfig)
         assertFalse("Bstar overseas stream should not be rewritten to mainland UPOS in force mode", result.changed)
         assertEquals("ok", result.reason)
+    }
+
+    @Test
+    fun testThirdPartyVideoWithPortNotRewritten() {
+        // 第三方广告或外部视频即使走非标端口，只要不属于 B 站域名族且无 B 站路径签名，绝不误拦截
+        val externalAd = "http://ad-server.example.com:8080/commercial/intro.mp4"
+        val result = BiliAcceleratorCore.rewriteUrl(externalAd, defaultConfig)
+        assertFalse("External third-party media should not be rewritten", result.changed)
+        assertFalse("Should not be recognized as PCDN", result.isPcdn)
+        assertEquals("ok", result.reason)
+    }
+
+    @Test
+    fun testIpv6Detection() {
+        assertTrue("IPv4 detection", BiliAcceleratorCore.isIpAddress("192.168.1.1"))
+        assertTrue("IPv6 bracketed detection", BiliAcceleratorCore.isIpAddress("[2001:db8::1]"))
+        assertTrue("IPv6 raw detection", BiliAcceleratorCore.isIpAddress("2001:db8::1"))
+        assertFalse("Standard domain detection", BiliAcceleratorCore.isIpAddress("upos-sz-mirrorcos.bilivideo.com"))
+    }
+
+    @Test
+    fun testAdditionalLiveMediaPatterns() {
+        val livePatterns = listOf(
+            "https://d1--cn-gotcha01.bilivideo.com/live-bvc/123/live.flv",
+            "https://live.bilibili.com/live-stream/456/index.m3u8",
+            "https://d1--cn-gotcha02.bilivideo.com/live-flv/789/stream.flv",
+            "https://live-play.bilivideo.com/live/101/stream.m4s"
+        )
+        for (url in livePatterns) {
+            val result = BiliAcceleratorCore.rewriteUrl(url, defaultConfig)
+            assertFalse("Live URL must be skipped: $url", result.changed)
+            assertEquals("live-skip", result.reason)
+        }
     }
 }

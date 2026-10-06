@@ -12,7 +12,8 @@
 
 * 拦截住宅 P2P/PCDN 节点（包括 `szbdyd.com`, `mountaintoys.cn`, `nexusedgeio.com`, `ahdohpiechei.com`，以及非常规的高位端口和裸 IP 节点）。自动提取 `xy_usource` 参数，强制恢复至真实的 CDN 源站。
     *   对于其他劣质 PCDN 请求，直接重定向至极速 UPOS 镜像节点。
-* 配有数据可视化的实时统计面板**
+* 配有数据可视化的实时统计面板
+* 针对现代 LibXposed (API 101+) 进行全面重构，杜绝传统 API 性能瓶颈
 
 ---
 
@@ -20,7 +21,7 @@
 
 ### 前置要求
 *   已 Root 的 Android 设备
-*   已安装并激活支持现代 **LibXposed (API 101+)** 的 [LSPosed](https://github.com/LSPosed/LSPosed) 或 Vector 框架
+*   已安装并激活支持现代 **LibXposed (API 101+)** 的 [LSPosed](https://github.com/LSPosed/LSPosed) 或 Vector 框架（必须支持现代 API 101 标准）
 *   哔哩哔哩官方客户端（支持标准版 / 概念版 / 国际版 / HD 版等）
 
 ### 激活步骤
@@ -65,16 +66,20 @@
 2. 等待 Gradle 同步完成后，点击菜单栏：**Build > Build Bundle(s) / APK(s) > Build APK(s)**。
 3. 或者在终端运行以下命令：
    ```bash
+   # 构建正式 Release 版本
+   ./gradlew assembleRelease
+
+   # 或构建开发 Debug 版本
    ./gradlew assembleDebug
    ```
 
-4. 编译成功后，在 `app/build/outputs/apk/debug/` 目录下获取 `app-debug.apk` 并安装。
+4. 编译成功后，在 `app/build/outputs/apk/release/` 目录下获取 `app-release.apk` 并安装。
 
 ---
 
 ## 鸣谢与开源协议
 
-本项目基于 [MIT License](https://www.google.com/search?q=LICENSE) 许可协议开源。
+本项目基于 [MIT License](LICENSE) 许可协议开源。
 
 特别感谢上游项目 [realzza/bilibili-accelerator](https://github.com/realzza/bilibili-accelerator) 的原作者。本 Android 模块的核心逻辑架构与协议分析均参考自该项目！
 
