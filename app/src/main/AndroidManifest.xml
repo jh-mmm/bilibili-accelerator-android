@@ -58,6 +58,12 @@
             </intent-filter>
         </activity>
 
+        <!-- Modern LibXposed Framework Service Provider -->
+        <provider
+            android:name=".provider.XposedServiceProvider"
+            android:authorities="io.github.jh_mmm.biliaccelerator.XposedService"
+            android:exported="true" />
+
         <!-- Cross-Process Statistics Content Provider -->
         <provider
             android:name=".provider.StatsProvider"

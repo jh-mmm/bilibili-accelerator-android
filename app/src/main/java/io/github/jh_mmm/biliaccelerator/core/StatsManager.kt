@@ -34,7 +34,8 @@ data class StatsSnapshot(
     val mcdnProxied: Long = 0,
     val avoidedHosts: List<String> = emptyList(),
     val recentLogs: List<RewriteLogEntry> = emptyList(),
-    val installedAt: String = ""
+    val installedAt: String = "",
+    val lastHeartbeatTimestamp: Long = 0L
 )
 
 object StatsManager {
@@ -47,6 +48,7 @@ object StatsManager {
     private const val KEY_AVOIDED_HOSTS = "stat_avoided_hosts"
     private const val KEY_RECENT_LOGS = "stat_recent_logs"
     private const val KEY_INSTALLED_AT = "stat_installed_at"
+    private const val KEY_LAST_HEARTBEAT = "stat_last_heartbeat"
 
     private const val MAX_LOGS = 100
     private const val MAX_AVOIDED_HOSTS = 500
@@ -55,6 +57,7 @@ object StatsManager {
     private val totalRewrites = AtomicLong(0)
     private val pcdnBlocked = AtomicLong(0)
     private val mcdnProxied = AtomicLong(0)
+    private val lastHeartbeat = AtomicLong(0L)
     private val avoidedHosts = ConcurrentHashMap.newKeySet<String>()
     private val recentLogs = CopyOnWriteArrayList<RewriteLogEntry>()
     private var installedAt = ""
@@ -85,6 +88,7 @@ object StatsManager {
             totalRewrites.set(sp.getLong(KEY_TOTAL_REWRITES, 0))
             pcdnBlocked.set(sp.getLong(KEY_PCDN_BLOCKED, 0))
             mcdnProxied.set(sp.getLong(KEY_MCDN_PROXIED, 0))
+            lastHeartbeat.set(sp.getLong(KEY_LAST_HEARTBEAT, 0L))
 
             installedAt = sp.getString(KEY_INSTALLED_AT, null) ?: run {
                 val now = LocalDateTime.now().format(installTimeFormatter)
@@ -118,6 +122,23 @@ object StatsManager {
         }
     }
 
+    fun recordHeartbeat(context: Context? = null) {
+        if (context != null) {
+            ensureInitialized(context)
+        }
+        lastHeartbeat.set(System.currentTimeMillis())
+        context?.let { scheduleDebouncedSave(it) }
+    }
+
+    fun isRecentlyActive(thresholdMs: Long = 7L * 24 * 3600 * 1000L): Boolean {
+        val last = lastHeartbeat.get()
+        if (last <= 0L) return false
+        val diff = System.currentTimeMillis() - last
+        return diff in 0..thresholdMs
+    }
+
+    fun getLastHeartbeat(): Long = lastHeartbeat.get()
+
     fun recordRequest(result: RewriteResult, context: Context? = null) {
         if (context != null) {
             ensureInitialized(context)
@@ -138,6 +159,7 @@ object StatsManager {
     }
 
     private fun recordSingleInternal(result: RewriteResult) {
+        lastHeartbeat.set(System.currentTimeMillis())
         totalRequests.incrementAndGet()
 
         if (result.changed) {
@@ -195,6 +217,7 @@ object StatsManager {
                     .putLong(KEY_TOTAL_REWRITES, totalRewrites.get())
                     .putLong(KEY_PCDN_BLOCKED, pcdnBlocked.get())
                     .putLong(KEY_MCDN_PROXIED, mcdnProxied.get())
+                    .putLong(KEY_LAST_HEARTBEAT, lastHeartbeat.get())
                     .putString(KEY_AVOIDED_HOSTS, gson.toJson(avoidedHosts.toList()))
                     .putString(KEY_RECENT_LOGS, gson.toJson(recentLogs.toList()))
                     .apply()
@@ -212,6 +235,7 @@ object StatsManager {
             totalRewrites.set(0)
             pcdnBlocked.set(0)
             mcdnProxied.set(0)
+            lastHeartbeat.set(0L)
             avoidedHosts.clear()
             recentLogs.clear()
             try {
@@ -229,7 +253,8 @@ object StatsManager {
             mcdnProxied = mcdnProxied.get(),
             avoidedHosts = avoidedHosts.toList().sorted(),
             recentLogs = recentLogs.toList(),
-            installedAt = installedAt
+            installedAt = installedAt,
+            lastHeartbeatTimestamp = lastHeartbeat.get()
         )
     }
 
@@ -243,6 +268,13 @@ object StatsManager {
         sb.appendLine("设备型号: ${Build.MANUFACTURER} ${Build.MODEL}")
         sb.appendLine("客户端版本: $appVersion")
         sb.appendLine("模块安装时间: ${snapshot.installedAt}")
+        val lastHb = snapshot.lastHeartbeatTimestamp
+        val lastHbDesc = if (lastHb > 0L) {
+            LocalDateTime.ofInstant(Instant.ofEpochMilli(lastHb), ZoneId.systemDefault()).format(installTimeFormatter)
+        } else {
+            "无心跳记录"
+        }
+        sb.appendLine("最近活跃心跳: $lastHbDesc")
         sb.appendLine("-----------------------------------------")
         sb.appendLine("【当前配置】")
         sb.appendLine("加速开关: ${if (config.enabled) "已启用" else "已关闭"}")

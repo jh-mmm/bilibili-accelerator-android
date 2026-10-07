@@ -56,6 +56,7 @@ class StatsReceiver : BroadcastReceiver() {
                 val listType = object : TypeToken<List<RewriteResult>>() {}.type
                 val results: List<RewriteResult> = gson.fromJson(batchJson, listType)
                 StatsManager.recordRequests(results, context)
+                StatsManager.recordHeartbeat(context)
                 Log.i(TAG, "通过 Broadcast 成功记录批量重定向 (${results.size} 条)")
                 return
             } catch (e: Exception) {

@@ -17,7 +17,7 @@
 -keep class io.github.jh_mmm.biliaccelerator.core.** { *; }
 
 # Keep ContentProvider and UI components
--keep class io.github.jh_mmm.biliaccelerator.provider.StatsProvider { *; }
+-keep class io.github.jh_mmm.biliaccelerator.provider.** { *; }
 -keep class io.github.jh_mmm.biliaccelerator.ui.** { *; }
 
 # Keep isModuleActive hooked via reflection in MainActivity

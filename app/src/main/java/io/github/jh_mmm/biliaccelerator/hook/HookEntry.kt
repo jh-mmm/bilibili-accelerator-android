@@ -16,17 +16,10 @@ class HookEntry : XposedModule() {
         val packageName = param.packageName
         val classLoader = param.defaultClassLoader ?: Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader()
 
-        // 1. Self activation check in module UI
+        // 1. 忽略模块自身包名
+        // 注意：在 LibXposed Modern API (API 101+) 下，LSPosed 明确不再将现代模块自身加入注入作用域，
+        // 激活状态感知改由 XposedService Binder 绑定与运行时回执（Heartbeat/Stats）机制接管。
         if (packageName == BiliAcceleratorCore.MODULE_PACKAGE) {
-            try {
-                val mainActivity = classLoader.loadClass("${BiliAcceleratorCore.MODULE_PACKAGE}.ui.MainActivity")
-                val isModuleActiveMethod = mainActivity.getDeclaredMethod("isModuleActive")
-                hook(isModuleActiveMethod).intercept {
-                    true
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "Self hook failed", t)
-            }
             return
         }
 

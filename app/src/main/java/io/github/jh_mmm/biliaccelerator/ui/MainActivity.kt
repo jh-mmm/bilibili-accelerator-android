@@ -20,6 +20,11 @@ import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
 import io.github.jh_mmm.biliaccelerator.databinding.ActivityMainBinding
 import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
+import io.github.jh_mmm.biliaccelerator.provider.XposedServiceProvider
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 class MainActivity : AppCompatActivity() {
 
@@ -35,9 +40,43 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Hooked by HookEntry to return true when active in LSPosed
+    enum class ActivationState {
+        /** 已生效：已实际重写或过滤视频请求（totalRewrites > 0） */
+        ACTIVE_EFFECTIVE,
+
+        /** 已激活：LSPosed 框架服务已连接，或 7 天内有心跳通信，等待目标应用产生视频流量 */
+        ACTIVE_HEARTBEAT,
+
+        /** 未激活：无框架服务连接且无近期活跃心跳 */
+        INACTIVE;
+
+        val isActive: Boolean
+            get() = this != INACTIVE
+    }
+
+    /**
+     * 判定模块激活与生效状态：
+     * 1. 运行时统计（totalRewrites > 0）：确认已在目标进程生效并执行过加速/拦截；
+     * 2. 框架 Service 绑定状态（XposedServiceProvider.isServiceBound）：确认 LSPosed 已推送 Binder；
+     * 3. 运行时心跳回执（7 天内）：确认目标 B 站进程已注入并成功与伴侣 App 握手。
+     */
+    fun getActivationState(): ActivationState {
+        val snapshot = StatsManager.getSnapshot()
+        if (snapshot.totalRewrites > 0) {
+            return ActivationState.ACTIVE_EFFECTIVE
+        }
+        if (XposedServiceProvider.isServiceBound) {
+            return ActivationState.ACTIVE_HEARTBEAT
+        }
+        if (StatsManager.isRecentlyActive(7L * 24 * 3600 * 1000L)) {
+            return ActivationState.ACTIVE_HEARTBEAT
+        }
+        return ActivationState.INACTIVE
+    }
+
+    // 保留向后兼容
     @Keep
-    open fun isModuleActive(): Boolean = false
+    open fun isModuleActive(): Boolean = getActivationState().isActive
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,6 +93,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        updateStatusBadge()
         refreshStats()
         refreshHandler.removeCallbacks(refreshRunnable)
         refreshHandler.postDelayed(refreshRunnable, 2000L)
@@ -64,26 +104,84 @@ class MainActivity : AppCompatActivity() {
         refreshHandler.removeCallbacks(refreshRunnable)
     }
 
-    private fun initViews() {
-        // Module Status Badge
-        val active = isModuleActive()
-        if (active) {
-            binding.tvStatusBadge.text = getString(R.string.status_active)
-            binding.tvStatusBadge.setTextColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green))
-            binding.tvStatusBadge.setBackgroundColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green_bg))
-        } else {
-            binding.tvStatusBadge.text = getString(R.string.status_badge_inactive)
-            binding.tvStatusBadge.setTextColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_red))
-            binding.tvStatusBadge.setBackgroundColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_red_bg))
+    private fun updateStatusBadge() {
+        val state = getActivationState()
+        when (state) {
+            ActivationState.ACTIVE_EFFECTIVE -> {
+                binding.tvStatusBadge.text = getString(R.string.status_badge_in_effect)
+                binding.tvStatusBadge.setTextColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green))
+                binding.tvStatusBadge.setBackgroundColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green_bg))
+            }
+            ActivationState.ACTIVE_HEARTBEAT -> {
+                binding.tvStatusBadge.text = getString(R.string.status_badge_active)
+                binding.tvStatusBadge.setTextColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green))
+                binding.tvStatusBadge.setBackgroundColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green_bg))
+            }
+            ActivationState.INACTIVE -> {
+                binding.tvStatusBadge.text = getString(R.string.status_badge_inactive)
+                binding.tvStatusBadge.setTextColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_red))
+                binding.tvStatusBadge.setBackgroundColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_red_bg))
+            }
+        }
+    }
+
+    private fun showStatusDialog() {
+        val state = getActivationState()
+        val snapshot = StatsManager.getSnapshot()
+        val hookReport = io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.formatReport()
+        val isServiceBound = XposedServiceProvider.isServiceBound
+
+        val message = StringBuilder()
+        when (state) {
+            ActivationState.ACTIVE_EFFECTIVE -> {
+                message.appendLine("状态：已生效 (运行正常)")
+                message.appendLine("已成功拦截并加速视频播放，累计重写 ${snapshot.totalRewrites} 次。")
+            }
+            ActivationState.ACTIVE_HEARTBEAT -> {
+                message.appendLine("状态：已激活 (等待流量)")
+                if (isServiceBound) {
+                    message.appendLine("LSPosed 框架服务已成功连接。")
+                } else {
+                    message.appendLine("目标应用（B站）已成功挂载并向本模块握手。")
+                }
+                message.appendLine("播放任意 B 站视频即可开始加速并生成重写记录。")
+            }
+            ActivationState.INACTIVE -> {
+                message.appendLine("状态：未激活")
+                message.appendLine("排查指引：")
+                message.appendLine("1. 打开 LSPosed 管理器，确认本模块开关已开启；")
+                message.appendLine("2. 在模块作用域中勾选“哔哩哔哩”（无需且无法勾选模块自身）；")
+                message.appendLine("3. 强行停止哔哩哔哩后重新打开，播放视频测试。")
+            }
         }
 
+        message.appendLine()
+        message.appendLine("【框架与运行时状态】")
+        message.appendLine("框架 Service 绑定: ${if (isServiceBound) "已连接" else "未连接"}")
+        val lastHb = snapshot.lastHeartbeatTimestamp
+        val lastHbDesc = if (lastHb > 0L) {
+            LocalDateTime.ofInstant(Instant.ofEpochMilli(lastHb), ZoneId.systemDefault())
+                .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+        } else {
+            "无记录"
+        }
+        message.appendLine("最近心跳回执: $lastHbDesc")
+        message.appendLine()
+        message.appendLine("【Hook 挂载状态】")
+        message.append(hookReport)
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.title_status_detail)
+            .setMessage(message.toString())
+            .setPositiveButton(R.string.dialog_confirm, null)
+            .show()
+    }
+
+    private fun initViews() {
+        // Module Status Badge
+        updateStatusBadge()
         binding.tvStatusBadge.setOnClickListener {
-            val hookReport = io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.formatReport()
-            AlertDialog.Builder(this)
-                .setTitle("Hook 挂载状态")
-                .setMessage(hookReport)
-                .setPositiveButton(R.string.dialog_confirm, null)
-                .show()
+            showStatusDialog()
         }
 
         // RecyclerView
@@ -185,6 +283,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshStats() {
+        updateStatusBadge()
         val snapshot = StatsManager.getSnapshot()
         binding.tvStatTotalRewrites.text = snapshot.totalRewrites.toString()
         binding.tvStatPcdnBlocked.text = snapshot.pcdnBlocked.toString()

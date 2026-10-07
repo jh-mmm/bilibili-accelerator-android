@@ -27,6 +27,7 @@ class StatsProvider : ContentProvider() {
         const val METHOD_GET_STATS = "getStats"
         const val METHOD_CLEAR_STATS = "clearStats"
         const val METHOD_GET_CONFIG = "getConfig"
+        const val METHOD_HEARTBEAT = "heartbeat"
 
         const val EXTRA_REWRITE_RESULT = "extra_rewrite_result"
         const val EXTRA_REWRITE_BATCH_JSON = "extra_rewrite_batch_json"
@@ -127,6 +128,7 @@ class StatsProvider : ContentProvider() {
                         val listType = object : TypeToken<List<RewriteResult>>() {}.type
                         val results: List<RewriteResult> = gson.fromJson(json, listType)
                         StatsManager.recordRequests(results, ctx)
+                        StatsManager.recordHeartbeat(ctx)
                         response.putBoolean(EXTRA_SUCCESS, true)
                         log("已批量记录重定向: ${results.size} 条记录 (来自 uid=$uid)")
                     } catch (e: Exception) {
@@ -144,6 +146,7 @@ class StatsProvider : ContentProvider() {
                     try {
                         val result = gson.fromJson(json, RewriteResult::class.java)
                         StatsManager.recordRequest(result, ctx)
+                        StatsManager.recordHeartbeat(ctx)
                         response.putBoolean(EXTRA_SUCCESS, true)
                         log("已记录单条重定向：${result.originalHost} -> ${result.targetHost} [${result.reason}] (来自 uid=$uid)")
                     } catch (e: Exception) {
@@ -164,8 +167,14 @@ class StatsProvider : ContentProvider() {
                 response.putBoolean(EXTRA_SUCCESS, true)
             }
             METHOD_GET_CONFIG -> {
+                StatsManager.recordHeartbeat(ctx)
                 val config = loadConfig(ctx)
                 response.putString(EXTRA_CONFIG_JSON, gson.toJson(config))
+            }
+            METHOD_HEARTBEAT -> {
+                StatsManager.recordHeartbeat(ctx)
+                response.putBoolean(EXTRA_SUCCESS, true)
+                log("收到来自目标应用的心跳回执 (来自 uid=$uid)")
             }
         }
         return response
