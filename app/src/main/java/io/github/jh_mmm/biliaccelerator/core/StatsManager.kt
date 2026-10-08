@@ -2,6 +2,7 @@ package io.github.jh_mmm.biliaccelerator.core
 
 import android.content.Context
 import android.os.Build
+import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.time.Instant
@@ -35,7 +36,8 @@ data class StatsSnapshot(
     val avoidedHosts: List<String> = emptyList(),
     val recentLogs: List<RewriteLogEntry> = emptyList(),
     val installedAt: String = "",
-    val lastHeartbeatTimestamp: Long = 0L
+    val lastHeartbeatTimestamp: Long = 0L,
+    val hookStatus: Map<String, String> = emptyMap()
 )
 
 object StatsManager {
@@ -49,9 +51,13 @@ object StatsManager {
     private const val KEY_RECENT_LOGS = "stat_recent_logs"
     private const val KEY_INSTALLED_AT = "stat_installed_at"
     private const val KEY_LAST_HEARTBEAT = "stat_last_heartbeat"
+    private const val KEY_HOOK_STATUS = "stat_hook_status"
 
+    private const val TAG = "BiliAccelerator-Stats"
     private const val MAX_LOGS = 100
     private const val MAX_AVOIDED_HOSTS = 500
+    private const val MAX_HOOK_ENTRIES = 100
+    private const val MAX_BATCH_SIZE = 200
 
     private val totalRequests = AtomicLong(0)
     private val totalRewrites = AtomicLong(0)
@@ -60,6 +66,7 @@ object StatsManager {
     private val lastHeartbeat = AtomicLong(0L)
     private val avoidedHosts = ConcurrentHashMap.newKeySet<String>()
     private val recentLogs = CopyOnWriteArrayList<RewriteLogEntry>()
+    private val hookStatus = ConcurrentHashMap<String, String>()
     private var installedAt = ""
 
     private val logTimeFormatter = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss", Locale.getDefault())
@@ -77,12 +84,14 @@ object StatsManager {
     private val statsLock = Any()
 
     fun init(context: Context) {
-        // 保证进程内单次幂等初始化，避免多处调用（Provider与Activity）导致日志翻倍与计数回退
-        if (!isInitialized.compareAndSet(false, true)) {
+        if (isInitialized.get()) {
             return
         }
 
         synchronized(statsLock) {
+            if (isInitialized.get()) {
+                return
+            }
             val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             totalRequests.set(sp.getLong(KEY_TOTAL_REQUESTS, 0))
             totalRewrites.set(sp.getLong(KEY_TOTAL_REWRITES, 0))
@@ -113,6 +122,18 @@ object StatsManager {
                     recentLogs.addAll(list.take(MAX_LOGS))
                 } catch (_: Exception) {}
             }
+
+            val hookJson = sp.getString(KEY_HOOK_STATUS, null)
+            if (!hookJson.isNullOrEmpty()) {
+                try {
+                    val map: Map<String, String> = gson.fromJson(hookJson, object : TypeToken<Map<String, String>>() {}.type)
+                    hookStatus.clear()
+                    hookStatus.putAll(map)
+                    io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.updateFromMap(map)
+                } catch (_: Exception) {}
+            }
+
+            isInitialized.set(true)
         }
     }
 
@@ -130,30 +151,32 @@ object StatsManager {
         context?.let { scheduleDebouncedSave(it) }
     }
 
-    fun isRecentlyActive(thresholdMs: Long = 7L * 24 * 3600 * 1000L): Boolean {
-        val last = lastHeartbeat.get()
-        if (last <= 0L) return false
-        val diff = System.currentTimeMillis() - last
-        return diff in 0..thresholdMs
-    }
-
-    fun getLastHeartbeat(): Long = lastHeartbeat.get()
-
-    fun recordRequest(result: RewriteResult, context: Context? = null) {
+    fun recordHookStatus(status: Map<String, String>, context: Context? = null) {
+        if (status.isEmpty()) return
         if (context != null) {
             ensureInitialized(context)
         }
-        recordSingleInternal(result)
+        for ((k, v) in status.entries.take(MAX_HOOK_ENTRIES)) {
+            if (hookStatus.size >= MAX_HOOK_ENTRIES && !hookStatus.containsKey(k)) break
+            hookStatus[k.trim().take(64)] = v.trim().take(256)
+        }
+        io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.updateFromMap(hookStatus)
         context?.let { scheduleDebouncedSave(it) }
     }
+
+    fun getLastHeartbeat(): Long = lastHeartbeat.get()
 
     fun recordRequests(results: List<RewriteResult>, context: Context? = null) {
         if (results.isEmpty()) return
         if (context != null) {
             ensureInitialized(context)
         }
-        for (result in results) {
-            recordSingleInternal(result)
+        for (result in results.take(MAX_BATCH_SIZE)) {
+            try {
+                recordSingleInternal(result)
+            } catch (t: Throwable) {
+                Log.w(TAG, "跳过异常统计条目: ${t.message}")
+            }
         }
         context?.let { scheduleDebouncedSave(it) }
     }
@@ -164,12 +187,15 @@ object StatsManager {
 
         if (result.changed) {
             totalRewrites.incrementAndGet()
+            val rawOriginalHost = (result.originalHost ?: "").trim().take(128)
+            val rawTargetHost = (result.targetHost ?: "").trim().take(128)
+            val rawReason = (result.reason ?: "").trim().take(64)
+
             if (result.isPcdn) {
                 pcdnBlocked.incrementAndGet()
-                val host = result.originalHost.trim().take(128)
-                if (host.isNotBlank()) {
-                    if (avoidedHosts.size < MAX_AVOIDED_HOSTS || avoidedHosts.contains(host)) {
-                        avoidedHosts.add(host)
+                if (rawOriginalHost.isNotBlank()) {
+                    if (avoidedHosts.size < MAX_AVOIDED_HOSTS || avoidedHosts.contains(rawOriginalHost)) {
+                        avoidedHosts.add(rawOriginalHost)
                     }
                 }
             }
@@ -184,9 +210,9 @@ object StatsManager {
             val entry = RewriteLogEntry(
                 timestamp = now,
                 timeFormatted = formattedTime,
-                originalHost = result.originalHost.trim().take(128),
-                targetHost = result.targetHost.trim().take(128),
-                reason = result.reason.trim().take(64),
+                originalHost = rawOriginalHost,
+                targetHost = rawTargetHost,
+                reason = rawReason,
                 isPcdn = result.isPcdn,
                 isMcdn = result.isMcdn
             )
@@ -220,12 +246,14 @@ object StatsManager {
                     .putLong(KEY_LAST_HEARTBEAT, lastHeartbeat.get())
                     .putString(KEY_AVOIDED_HOSTS, gson.toJson(avoidedHosts.toList()))
                     .putString(KEY_RECENT_LOGS, gson.toJson(recentLogs.toList()))
+                    .putString(KEY_HOOK_STATUS, gson.toJson(hookStatus))
                     .apply()
             } catch (_: Exception) {}
         }
     }
 
     fun clearStats(context: Context) {
+        ensureInitialized(context)
         synchronized(saveLock) {
             pendingSaveFuture?.cancel(false)
             pendingSaveFuture = null
@@ -235,12 +263,19 @@ object StatsManager {
             totalRewrites.set(0)
             pcdnBlocked.set(0)
             mcdnProxied.set(0)
-            lastHeartbeat.set(0L)
+            // 注意：不重置 lastHeartbeat 与 hookStatus，避免指标清零连带将模块健康与激活状态误打回“未激活”
             avoidedHosts.clear()
             recentLogs.clear()
             try {
                 val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                sp.edit().clear().putString(KEY_INSTALLED_AT, installedAt).apply()
+                sp.edit()
+                    .putLong(KEY_TOTAL_REQUESTS, 0L)
+                    .putLong(KEY_TOTAL_REWRITES, 0L)
+                    .putLong(KEY_PCDN_BLOCKED, 0L)
+                    .putLong(KEY_MCDN_PROXIED, 0L)
+                    .putString(KEY_AVOIDED_HOSTS, gson.toJson(emptyList<String>()))
+                    .putString(KEY_RECENT_LOGS, gson.toJson(emptyList<RewriteLogEntry>()))
+                    .apply()
             } catch (_: Exception) {}
         }
     }
@@ -254,7 +289,8 @@ object StatsManager {
             avoidedHosts = avoidedHosts.toList().sorted(),
             recentLogs = recentLogs.toList(),
             installedAt = installedAt,
-            lastHeartbeatTimestamp = lastHeartbeat.get()
+            lastHeartbeatTimestamp = lastHeartbeat.get(),
+            hookStatus = HashMap(hookStatus)
         )
     }
 
@@ -286,7 +322,9 @@ object StatsManager {
         sb.appendLine("-----------------------------------------")
         sb.appendLine("【Hook 挂载状态】")
         try {
-            val hookReport = io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.formatReport()
+            val hookReport = io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.formatReport(
+                snapshot.hookStatus.ifEmpty { io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.getSnapshot() }
+            )
             sb.appendLine(hookReport)
         } catch (_: Throwable) {
             sb.appendLine("状态不可用")

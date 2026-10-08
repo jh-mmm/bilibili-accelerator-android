@@ -10,11 +10,17 @@ class HookEntry : XposedModule() {
 
     companion object {
         private const val TAG = "BiliAccelerator"
+        private val hookedPackages = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     }
 
+    @android.annotation.SuppressLint("NewApi")
     override fun onPackageLoaded(param: PackageLoadedParam) {
         val packageName = param.packageName
-        val classLoader = param.defaultClassLoader ?: Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader()
+        val classLoader = try {
+            param.defaultClassLoader
+        } catch (_: Throwable) {
+            null
+        } ?: Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader()
 
         // 1. 忽略模块自身包名
         // 注意：在 LibXposed Modern API (API 101+) 下，LSPosed 明确不再将现代模块自身加入注入作用域，
@@ -25,6 +31,11 @@ class HookEntry : XposedModule() {
 
         // 2. Target Bilibili Apps
         if (BiliAcceleratorCore.TARGET_PACKAGES.contains(packageName)) {
+            // 确保同一进程内对特定包名仅注入一次，避免多ClassLoader或边界调用重复安装
+            if (!hookedPackages.add(packageName)) {
+                return
+            }
+
             Log.i(TAG, "Injecting into $packageName via LibXposed API 101")
 
             // 尽早捕获 Application 实例，供统计上报（跨进程 ContentProvider 调用）使用

@@ -4,7 +4,6 @@ import android.util.Log
 import io.github.libxposed.api.XposedModule
 import java.math.BigDecimal
 import java.math.BigInteger
-import java.lang.reflect.Method
 
 object MossGrpcHook {
 
@@ -26,89 +25,109 @@ object MossGrpcHook {
             } ?: continue
 
             try {
-                // 仅拦截无参或单个上下文参数的 tf() 方法，避免误命中同名其他重载方法
+                // 仅拦截带单个请求上下文参数、声明在 RuntimeHelper 且返回类型符合协议预期（Boolean/String/Number/Enum）的 tf() 方法
                 val tfMethods = (runtimeHelper.declaredMethods + runtimeHelper.methods)
                     .distinct()
-                    .filter { it.name == "tf" && it.returnType != Void.TYPE && it.parameterTypes.size <= 1 }
+                    .filter {
+                        it.name == "tf" &&
+                                it.declaringClass == runtimeHelper &&
+                                it.parameterTypes.size == 1 &&
+                                isSupportedReturnType(it.returnType)
+                    }
 
+                var hookCount = 0
                 for (method in tfMethods) {
-                    module.hook(method).intercept { chain ->
-                        val config = RemoteClient.fetchConfig()
-                        val result = chain.proceed()
-                        if (!config.enabled || !config.blockPcdn || result == null) {
-                            return@intercept result
-                        }
-
-                        val returnType = method.returnType
-
-                        // 1. Boolean / boolean 返回类型
-                        if (returnType == java.lang.Boolean.TYPE || returnType == java.lang.Boolean::class.java || result is Boolean) {
-                            if (result == false) {
-                                Log.i(TAG, "Injected TF=true (Boolean) to force official mirror CDN from server")
-                                return@intercept true
+                    try {
+                        module.hook(method).intercept { chain ->
+                            val config = RemoteClient.fetchConfig()
+                            val result = chain.proceed()
+                            if (!config.enabled || !config.blockPcdn || result == null) {
+                                return@intercept result
                             }
-                            return@intercept result
-                        }
 
-                        // 2. String 返回类型
-                        if (returnType == String::class.java || result is String) {
-                            val str = result.toString()
-                            if (str == "0" || str.equals("false", ignoreCase = true) || str.isEmpty()) {
-                                Log.i(TAG, "Injected TF='1' (String) to force official mirror CDN from server")
-                                return@intercept "1"
-                            }
-                            return@intercept result
-                        }
+                            val returnType = method.returnType
 
-                        // 3. Primitive/Boxed number 返回类型：严格按 method.returnType 匹配，杜绝拆箱 ClassCastException
-                        if (result is Number) {
-                            if (result.toDouble() == 0.0) {
-                                val modified = convertNumberToTfOne(returnType, result)
-                                Log.i(TAG, "Injected TF=1 (${modified.javaClass.simpleName}) to force official mirror CDN from server")
-                                return@intercept modified
-                            }
-                            return@intercept result
-                        }
-
-                        // 4. Protobuf Enum 返回类型
-                        // 在 B 站 Moss gRPC 协议中，TF (Traffic Flow / Mirror Flag) 枚举中：
-                        // TF=0 代表 UNSPECIFIED / DEFAULT（默认算法调度，包含大量 PCDN/MCDN 节点）；
-                        // TF=1 代表 OFFICIAL / MIRROR（由服务端强制下发官方 UPOS 直连镜像节点）。
-                        try {
-                            val getNumber = result.javaClass.getMethod("getNumber")
-                            val currentNum = getNumber.invoke(result) as? Int
-                            if (currentNum == 0) {
-                                val forNumberMethod = try {
-                                    result.javaClass.getMethod("forNumber", Int::class.javaPrimitiveType)
-                                } catch (_: NoSuchMethodException) {
-                                    result.javaClass.getMethod("valueOf", Int::class.javaPrimitiveType)
+                            // 1. Boolean / boolean 返回类型
+                            if (returnType == java.lang.Boolean.TYPE || returnType == java.lang.Boolean::class.java || result is Boolean) {
+                                if (result == false) {
+                                    Log.i(TAG, "Injected TF=true (Boolean) to force official mirror CDN from server")
+                                    return@intercept true
                                 }
-                                val mirrorTf = forNumberMethod.invoke(null, 1)
-                                if (mirrorTf != null) {
-                                    Log.i(TAG, "Injected TF=1 (protobuf enum: ${result.javaClass.simpleName}) to force official mirror CDN from server")
-                                    return@intercept mirrorTf
-                                }
+                                return@intercept result
                             }
-                        } catch (_: Throwable) {}
 
-                        result
+                            // 2. String 返回类型
+                            if (returnType == String::class.java || result is String) {
+                                val str = result.toString()
+                                if (str == "0" || str.equals("false", ignoreCase = true) || str.isEmpty()) {
+                                    Log.i(TAG, "Injected TF='1' (String) to force official mirror CDN from server")
+                                    return@intercept "1"
+                                }
+                                return@intercept result
+                            }
+
+                            // 3. Primitive/Boxed number 返回类型：严格按 method.returnType 匹配，杜绝拆箱 ClassCastException
+                            if (result is Number) {
+                                if (result.toDouble() == 0.0) {
+                                    val modified = convertNumberToTfOne(returnType, result)
+                                    Log.i(TAG, "Injected TF=1 (${modified.javaClass.simpleName}) to force official mirror CDN from server")
+                                    return@intercept modified
+                                }
+                                return@intercept result
+                            }
+
+                            // 4. Protobuf Enum 返回类型
+                            // 在 B 站 Moss gRPC 协议中，TF (Traffic Flow / Mirror Flag) 枚举中：
+                            // TF=0 代表 UNSPECIFIED / DEFAULT（默认算法调度，包含大量 PCDN/MCDN 节点）；
+                            // TF=1 代表 OFFICIAL / MIRROR（由服务端强制下发官方 UPOS 直连镜像节点）。
+                            try {
+                                val getNumber = result.javaClass.getMethod("getNumber")
+                                val currentNum = getNumber.invoke(result) as? Int
+                                if (currentNum == 0) {
+                                    val forNumberMethod = try {
+                                        result.javaClass.getMethod("forNumber", Int::class.javaPrimitiveType)
+                                    } catch (_: NoSuchMethodException) {
+                                        result.javaClass.getMethod("valueOf", Int::class.javaPrimitiveType)
+                                    }
+                                    val mirrorTf = forNumberMethod.invoke(null, 1)
+                                    if (mirrorTf != null) {
+                                        Log.i(TAG, "Injected TF=1 (protobuf enum: ${result.javaClass.simpleName}) to force official mirror CDN from server")
+                                        return@intercept mirrorTf
+                                    }
+                                }
+                            } catch (_: Throwable) {}
+
+                            result
+                        }
+                        hookCount++
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "Failed to hook method ${method.name} on $className: ${t.message}")
                     }
                 }
 
-                if (tfMethods.isNotEmpty()) {
-                    Log.i(TAG, "Successfully hooked ${tfMethods.size} RuntimeHelper.tf() methods on $className")
+                if (hookCount > 0) {
+                    Log.i(TAG, "Successfully hooked $hookCount RuntimeHelper.tf() methods on $className")
                     hooked = true
-                    HookStatusTracker.recordStatus("moss_grpc", className)
+                    HookStatusTracker.recordStatus("moss_grpc", "$className ($hookCount hooks)")
                     break
                 }
             } catch (t: Throwable) {
-                Log.w(TAG, "Failed to hook RuntimeHelper.tf() on $className: ${t.message}")
+                Log.w(TAG, "Failed to process RuntimeHelper on $className: ${t.message}")
             }
         }
 
         if (!hooked) {
-            Log.i(TAG, "RuntimeHelper class not found, skipping Moss TF hook")
+            HookStatusTracker.recordStatus("moss_grpc", "未找到 (版本不兼容)")
+            Log.i(TAG, "RuntimeHelper class not found or incompatible, skipping Moss TF hook")
         }
+    }
+
+    internal fun isSupportedReturnType(clazz: Class<*>): Boolean {
+        if (clazz == java.lang.Boolean.TYPE || clazz == java.lang.Boolean::class.java) return true
+        if (clazz == String::class.java) return true
+        if (Number::class.java.isAssignableFrom(clazz) || (clazz.isPrimitive && clazz != java.lang.Void.TYPE)) return true
+        if (clazz.isEnum || clazz.name.contains("Tf", ignoreCase = true) || clazz.name.contains("Traffic", ignoreCase = true)) return true
+        return false
     }
 
     internal fun convertNumberToTfOne(returnType: Class<*>, result: Number): Any {

@@ -19,13 +19,16 @@ on:
       - master
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build Android APK
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout Repository
@@ -49,16 +52,33 @@ jobs:
               echo "::error::KEYSTORE_BASE64 was provided but base64 decoding failed or produced an empty file!"
               exit 1
             fi
+            if [ -z "$STORE_PASS" ] || [ -z "$ALIAS" ]; then
+              echo "::error::KEYSTORE_PASSWORD or KEY_ALIAS secret is missing while KEYSTORE_BASE64 is provided!"
+              exit 1
+            fi
+            echo "KEYSTORE_PASSWORD=$STORE_PASS" >> $GITHUB_ENV
+            echo "KEY_ALIAS=$ALIAS" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=${KEY_PASS:-$STORE_PASS}" >> $GITHUB_ENV
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             echo "::error::Release tag build requires secret KEYSTORE_BASE64 to guarantee consistent APK signatures!"
             exit 1
           else
-            echo "::warning::KEYSTORE_BASE64 is not set; generating development fallback release keystore"
-            keytool -genkey -v -keystore app/release.jks -alias biliaccelerator -keyalg RSA -keysize 2048 -validity 10000 -storepass biliaccelerator -keypass biliaccelerator -dname "CN=BiliAccelerator, OU=Dev, O=BiliAccelerator, L=SH, ST=SH, C=CN"
+            echo "::warning::KEYSTORE_BASE64 is not set; generating ephemeral development keystore"
+            DEV_PASS=$(openssl rand -hex 16)
+            keytool -genkey -v -keystore app/release.jks -alias dev -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$DEV_PASS" -keypass "$DEV_PASS" \
+              -dname "CN=BiliAccelerator, OU=Dev, O=BiliAccelerator, L=SH, ST=SH, C=CN"
+            echo "KEYSTORE_PASSWORD=$DEV_PASS" >> $GITHUB_ENV
+            echo "KEY_ALIAS=dev" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=$DEV_PASS" >> $GITHUB_ENV
+            echo "IS_DEV_BUILD=true" >> $GITHUB_ENV
           fi
           echo "Keystore ready: $(wc -c < app/release.jks) bytes"
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
 
       - name: Run Lint & Unit Tests
         run: |
@@ -80,9 +100,9 @@ jobs:
           fi
         env:
           KEYSTORE_FILE: release.jks
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEYSTORE_PASSWORD: ${{ env.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ env.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ env.KEY_PASSWORD }}
 
       - name: Prepare APK Artifacts
         id: prepare_artifact
@@ -93,7 +113,8 @@ jobs:
           if [[ "$VERSION_TAG" == v* ]]; then
             NAME="BiliAccelerator-${VERSION_TAG}.apk"
           else
-            NAME="BiliAccelerator-${SHORT_SHA}.apk"
+            NAME="BiliAccelerator-${SHORT_SHA}-dev.apk"
+            echo "::warning::Non-release tag build produced a development artifact (-dev) with ephemeral signing key. Do NOT distribute as an official release."
           fi
           APK_FILE=$(find app/build/outputs -name "*release*.apk" 2>/dev/null | head -n 1)
           if [ -z "$APK_FILE" ]; then
@@ -115,11 +136,24 @@ jobs:
           path: outputs/*.apk
           retention-days: 30
 
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download APK from Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_outputs
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: outputs/*.apk
+          files: release_outputs/**/*.apk
           draft: false
           prerelease: false
           generate_release_notes: true

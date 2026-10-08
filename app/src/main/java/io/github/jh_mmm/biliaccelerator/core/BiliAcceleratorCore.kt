@@ -1,6 +1,7 @@
 package io.github.jh_mmm.biliaccelerator.core
 
 import android.net.Uri
+import io.github.jh_mmm.biliaccelerator.BuildConfig
 import java.net.URLDecoder
 
 data class RewriteResult(
@@ -26,7 +27,7 @@ data class AcceleratorConfig(
 
 object BiliAcceleratorCore {
 
-    const val MODULE_PACKAGE = "io.github.jh_mmm.biliaccelerator"
+    val MODULE_PACKAGE: String = BuildConfig.APPLICATION_ID
 
     val TARGET_PACKAGES = setOf(
         "tv.danmaku.bili",
@@ -50,7 +51,6 @@ object BiliAcceleratorCore {
 
     private val HOSTNAME_REGEX = Regex("""^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(:[0-9]{1,5})?$""")
     private val MEDIA_PATH_REGEX = Regex("""\.(m4s|mp4|flv|m3u8)(?:$|[?#])""", RegexOption.IGNORE_CASE)
-    private val IPV4_REGEX = Regex("""^(?:\d{1,3}\.){3}\d{1,3}$""")
     private val IPV6_REGEX = Regex("""^\[?[0-9a-fA-F:]+\]?$""")
 
     fun isIpAddress(rawHost: String): Boolean {
@@ -63,7 +63,10 @@ object BiliAcceleratorCore {
         } else if (!h.contains("::") && h.count { it == ':' } == 1) {
             h = h.substringBefore(':')
         }
-        if (IPV4_REGEX.matches(h)) return true
+        val parts = h.split('.')
+        if (parts.size == 4 && parts.all { part -> part.toIntOrNull()?.let { it in 0..255 } == true }) {
+            return true
+        }
         return h.contains(':') && IPV6_REGEX.matches(h)
     }
 
@@ -226,14 +229,6 @@ object BiliAcceleratorCore {
         }
     }
 
-    fun isMediaUrl(uri: Uri): Boolean {
-        val path = uri.path ?: ""
-        val full = uri.toString()
-        return MEDIA_PATH_REGEX.containsMatchIn(full) ||
-                path.startsWith("/upgcxcode/") ||
-                path.startsWith("/v1/resource/")
-    }
-
     fun isLiveMediaUrl(path: String, fullUrl: String = ""): Boolean {
         val lowerPath = path.lowercase()
         val lowerUrl = fullUrl.lowercase()
@@ -254,7 +249,7 @@ object BiliAcceleratorCore {
 
         val parsed = parseUri(original) ?: return noChange(original, "parse-failed")
         val hostname = parsed.host.lowercase()
-        val cleanProxyHost = cleanHost(config.proxyHost).ifBlank { "proxy-tf-all-ws.bilivideo.com" }
+        val cleanProxyHost = cleanHost(config.proxyHost).substringBefore(':').ifBlank { "proxy-tf-all-ws.bilivideo.com" }
         if (hostname == cleanProxyHost) {
             return noChange(original, "already-proxied", isMcdn = true)
         }
@@ -288,14 +283,14 @@ object BiliAcceleratorCore {
             val cleanedSource = cleanHost(rawSource)
             val hostOnly = cleanedSource.substringBefore(':')
             if (isValidHost(cleanedSource) && isBiliCdnHost(hostOnly)) {
-                val rewritten = parsed.replaceAuthority(cleanedSource)
+                val rewritten = parsed.replaceAuthority(hostOnly)
                 if (rewritten != original) {
                     return RewriteResult(
                         changed = true,
                         originalUrl = original,
                         finalUrl = rewritten,
                         originalHost = hostname,
-                        targetHost = cleanedSource,
+                        targetHost = hostOnly,
                         reason = if (hostname.endsWith(".mountaintoys.cn", ignoreCase = true)) "mountaintoys-source" else "szbdyd-source",
                         isPcdn = true,
                         isMcdn = false
@@ -335,20 +330,20 @@ object BiliAcceleratorCore {
 
         if (shouldRewrite) {
             val cleanedTarget = cleanHost(config.targetHost)
-            val target = if (isValidHost(cleanedTarget) && (isBiliCdnHost(cleanedTarget) || CANDIDATE_POOL.contains(cleanedTarget))) {
-                cleanedTarget
+            val targetHostOnly = cleanedTarget.substringBefore(':')
+            val target = if (isValidHost(cleanedTarget) && (isBiliCdnHost(targetHostOnly) || CANDIDATE_POOL.contains(targetHostOnly))) {
+                targetHostOnly
             } else {
                 CANDIDATE_POOL[0]
             }
-            val targetHostOnly = target.substringBefore(':')
-            val rewritten = parsed.replaceAuthority(targetHostOnly)
+            val rewritten = parsed.replaceAuthority(target)
             if (rewritten != original) {
                 return RewriteResult(
                     changed = true,
                     originalUrl = original,
                     finalUrl = rewritten,
                     originalHost = hostname,
-                    targetHost = targetHostOnly,
+                    targetHost = target,
                     reason = if (isPcdn) "pcdn-host" else if (isMcdn) "mcdn-host" else "force-upos",
                     isPcdn = isPcdn,
                     isMcdn = isMcdn

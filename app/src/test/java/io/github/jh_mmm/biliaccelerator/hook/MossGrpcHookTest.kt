@@ -1,6 +1,7 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.math.BigDecimal
@@ -57,5 +58,21 @@ class MossGrpcHookTest {
 
         val intResult = MossGrpcHook.convertNumberToTfOne(BigInteger::class.java, BigInteger.ZERO)
         assertEquals(BigInteger.ONE, intResult)
+    }
+
+    private enum class DummyTfEnum {
+        DEFAULT, MIRROR
+    }
+
+    @Test
+    fun testIsSupportedReturnType() {
+        assertTrue("Boolean primitive", MossGrpcHook.isSupportedReturnType(java.lang.Boolean.TYPE))
+        assertTrue("Boolean boxed", MossGrpcHook.isSupportedReturnType(java.lang.Boolean::class.java))
+        assertTrue("String", MossGrpcHook.isSupportedReturnType(String::class.java))
+        assertTrue("Int primitive", MossGrpcHook.isSupportedReturnType(java.lang.Integer.TYPE))
+        assertTrue("Long boxed", MossGrpcHook.isSupportedReturnType(java.lang.Long::class.java))
+        assertTrue("Enum", MossGrpcHook.isSupportedReturnType(DummyTfEnum::class.java))
+        assertFalse("Void", MossGrpcHook.isSupportedReturnType(java.lang.Void.TYPE))
+        assertFalse("Object", MossGrpcHook.isSupportedReturnType(Any::class.java))
     }
 }

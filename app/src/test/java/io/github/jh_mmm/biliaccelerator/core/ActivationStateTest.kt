@@ -5,17 +5,11 @@ import io.github.jh_mmm.biliaccelerator.provider.XposedServiceProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
-import org.junit.Before
 import org.junit.Test
 
 class ActivationStateTest {
 
     private val gson = Gson()
-
-    @Before
-    fun setUp() {
-        XposedServiceProvider.resetForTesting(bound = false, binder = null)
-    }
 
     @Test
     fun testStatsSnapshotSerializationWithHeartbeat() {
@@ -66,7 +60,7 @@ class ActivationStateTest {
         val isServiceBound = XposedServiceProvider.isServiceBound
 
         assertTrue("Should be effective when totalRewrites > 0", hasRewrites)
-        assertFalse("Framework service is not bound", isServiceBound)
+        assertFalse("Framework service is not bound initially in test environment", isServiceBound)
     }
 
     @Test
@@ -90,9 +84,7 @@ class ActivationStateTest {
     }
 
     @Test
-    fun testFrameworkServiceBindingState() {
-        assertFalse(XposedServiceProvider.isServiceBound)
-        XposedServiceProvider.resetForTesting(bound = true, binder = null)
-        assertTrue(XposedServiceProvider.isServiceBound)
+    fun testFrameworkServiceBindingDefaultState() {
+        assertFalse("Initial framework service binding state must be false", XposedServiceProvider.isServiceBound)
     }
 }

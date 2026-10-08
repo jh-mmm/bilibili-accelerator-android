@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string-array name="xposed_scope">
-        <item>io.github.jh_mmm.biliaccelerator</item>
         <item>tv.danmaku.bili</item>
         <item>com.bilibili.app.in</item>
         <item>com.bstar.intl</item>

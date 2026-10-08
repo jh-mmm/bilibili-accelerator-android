@@ -12,6 +12,8 @@
     <color name="tag_upos">#66BB6A</color>
     <color name="status_green">#2ECC71</color>
     <color name="status_green_bg">#302ECC71</color>
+    <color name="status_blue">#00AEEC</color>
+    <color name="status_blue_bg">#3000AEEC</color>
     <color name="status_red">#E74C3C</color>
     <color name="status_red_bg">#30E74C3C</color>
     <color name="divider">#2A2A2A</color>

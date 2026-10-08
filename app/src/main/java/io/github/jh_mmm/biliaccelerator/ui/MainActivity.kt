@@ -3,34 +3,37 @@ package io.github.jh_mmm.biliaccelerator.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.graphics.Color
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.view.View
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
 import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.annotation.Keep
-import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
-import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.jh_mmm.biliaccelerator.R
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.RewriteLogEntry
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
-import io.github.jh_mmm.biliaccelerator.databinding.ActivityMainBinding
+import io.github.jh_mmm.biliaccelerator.core.StatsSnapshot
 import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
 import io.github.jh_mmm.biliaccelerator.provider.XposedServiceProvider
-import java.time.Instant
-import java.time.LocalDateTime
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
+import io.github.jh_mmm.biliaccelerator.ui.navigation.AcceleratorApp
+import io.github.jh_mmm.biliaccelerator.ui.theme.AcceleratorTheme
+import io.github.jh_mmm.biliaccelerator.ui.theme.UiPreferencesStore
+import kotlinx.coroutines.flow.MutableStateFlow
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : ComponentActivity() {
 
-    private lateinit var binding: ActivityMainBinding
-    private lateinit var logAdapter: LogAdapter
-    private var currentConfig = AcceleratorConfig()
+    private lateinit var uiPreferencesStore: UiPreferencesStore
+
+    private val currentConfig = MutableStateFlow(AcceleratorConfig())
+    private val currentSnapshot = MutableStateFlow(StatsSnapshot())
+    private val currentActivationState = MutableStateFlow(ActivationState.INACTIVE)
 
     private val refreshHandler = Handler(Looper.getMainLooper())
     private val refreshRunnable = object : Runnable {
@@ -54,46 +57,121 @@ class MainActivity : AppCompatActivity() {
             get() = this != INACTIVE
     }
 
-    /**
-     * 判定模块激活与生效状态：
-     * 1. 运行时统计（totalRewrites > 0）：确认已在目标进程生效并执行过加速/拦截；
-     * 2. 框架 Service 绑定状态（XposedServiceProvider.isServiceBound）：确认 LSPosed 已推送 Binder；
-     * 3. 运行时心跳回执（7 天内）：确认目标 B 站进程已注入并成功与伴侣 App 握手。
-     */
-    fun getActivationState(): ActivationState {
-        val snapshot = StatsManager.getSnapshot()
-        if (snapshot.totalRewrites > 0) {
-            return ActivationState.ACTIVE_EFFECTIVE
+    companion object {
+        fun calculateActivationState(
+            totalRewrites: Long,
+            isServiceBound: Boolean,
+            lastHeartbeat: Long,
+            now: Long = System.currentTimeMillis(),
+            heartbeatThresholdMs: Long = 7L * 24 * 3600 * 1000L
+        ): ActivationState {
+            if (totalRewrites > 0) {
+                return ActivationState.ACTIVE_EFFECTIVE
+            }
+            if (isServiceBound) {
+                return ActivationState.ACTIVE_HEARTBEAT
+            }
+            val diff = now - lastHeartbeat
+            if (lastHeartbeat > 0L && diff in 0..heartbeatThresholdMs) {
+                return ActivationState.ACTIVE_HEARTBEAT
+            }
+            return ActivationState.INACTIVE
         }
-        if (XposedServiceProvider.isServiceBound) {
-            return ActivationState.ACTIVE_HEARTBEAT
-        }
-        if (StatsManager.isRecentlyActive(7L * 24 * 3600 * 1000L)) {
-            return ActivationState.ACTIVE_HEARTBEAT
-        }
-        return ActivationState.INACTIVE
     }
 
-    // 保留向后兼容
+    fun getActivationState(): ActivationState {
+        val snapshot = StatsManager.getSnapshot()
+        return calculateActivationState(
+            totalRewrites = snapshot.totalRewrites,
+            isServiceBound = XposedServiceProvider.isServiceBound,
+            lastHeartbeat = snapshot.lastHeartbeatTimestamp
+        )
+    }
+
+    // 保留向后兼容供反射或外部查询
     @Keep
-    open fun isModuleActive(): Boolean = getActivationState().isActive
+    fun isModuleActive(): Boolean = getActivationState().isActive
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
 
         StatsManager.init(this)
-        currentConfig = StatsProvider.loadConfig(this)
+        uiPreferencesStore = UiPreferencesStore(this)
 
-        initViews()
-        initSettings()
+        val loadedConfig = StatsProvider.loadConfig(this)
+        currentConfig.value = loadedConfig
+
+        val uposEntries = resources.getStringArray(R.array.upos_entries).toList()
+        val uposValues = resources.getStringArray(R.array.upos_values).toList()
+
+        val (versionName, versionCode) = try {
+            val pInfo = packageManager.getPackageInfo(packageName, 0)
+            val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                pInfo.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                pInfo.versionCode.toLong()
+            }
+            (pInfo.versionName ?: "1.0.6") to code
+        } catch (_: Exception) {
+            "1.0.6" to 106L
+        }
+
         refreshStats()
+
+        setContent {
+            val uiPreferences by uiPreferencesStore.preferences.collectAsStateWithLifecycle()
+            val state by currentActivationState.collectAsStateWithLifecycle()
+            val snapshot by currentSnapshot.collectAsStateWithLifecycle()
+            val config by currentConfig.collectAsStateWithLifecycle()
+
+            AcceleratorTheme(preferences = uiPreferences) {
+                AcceleratorApp(
+                    state = state,
+                    snapshot = snapshot,
+                    config = config,
+                    onConfigChange = { newConfig ->
+                        currentConfig.value = newConfig
+                        StatsProvider.saveConfig(this@MainActivity, newConfig)
+                    },
+                    uiPreferences = uiPreferences,
+                    onUiPreferencesChange = { newPrefs ->
+                        if (newPrefs.style != uiPreferences.style) {
+                            uiPreferencesStore.updateStyle(newPrefs.style)
+                        }
+                        if (newPrefs.themeMode != uiPreferences.themeMode) {
+                            uiPreferencesStore.updateThemeMode(newPrefs.themeMode)
+                        }
+                    },
+                    onClearStats = {
+                        StatsManager.clearStats(this@MainActivity)
+                        refreshStats()
+                        Toast.makeText(this@MainActivity, R.string.toast_stats_cleared, Toast.LENGTH_SHORT).show()
+                    },
+                    onExportDiagnostic = {
+                        val report = StatsManager.buildDiagnosticReport(currentConfig.value, "$versionName ($versionCode)")
+                        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("BiliAccelerator Diagnostic", report))
+                        Toast.makeText(this@MainActivity, R.string.toast_diag_copied, Toast.LENGTH_SHORT).show()
+                    },
+                    onRefresh = {
+                        refreshStats()
+                    },
+                    onLogClick = { logEntry ->
+                        copyLogToClipboard(logEntry)
+                    },
+                    uposEntries = uposEntries,
+                    uposValues = uposValues,
+                    versionName = versionName,
+                    versionCode = versionCode
+                )
+            }
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        updateStatusBadge()
         refreshStats()
         refreshHandler.removeCallbacks(refreshRunnable)
         refreshHandler.postDelayed(refreshRunnable, 2000L)
@@ -104,199 +182,20 @@ class MainActivity : AppCompatActivity() {
         refreshHandler.removeCallbacks(refreshRunnable)
     }
 
-    private fun updateStatusBadge() {
-        val state = getActivationState()
-        when (state) {
-            ActivationState.ACTIVE_EFFECTIVE -> {
-                binding.tvStatusBadge.text = getString(R.string.status_badge_in_effect)
-                binding.tvStatusBadge.setTextColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green))
-                binding.tvStatusBadge.setBackgroundColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green_bg))
-            }
-            ActivationState.ACTIVE_HEARTBEAT -> {
-                binding.tvStatusBadge.text = getString(R.string.status_badge_active)
-                binding.tvStatusBadge.setTextColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green))
-                binding.tvStatusBadge.setBackgroundColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_green_bg))
-            }
-            ActivationState.INACTIVE -> {
-                binding.tvStatusBadge.text = getString(R.string.status_badge_inactive)
-                binding.tvStatusBadge.setTextColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_red))
-                binding.tvStatusBadge.setBackgroundColor(androidx.core.content.ContextCompat.getColor(this, R.color.status_red_bg))
-            }
-        }
-    }
-
-    private fun showStatusDialog() {
-        val state = getActivationState()
-        val snapshot = StatsManager.getSnapshot()
-        val hookReport = io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.formatReport()
-        val isServiceBound = XposedServiceProvider.isServiceBound
-
-        val message = StringBuilder()
-        when (state) {
-            ActivationState.ACTIVE_EFFECTIVE -> {
-                message.appendLine("状态：已生效 (运行正常)")
-                message.appendLine("已成功拦截并加速视频播放，累计重写 ${snapshot.totalRewrites} 次。")
-            }
-            ActivationState.ACTIVE_HEARTBEAT -> {
-                message.appendLine("状态：已激活 (等待流量)")
-                if (isServiceBound) {
-                    message.appendLine("LSPosed 框架服务已成功连接。")
-                } else {
-                    message.appendLine("目标应用（B站）已成功挂载并向本模块握手。")
-                }
-                message.appendLine("播放任意 B 站视频即可开始加速并生成重写记录。")
-            }
-            ActivationState.INACTIVE -> {
-                message.appendLine("状态：未激活")
-                message.appendLine("排查指引：")
-                message.appendLine("1. 打开 LSPosed 管理器，确认本模块开关已开启；")
-                message.appendLine("2. 在模块作用域中勾选“哔哩哔哩”（无需且无法勾选模块自身）；")
-                message.appendLine("3. 强行停止哔哩哔哩后重新打开，播放视频测试。")
-            }
-        }
-
-        message.appendLine()
-        message.appendLine("【框架与运行时状态】")
-        message.appendLine("框架 Service 绑定: ${if (isServiceBound) "已连接" else "未连接"}")
-        val lastHb = snapshot.lastHeartbeatTimestamp
-        val lastHbDesc = if (lastHb > 0L) {
-            LocalDateTime.ofInstant(Instant.ofEpochMilli(lastHb), ZoneId.systemDefault())
-                .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-        } else {
-            "无记录"
-        }
-        message.appendLine("最近心跳回执: $lastHbDesc")
-        message.appendLine()
-        message.appendLine("【Hook 挂载状态】")
-        message.append(hookReport)
-
-        AlertDialog.Builder(this)
-            .setTitle(R.string.title_status_detail)
-            .setMessage(message.toString())
-            .setPositiveButton(R.string.dialog_confirm, null)
-            .show()
-    }
-
-    private fun initViews() {
-        // Module Status Badge
-        updateStatusBadge()
-        binding.tvStatusBadge.setOnClickListener {
-            showStatusDialog()
-        }
-
-        // RecyclerView
-        logAdapter = LogAdapter(emptyList())
-        binding.rvLogs.layoutManager = LinearLayoutManager(this)
-        binding.rvLogs.adapter = logAdapter
-
-        // Clear Stats Button
-        binding.btnClearStats.setOnClickListener {
-            AlertDialog.Builder(this)
-                .setTitle(R.string.dialog_clear_title)
-                .setMessage(R.string.dialog_clear_message)
-                .setPositiveButton(R.string.dialog_confirm) { _, _ ->
-                    StatsManager.clearStats(this)
-                    refreshStats()
-                    Toast.makeText(this, R.string.toast_stats_cleared, Toast.LENGTH_SHORT).show()
-                }
-                .setNegativeButton(R.string.dialog_cancel, null)
-                .show()
-        }
-
-        // Export Diagnostic Report Button
-        binding.btnExportDiag.setOnClickListener {
-            val appVersion = try {
-                val pInfo = packageManager.getPackageInfo(packageName, 0)
-                "${pInfo.versionName} (${pInfo.versionCode})"
-            } catch (_: Exception) {
-                "Unknown"
-            }
-            val report = StatsManager.buildDiagnosticReport(currentConfig, appVersion)
-            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            clipboard.setPrimaryClip(ClipData.newPlainText("BiliAccelerator Diagnostic", report))
-            Toast.makeText(this, R.string.toast_diag_copied, Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun initSettings() {
-        binding.switchEnabled.isChecked = currentConfig.enabled
-        binding.switchEnabled.setOnCheckedChangeListener { _, isChecked ->
-            currentConfig = currentConfig.copy(enabled = isChecked)
-            saveCurrentConfig()
-        }
-
-        val uposEntries = resources.getStringArray(R.array.upos_entries)
-        val uposValues = resources.getStringArray(R.array.upos_values)
-
-        val spinnerAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, uposEntries)
-        binding.spinnerUpos.adapter = spinnerAdapter
-
-        // 防止 targetHost 不在列表时（历史遗留配置）造成 Spinner 显示第一项但配置仍为旧值的假象
-        val rawIndex = uposValues.indexOf(currentConfig.targetHost)
-        val selectedIndex = if (rawIndex >= 0) {
-            rawIndex
-        } else {
-            currentConfig = currentConfig.copy(targetHost = uposValues[0])
-            saveCurrentConfig()
-            0
-        }
-        binding.spinnerUpos.setSelection(selectedIndex)
-
-        binding.spinnerUpos.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                val selectedHost = uposValues[position]
-                if (selectedHost != currentConfig.targetHost) {
-                    currentConfig = currentConfig.copy(targetHost = selectedHost)
-                    saveCurrentConfig()
-                }
-            }
-            override fun onNothingSelected(parent: AdapterView<*>?) {}
-        }
-
-        binding.switchBlockPcdn.isChecked = currentConfig.blockPcdn
-        binding.switchBlockPcdn.setOnCheckedChangeListener { _, isChecked ->
-            currentConfig = currentConfig.copy(blockPcdn = isChecked)
-            saveCurrentConfig()
-        }
-
-        binding.switchProxyMcdn.isChecked = currentConfig.proxyMcdn
-        binding.switchProxyMcdn.setOnCheckedChangeListener { _, isChecked ->
-            currentConfig = currentConfig.copy(proxyMcdn = isChecked)
-            saveCurrentConfig()
-        }
-
-        binding.switchForceUpos.isChecked = currentConfig.forceUpos
-        binding.switchForceUpos.setOnCheckedChangeListener { _, isChecked ->
-            currentConfig = currentConfig.copy(forceUpos = isChecked)
-            saveCurrentConfig()
-        }
-
-        binding.switchPortHeuristic.isChecked = currentConfig.portHeuristic
-        binding.switchPortHeuristic.setOnCheckedChangeListener { _, isChecked ->
-            currentConfig = currentConfig.copy(portHeuristic = isChecked)
-            saveCurrentConfig()
-        }
-    }
-
-    private fun saveCurrentConfig() {
-        StatsProvider.saveConfig(this, currentConfig)
-    }
-
     private fun refreshStats() {
-        updateStatusBadge()
         val snapshot = StatsManager.getSnapshot()
-        binding.tvStatTotalRewrites.text = snapshot.totalRewrites.toString()
-        binding.tvStatPcdnBlocked.text = snapshot.pcdnBlocked.toString()
-        binding.tvStatMcdnProxied.text = snapshot.mcdnProxied.toString()
-        binding.tvStatAvoidedHosts.text = snapshot.avoidedHosts.size.toString()
+        currentSnapshot.value = snapshot
+        currentActivationState.value = calculateActivationState(
+            totalRewrites = snapshot.totalRewrites,
+            isServiceBound = XposedServiceProvider.isServiceBound,
+            lastHeartbeat = snapshot.lastHeartbeatTimestamp
+        )
+    }
 
-        if (snapshot.recentLogs.isEmpty()) {
-            binding.tvEmptyLogs.visibility = View.VISIBLE
-            binding.rvLogs.visibility = View.GONE
-        } else {
-            binding.tvEmptyLogs.visibility = View.GONE
-            binding.rvLogs.visibility = View.VISIBLE
-            logAdapter.updateLogs(snapshot.recentLogs)
-        }
+    private fun copyLogToClipboard(entry: RewriteLogEntry) {
+        val detail = "时间: ${entry.timeFormatted}\n来源: ${entry.originalHost}\n重定向至: ${entry.targetHost}\n策略: ${entry.reason}"
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("Rewrite Log", detail))
+        Toast.makeText(this, "日志信息已复制到剪贴板", Toast.LENGTH_SHORT).show()
     }
 }

@@ -11,28 +11,57 @@ import android.os.Process
 import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import io.github.jh_mmm.biliaccelerator.BuildConfig
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
 
+/**
+ * 传输层 DTO，防范反射反序列化导致的不可信字段与 NPE
+ */
+data class RewriteResultDto(
+    val changed: Boolean? = false,
+    val originalUrl: String? = null,
+    val finalUrl: String? = null,
+    val originalHost: String? = null,
+    val targetHost: String? = null,
+    val reason: String? = null,
+    val isPcdn: Boolean? = false,
+    val isMcdn: Boolean? = false
+) {
+    fun toDomain(): RewriteResult? {
+        val origHost = originalHost?.trim()?.take(256) ?: return null
+        val tgtHost = targetHost?.trim()?.take(256) ?: origHost
+        return RewriteResult(
+            changed = changed ?: false,
+            originalUrl = originalUrl?.take(2048) ?: "",
+            finalUrl = finalUrl?.take(2048) ?: "",
+            originalHost = origHost,
+            targetHost = tgtHost,
+            reason = reason?.trim()?.take(64) ?: "unknown",
+            isPcdn = isPcdn ?: false,
+            isMcdn = isMcdn ?: false
+        )
+    }
+}
+
 class StatsProvider : ContentProvider() {
 
     companion object {
-        const val AUTHORITY = "${BiliAcceleratorCore.MODULE_PACKAGE}.provider"
+        val AUTHORITY = "${BuildConfig.APPLICATION_ID}.provider"
         val CONTENT_URI: Uri = Uri.parse("content://$AUTHORITY")
 
-        const val METHOD_RECORD_REWRITE = "recordRewrite"
         const val METHOD_RECORD_BATCH_REWRITE = "recordBatchRewrite"
-        const val METHOD_GET_STATS = "getStats"
-        const val METHOD_CLEAR_STATS = "clearStats"
         const val METHOD_GET_CONFIG = "getConfig"
-        const val METHOD_HEARTBEAT = "heartbeat"
 
-        const val EXTRA_REWRITE_RESULT = "extra_rewrite_result"
         const val EXTRA_REWRITE_BATCH_JSON = "extra_rewrite_batch_json"
         const val EXTRA_CONFIG_JSON = "extra_config_json"
-        const val EXTRA_STATS_JSON = "extra_stats_json"
+        const val EXTRA_HOOK_STATUS_JSON = "extra_hook_status_json"
+        const val EXTRA_SUCCESS = "success"
+
+        const val MAX_BATCH_SIZE = 200
+        const val MAX_HOOK_STATUS_ENTRIES = 50
 
         const val PREFS_CONFIG = "bili_accelerator_config"
         const val KEY_ENABLED = "cfg_enabled"
@@ -42,7 +71,6 @@ class StatsProvider : ContentProvider() {
         const val KEY_PROXY_MCDN = "cfg_proxy_mcdn"
         const val KEY_FORCE_UPOS = "cfg_force_upos"
         const val KEY_PORT_HEURISTIC = "cfg_port_heuristic"
-        const val EXTRA_SUCCESS = "success"
 
         private val gson = Gson()
 
@@ -97,9 +125,7 @@ class StatsProvider : ContentProvider() {
     }
 
     override fun onCreate(): Boolean {
-        context?.let { ctx ->
-            StatsManager.init(ctx)
-        }
+        // 轻量化启动：不在 onCreate 阶段预热 StatsManager，避免未授权调用触发冷启动 I/O 放大
         return true
     }
 
@@ -110,12 +136,28 @@ class StatsProvider : ContentProvider() {
             return null
         }
 
-        // 校验调用方 UID，仅允许模块自身与目标 B 站应用访问
+        // 最前置鉴权：未授权调用直接熔断，不执行任何反序列化与业务逻辑
         val uid = Binder.getCallingUid()
         if (!isCallerAuthorized(ctx, uid)) {
             val pkgs = ctx.packageManager.getPackagesForUid(uid).orEmpty()
             log("拒绝调用：method=$method uid=$uid pkgs=${pkgs.joinToString()}")
             return null
+        }
+
+        // 鉴权通过后惰性初始化统计管理器
+        StatsManager.ensureInitialized(ctx)
+
+        // 接收跨进程同步的 Hook 挂载状态（带上限与字段截断约束）
+        extras?.getString(EXTRA_HOOK_STATUS_JSON)?.let { hookJson ->
+            try {
+                val mapType = object : TypeToken<Map<String, String?>>() {}.type
+                val rawHookMap: Map<String, String?> = gson.fromJson(hookJson, mapType)
+                val sanitizedMap = rawHookMap.entries
+                    .take(MAX_HOOK_STATUS_ENTRIES)
+                    .filter { it.key.isNotBlank() && it.value != null }
+                    .associate { it.key.trim().take(64) to it.value!!.trim().take(256) }
+                StatsManager.recordHookStatus(sanitizedMap, ctx)
+            } catch (_: Exception) {}
         }
 
         val response = Bundle()
@@ -125,12 +167,13 @@ class StatsProvider : ContentProvider() {
                 val json = extras?.getString(EXTRA_REWRITE_BATCH_JSON)
                 if (!json.isNullOrEmpty()) {
                     try {
-                        val listType = object : TypeToken<List<RewriteResult>>() {}.type
-                        val results: List<RewriteResult> = gson.fromJson(json, listType)
-                        StatsManager.recordRequests(results, ctx)
+                        val listType = object : TypeToken<List<RewriteResultDto>>() {}.type
+                        val dtos: List<RewriteResultDto> = gson.fromJson(json, listType)
+                        val validResults = dtos.take(MAX_BATCH_SIZE).mapNotNull { it.toDomain() }
+                        StatsManager.recordRequests(validResults, ctx)
                         StatsManager.recordHeartbeat(ctx)
                         response.putBoolean(EXTRA_SUCCESS, true)
-                        log("已批量记录重定向: ${results.size} 条记录 (来自 uid=$uid)")
+                        log("已批量记录媒体请求: ${validResults.size} 条记录 (来自 uid=$uid)")
                     } catch (e: Exception) {
                         response.putBoolean(EXTRA_SUCCESS, false)
                         log("批量记录重定向失败: $e")
@@ -140,41 +183,10 @@ class StatsProvider : ContentProvider() {
                     log("批量记录重定向失败：extras 为空 (来自 uid=$uid)")
                 }
             }
-            METHOD_RECORD_REWRITE -> {
-                val json = extras?.getString(EXTRA_REWRITE_RESULT)
-                if (!json.isNullOrEmpty()) {
-                    try {
-                        val result = gson.fromJson(json, RewriteResult::class.java)
-                        StatsManager.recordRequest(result, ctx)
-                        StatsManager.recordHeartbeat(ctx)
-                        response.putBoolean(EXTRA_SUCCESS, true)
-                        log("已记录单条重定向：${result.originalHost} -> ${result.targetHost} [${result.reason}] (来自 uid=$uid)")
-                    } catch (e: Exception) {
-                        response.putBoolean(EXTRA_SUCCESS, false)
-                        log("记录单条重定向失败：$e")
-                    }
-                } else {
-                    response.putBoolean(EXTRA_SUCCESS, false)
-                    log("记录重定向失败：extras 为空 (来自 uid=$uid)")
-                }
-            }
-            METHOD_GET_STATS -> {
-                val snapshot = StatsManager.getSnapshot()
-                response.putString(EXTRA_STATS_JSON, gson.toJson(snapshot))
-            }
-            METHOD_CLEAR_STATS -> {
-                StatsManager.clearStats(ctx)
-                response.putBoolean(EXTRA_SUCCESS, true)
-            }
             METHOD_GET_CONFIG -> {
                 StatsManager.recordHeartbeat(ctx)
                 val config = loadConfig(ctx)
                 response.putString(EXTRA_CONFIG_JSON, gson.toJson(config))
-            }
-            METHOD_HEARTBEAT -> {
-                StatsManager.recordHeartbeat(ctx)
-                response.putBoolean(EXTRA_SUCCESS, true)
-                log("收到来自目标应用的心跳回执 (来自 uid=$uid)")
             }
         }
         return response

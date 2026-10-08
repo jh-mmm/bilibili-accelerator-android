@@ -1,18 +1,15 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
-import io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.lang.reflect.Method
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -23,7 +20,6 @@ object RemoteClient {
 
     private const val TAG = "BiliAccelerator-Remote"
     private const val TARGET_PREFS_NAME = "bili_accelerator_target_cache"
-    private const val KEY_CACHED_CONFIG = "cached_config_json"
 
     private val gson = Gson()
 
@@ -35,22 +31,34 @@ object RemoteClient {
         Thread(runnable, "RemoteClient-ReportWorker").apply { isDaemon = true }
     }
 
+    // 默认 fail-closed：拉取成功前不开启加速，确保模块冻结/卸载时安全失效
     @Volatile
-    private var cachedConfig: AcceleratorConfig = AcceleratorConfig()
+    private var cachedConfig: AcceleratorConfig = AcceleratorConfig(enabled = false)
     private val lastConfigFetchTime = AtomicLong(0L)
     private val isFetching = AtomicBoolean(false)
     private const val CONFIG_CACHE_TTL = 30_000L // 30 秒缓存刷新
 
-    // 批量上报队列与防抖定时器
-    private val pendingBatch = ConcurrentLinkedQueue<RewriteResult>()
+    // 批量上报双端队列与防抖定时器
+    private val pendingBatch = ConcurrentLinkedDeque<RewriteResult>()
     private const val BATCH_MAX_SIZE = 10
+    private const val QUEUE_MAX_CAPACITY = 200
     private const val FLUSH_INTERVAL_MS = 1500L
     private var pendingFlushFuture: ScheduledFuture<*>? = null
     private val flushLock = Any()
-    private val lastBroadcastTime = AtomicLong(0L)
 
     @Volatile
     private var appContext: Context? = null
+
+    // 缓存 ActivityThread.currentApplication 反射方法，避免每次媒体请求重复反射查找
+    private val currentApplicationMethod: Method? by lazy {
+        try {
+            val activityThreadClass = Class.forName("android.app.ActivityThread")
+            activityThreadClass.getMethod("currentApplication")
+        } catch (t: Throwable) {
+            Log.d(TAG, "ActivityThread.currentApplication not accessible: ${t.message}")
+            null
+        }
+    }
 
     fun setAppContext(context: Context) {
         val app = try {
@@ -60,8 +68,10 @@ object RemoteClient {
         }
         appContext = app
 
-        // 从目标 App 私有目录载入历史持久化配置，避免冷启动瞬态使用硬编码默认镜像
-        loadConfigFromLocalCache(app)
+        // 清理可能遗留的历史目标私有目录缓存文件，杜绝污染目标 App 存储
+        try {
+            app.deleteSharedPreferences(TARGET_PREFS_NAME)
+        } catch (_: Throwable) {}
 
         // 尽早触发一次异步配置拉取
         fetchConfigAsync(app)
@@ -70,40 +80,15 @@ object RemoteClient {
     fun getContext(): Context? {
         appContext?.let { return it }
         return try {
-            val activityThreadClass = Class.forName("android.app.ActivityThread")
-            val currentAppMethod = activityThreadClass.getMethod("currentApplication")
-            val app = currentAppMethod.invoke(null) as? Context
+            val app = currentApplicationMethod?.invoke(null) as? Context
             if (app != null) {
                 setAppContext(app)
                 app
             } else null
         } catch (t: Throwable) {
-            Log.d(TAG, "getContext via ActivityThread failed: ${t.message}")
+            Log.d(TAG, "getContext failed: ${t.message}")
             null
         }
-    }
-
-    private fun loadConfigFromLocalCache(context: Context) {
-        try {
-            val sp = context.getSharedPreferences(TARGET_PREFS_NAME, Context.MODE_PRIVATE)
-            val json = sp.getString(KEY_CACHED_CONFIG, null)
-            if (!json.isNullOrEmpty()) {
-                val saved = gson.fromJson(json, AcceleratorConfig::class.java)
-                if (saved != null) {
-                    cachedConfig = saved
-                    Log.i(TAG, "Loaded cached config from local target app storage: targetHost=${saved.targetHost}")
-                }
-            }
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed to load local cached config: ${t.message}")
-        }
-    }
-
-    private fun saveConfigToLocalCache(context: Context, config: AcceleratorConfig) {
-        try {
-            val sp = context.getSharedPreferences(TARGET_PREFS_NAME, Context.MODE_PRIVATE)
-            sp.edit().putString(KEY_CACHED_CONFIG, gson.toJson(config)).apply()
-        } catch (_: Throwable) {}
     }
 
     fun fetchConfig(): AcceleratorConfig {
@@ -116,29 +101,21 @@ object RemoteClient {
 
         val context = getContext() ?: return cachedConfig
 
-        // 首次冷启动且尚未获取成功时，执行一次快速同步拉取，杜绝第一个视频走默认镜像的竞态
-        if (lastFetch == 0L) {
-            val direct = fetchConfigDirect(context)
-            if (direct != null) {
-                cachedConfig = direct
-                lastConfigFetchTime.set(now)
-                saveConfigToLocalCache(context, direct)
-                return direct
-            }
-        }
-
-        // 后续走后台异步刷新，避免阻塞播放线程
+        // 纯后台异步刷新，决不阻塞播放或 gRPC 线程
         fetchConfigAsync(context)
         return cachedConfig
     }
 
     private fun fetchConfigDirect(context: Context): AcceleratorConfig? {
         return try {
+            val extras = Bundle().apply {
+                putString(StatsProvider.EXTRA_HOOK_STATUS_JSON, gson.toJson(HookStatusTracker.getSnapshot()))
+            }
             val response = context.contentResolver.call(
                 StatsProvider.CONTENT_URI,
                 StatsProvider.METHOD_GET_CONFIG,
                 null,
-                null
+                extras
             )
             val json = response?.getString(StatsProvider.EXTRA_CONFIG_JSON)
             if (!json.isNullOrEmpty()) {
@@ -158,7 +135,6 @@ object RemoteClient {
                     if (config != null) {
                         cachedConfig = config
                         lastConfigFetchTime.set(System.currentTimeMillis())
-                        saveConfigToLocalCache(context, config)
                     } else {
                         // 拉取失败退避 5 秒
                         lastConfigFetchTime.set(System.currentTimeMillis() - CONFIG_CACHE_TTL + 5_000L)
@@ -191,7 +167,7 @@ object RemoteClient {
     private fun flushBatch() {
         val batch = mutableListOf<RewriteResult>()
         while (batch.size < 50) {
-            val item = pendingBatch.poll() ?: break
+            val item = pendingBatch.pollFirst() ?: break
             batch.add(item)
         }
         if (batch.isEmpty()) return
@@ -203,12 +179,14 @@ object RemoteClient {
         }
 
         val json = gson.toJson(batch)
+        val hookStatusJson = gson.toJson(HookStatusTracker.getSnapshot())
         var reported = false
 
         // 1. 优先尝试 ContentProvider 批量 IPC
         try {
             val extras = Bundle().apply {
                 putString(StatsProvider.EXTRA_REWRITE_BATCH_JSON, json)
+                putString(StatsProvider.EXTRA_HOOK_STATUS_JSON, hookStatusJson)
             }
             val response = context.contentResolver.call(
                 StatsProvider.CONTENT_URI,
@@ -218,42 +196,24 @@ object RemoteClient {
             )
             if (response?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true) {
                 reported = true
-                Log.i(TAG, "[Provider] 批量上报成功 (${batch.size} 条重定向)")
+                Log.i(TAG, "[Provider] 批量上报成功 (${batch.size} 条媒体请求)")
             }
         } catch (t: Throwable) {
             Log.d(TAG, "[Provider] 暂不可达: ${t.javaClass.simpleName} (${t.message})")
         }
 
-        // 2. 兜底通道：发送带鉴权 Token 的显式广播，附带限流防止广播风暴
+        // 2. 若 Provider 暂时不可达，保留最多 QUEUE_MAX_CAPACITY 条记录，稍后重试
         if (!reported) {
-            val now = System.currentTimeMillis()
-            if (now - lastBroadcastTime.get() >= 1000L) {
-                lastBroadcastTime.set(now)
-                try {
-                    // 使用不可伪造的 PendingIntent 作为调用者身份鉴权凭证
-                    val authIntent = Intent().apply {
-                        setPackage(context.packageName)
-                    }
-                    val authToken = PendingIntent.getBroadcast(
-                        context,
-                        0,
-                        authIntent,
-                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                    )
-
-                    val intent = Intent(StatsReceiver.ACTION_RECORD_REWRITE).apply {
-                        setPackage(BiliAcceleratorCore.MODULE_PACKAGE)
-                        addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-                        putExtra(StatsReceiver.EXTRA_REWRITE_BATCH_JSON, json)
-                        putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, authToken)
-                    }
-                    context.sendBroadcast(intent)
-                    Log.i(TAG, "[Broadcast] 备用通道批量发送成功 (${batch.size} 条重定向)")
-                } catch (t: Throwable) {
-                    Log.w(TAG, "[Broadcast] 发送异常: $t")
-                }
-            } else {
-                Log.w(TAG, "[Broadcast] 广播限流保护触发，暂缓发送")
+            val overflow = pendingBatch.size + batch.size - QUEUE_MAX_CAPACITY
+            val itemsToKeep = if (overflow > 0) batch.drop(overflow) else batch
+            for (item in itemsToKeep.asReversed()) {
+                pendingBatch.offerFirst(item)
+            }
+            synchronized(flushLock) {
+                pendingFlushFuture?.cancel(false)
+                pendingFlushFuture = reportScheduler.schedule({
+                    flushBatch()
+                }, 5000L, TimeUnit.MILLISECONDS)
             }
         }
     }

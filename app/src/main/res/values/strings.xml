@@ -19,7 +19,7 @@
     <string name="status_active">LSPosed 模块已激活</string>
     <string name="status_inactive">模块未激活（请在 LSPosed 中勾选本模块与目标作用域并重启 B 站）</string>
     <string name="status_badge_in_effect">已生效</string>
-    <string name="status_badge_active">已激活</string>
+    <string name="status_badge_active">已激活 (待命中)</string>
     <string name="status_badge_inactive">未激活</string>
     <string name="title_status_detail">模块状态与诊断</string>
     <string name="dialog_clear_title">确认清空</string>
