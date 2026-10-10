@@ -238,5 +238,48 @@ class ActivationStateTest {
         )
         assertTrue(merged.contains("6 hooks"))
     }
+
+    @Test
+    fun testUposDisplayNameAndUiStyleLabel() {
+        val entries = listOf(
+            "腾讯云 (国内) - upos-sz-mirrorcos",
+            "阿里云 (国内) - upos-sz-mirrorali",
+            "华为云 (国内) - upos-sz-mirrorhw",
+            "华为云 (全国混流) - upos-tf-all-hw"
+        )
+        val values = listOf(
+            "upos-sz-mirrorcos.bilivideo.com",
+            "upos-sz-mirrorali.bilivideo.com",
+            "upos-sz-mirrorhw.bilivideo.com",
+            "upos-tf-all-hw.bilivideo.com"
+        )
+
+        assertEquals(
+            "阿里云国内",
+            io.github.jh_mmm.biliaccelerator.ui.dashboard.resolveUposDisplayName(
+                "upos-sz-mirrorali.bilivideo.com",
+                entries,
+                values
+            )
+        )
+        assertEquals(
+            "华为云国内",
+            io.github.jh_mmm.biliaccelerator.ui.dashboard.resolveUposDisplayName(
+                "upos-sz-mirrorhw.bilivideo.com",
+                entries,
+                values
+            )
+        )
+        assertEquals(
+            "腾讯云国内",
+            io.github.jh_mmm.biliaccelerator.ui.dashboard.resolveUposDisplayName(
+                "upos-sz-mirrorcos.bilivideo.com"
+            )
+        )
+        assertEquals(
+            "MIUIX",
+            io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle.MIUIX.label
+        )
+    }
 }
 

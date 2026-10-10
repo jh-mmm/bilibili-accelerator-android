@@ -73,6 +73,31 @@ internal fun logItemKey(log: RewriteLogEntry): String {
         ?: "${log.timestamp}_${log.originalHost}_${log.targetHost}_${log.reason}"
 }
 
+internal fun resolveUposDisplayName(
+    targetHost: String,
+    uposEntries: List<String> = emptyList(),
+    uposValues: List<String> = emptyList()
+): String {
+    val index = uposValues.indexOf(targetHost)
+    if (index in uposEntries.indices) {
+        return uposEntries[index]
+            .substringBefore(" - ")
+            .replace(Regex("""\s*[()（）]\s*"""), "")
+            .trim()
+    }
+    return when (targetHost.lowercase().substringBefore(".")) {
+        "upos-sz-mirrorcos" -> "腾讯云国内"
+        "upos-sz-mirrorali" -> "阿里云国内"
+        "upos-sz-mirrorhw" -> "华为云国内"
+        "upos-tf-all-hw" -> "华为云全国混流"
+        "upos-tf-all-tx" -> "腾讯云全国混流"
+        "upos-sz-mirrorcosov" -> "腾讯云海外"
+        "upos-sz-mirroraliov" -> "阿里云海外"
+        "upos-sz-mirrorhwov" -> "华为云海外"
+        else -> targetHost.substringBefore(".").removePrefix("upos-")
+    }
+}
+
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun DashboardScreen(
@@ -81,6 +106,8 @@ fun DashboardScreen(
     config: AcceleratorConfig,
     onRefresh: () -> Unit,
     onLogClick: (RewriteLogEntry) -> Unit = {},
+    uposEntries: List<String> = emptyList(),
+    uposValues: List<String> = emptyList(),
     bottomContentPadding: Dp = 80.dp
 ) {
     var showStatusDialog by rememberSaveable { mutableStateOf(false) }
@@ -137,6 +164,8 @@ fun DashboardScreen(
                 RuntimeDetailsCard(
                     snapshot = snapshot,
                     config = config,
+                    uposEntries = uposEntries,
+                    uposValues = uposValues,
                     onRefresh = onRefresh
                 )
             }
@@ -339,6 +368,8 @@ private fun RuntimeStatsGrid(snapshot: StatsSnapshot) {
 private fun RuntimeDetailsCard(
     snapshot: StatsSnapshot,
     config: AcceleratorConfig,
+    uposEntries: List<String>,
+    uposValues: List<String>,
     onRefresh: () -> Unit
 ) {
     val uiStyle = LocalUiStyle.current
@@ -384,26 +415,29 @@ private fun RuntimeDetailsCard(
                 )
             }
 
-            Row(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 MetricColumn(
                     label = "总请求数",
                     value = snapshot.totalRequests.toString(),
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(0.9f)
                 )
                 MetricColumn(
                     label = "首选 UPOS",
-                    value = config.targetHost.substringBefore(".").removePrefix("upos-"),
-                    modifier = Modifier.weight(1f)
+                    value = resolveUposDisplayName(config.targetHost, uposEntries, uposValues),
+                    modifier = Modifier.weight(1.3f)
                 )
                 MetricColumn(
                     label = "PCDN 拦截",
                     value = if (config.blockPcdn) "已开启" else "已关闭",
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(0.9f)
                 )
                 MetricColumn(
                     label = "MCDN 代理",
                     value = if (config.proxyMcdn) "已开启" else "已关闭",
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(0.9f)
                 )
             }
         }
@@ -423,7 +457,7 @@ private fun MetricColumn(
     ) {
         Text(
             text = value,
-            fontSize = 15.sp,
+            fontSize = if (value.length > 5) 13.sp else 15.sp,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurface,
             maxLines = 1,

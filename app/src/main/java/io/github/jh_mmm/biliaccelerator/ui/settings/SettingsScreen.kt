@@ -165,12 +165,11 @@ fun SettingsScreen(
 
                     PreferenceDivider()
 
-                    val currentUposIndex = uposValues.indexOf(config.targetHost)
-                    val currentUposLabel = if (currentUposIndex >= 0 && currentUposIndex < uposEntries.size) {
-                        uposEntries[currentUposIndex].substringBefore(" - ")
-                    } else {
-                        config.targetHost.substringBefore(".")
-                    }
+                    val currentUposLabel = io.github.jh_mmm.biliaccelerator.ui.dashboard.resolveUposDisplayName(
+                        targetHost = config.targetHost,
+                        uposEntries = uposEntries,
+                        uposValues = uposValues
+                    )
 
                     PreferenceDropdownItem(
                         title = "首选 UPOS 镜像",
@@ -271,7 +270,7 @@ fun SettingsScreen(
                 PreferenceGroupCard {
                     PreferenceDropdownItem(
                         title = "界面渲染风格",
-                        summary = "支持 HyperOS (Miuix) 与 Material 3 实时切换",
+                        summary = "支持 MIUIX 与 Material 3 实时切换",
                         selectedValue = uiPreferences.style.label,
                         icon = Icons.Outlined.Palette,
                         onClick = { showStyleDialog = true }

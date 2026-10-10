@@ -56,6 +56,8 @@ fun AcceleratorApp(
                         config = config,
                         onRefresh = onRefresh,
                         onLogClick = onLogClick,
+                        uposEntries = uposEntries,
+                        uposValues = uposValues,
                         bottomContentPadding = 88.dp
                     )
                 }

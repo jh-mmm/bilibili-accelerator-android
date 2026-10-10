@@ -13,7 +13,7 @@ enum class UiThemeMode(val label: String) {
 }
 
 enum class UiStyle(val label: String) {
-    MIUIX("HyperOS (Miuix)"),
+    MIUIX("MIUIX"),
     MATERIAL3("Material 3")
 }
 
