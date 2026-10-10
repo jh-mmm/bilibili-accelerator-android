@@ -18,30 +18,31 @@ import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
 
 /**
- * 传输层 DTO，防范反射反序列化导致的不可信字段与 NPE
+ * 传输层 DTO，防范反射反序列化导致的不可信字段与 NPE，且绝不接收完整签名 URL（仅传输裸域名）
  */
 data class RewriteResultDto(
     val changed: Boolean? = false,
-    val originalUrl: String? = null,
-    val finalUrl: String? = null,
     val originalHost: String? = null,
     val targetHost: String? = null,
     val reason: String? = null,
     val isPcdn: Boolean? = false,
-    val isMcdn: Boolean? = false
+    val isMcdn: Boolean? = false,
+    val segmentKey: String? = null
 ) {
     fun toDomain(): RewriteResult? {
         val origHost = originalHost?.trim()?.take(256) ?: return null
         val tgtHost = targetHost?.trim()?.take(256) ?: origHost
+        val safeSegKey = segmentKey?.substringBefore('?')?.substringAfterLast('/')?.trim()?.take(96) ?: ""
         return RewriteResult(
             changed = changed ?: false,
-            originalUrl = originalUrl?.take(2048) ?: "",
-            finalUrl = finalUrl?.take(2048) ?: "",
+            originalUrl = "",
+            finalUrl = "",
             originalHost = origHost,
             targetHost = tgtHost,
             reason = reason?.trim()?.take(64) ?: "unknown",
             isPcdn = isPcdn ?: false,
-            isMcdn = isMcdn ?: false
+            isMcdn = isMcdn ?: false,
+            segmentKey = safeSegKey
         )
     }
 }
@@ -71,6 +72,7 @@ class StatsProvider : ContentProvider() {
         const val KEY_PROXY_MCDN = "cfg_proxy_mcdn"
         const val KEY_FORCE_UPOS = "cfg_force_upos"
         const val KEY_PORT_HEURISTIC = "cfg_port_heuristic"
+        const val KEY_ENABLE_MOSS_HOOK = "cfg_enable_moss_hook"
 
         private val gson = Gson()
 
@@ -106,7 +108,8 @@ class StatsProvider : ContentProvider() {
                 blockPcdn = sp.getBoolean(KEY_BLOCK_PCDN, true),
                 proxyMcdn = sp.getBoolean(KEY_PROXY_MCDN, true),
                 forceUpos = sp.getBoolean(KEY_FORCE_UPOS, false),
-                portHeuristic = sp.getBoolean(KEY_PORT_HEURISTIC, true)
+                portHeuristic = sp.getBoolean(KEY_PORT_HEURISTIC, true),
+                enableMossHook = sp.getBoolean(KEY_ENABLE_MOSS_HOOK, false)
             )
         }
 
@@ -120,7 +123,11 @@ class StatsProvider : ContentProvider() {
                 .putBoolean(KEY_PROXY_MCDN, config.proxyMcdn)
                 .putBoolean(KEY_FORCE_UPOS, config.forceUpos)
                 .putBoolean(KEY_PORT_HEURISTIC, config.portHeuristic)
+                .putBoolean(KEY_ENABLE_MOSS_HOOK, config.enableMossHook)
                 .apply()
+            runCatching {
+                context.contentResolver.notifyChange(CONTENT_URI, null)
+            }
         }
     }
 

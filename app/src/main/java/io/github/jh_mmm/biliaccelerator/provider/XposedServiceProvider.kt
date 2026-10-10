@@ -23,7 +23,6 @@ class XposedServiceProvider : ContentProvider() {
     companion object {
         private const val TAG = "BiliAccelerator-XSP"
         const val METHOD_SEND_BINDER = "SendBinder"
-        const val METHOD_SEND_BINDER_UPPER = "SEND_BINDER"
         const val EXTRA_BINDER = "binder"
 
         private val TRUSTED_PACKAGES = setOf(
@@ -50,12 +49,11 @@ class XposedServiceProvider : ContentProvider() {
 
         /**
          * 严格校验调用方身份：
-         * 1. 仅信任 root (0)、system_server (1000) 或模块自身 UID；
-         * 2. 兼容普通 UID 运行的管理组件：通过 PackageManager 校验包名白名单（由系统守护，不可伪造）。
-         * 坚决不使用调用方自报的 interfaceDescriptor 作为凭证。
+         * 1. 仅信任 system_server (1000，LSPosed 系统服务宿主) 或模块自身 UID，不再无条件放行任意 root (0) 进程；
+         * 2. 兼容管理组件 UID：通过 PackageManager 校验包名白名单。
          */
         fun isCallerAuthorized(context: Context?, uid: Int): Boolean {
-            if (uid == 0 || uid == Process.SYSTEM_UID || uid == Process.myUid()) {
+            if (uid == Process.SYSTEM_UID || uid == Process.myUid()) {
                 return true
             }
             if (context != null) {
@@ -74,7 +72,7 @@ class XposedServiceProvider : ContentProvider() {
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
         val uid = Binder.getCallingUid()
 
-        if (!METHOD_SEND_BINDER.equals(method, ignoreCase = true) && method != METHOD_SEND_BINDER_UPPER) {
+        if (!METHOD_SEND_BINDER.equals(method, ignoreCase = true)) {
             Log.w(TAG, "Rejected invalid method: $method (uid=$uid)")
             return null
         }
@@ -95,16 +93,20 @@ class XposedServiceProvider : ContentProvider() {
             return null
         }
 
-        if (!binder.isBinderAlive) {
+        if (!binder.isBinderAlive || !binder.pingBinder()) {
             Log.w(TAG, "Provided binder is not alive (method=$method)")
             return null
         }
 
         synchronized(lock) {
             val current = serviceBinder
-            if (current != null && current.isBinderAlive && current == binder) {
-                // 已处于相同存活绑定状态，无需重复重绑
-                return Bundle().apply { putBoolean("result", true) }
+            if (current != null && current.isBinderAlive && current.pingBinder()) {
+                if (current == binder) {
+                    return Bundle().apply { putBoolean("result", true) }
+                }
+                // 已有存活的框架 Binder 绑定时拒绝被其他调用顶替，防止状态假阳性劫持
+                Log.w(TAG, "Ignored binder replacement while existing XposedService binder is alive (uid=$uid)")
+                return null
             }
 
             // 替换前解绑旧 Binder 的 death recipient，防止内存泄漏与竞争

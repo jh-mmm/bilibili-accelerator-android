@@ -225,6 +225,16 @@ fun SettingsScreen(
                         onCheckedChange = { onConfigChange(config.copy(portHeuristic = it)) },
                         enabled = config.enabled
                     )
+
+                    PreferenceDivider()
+
+                    PreferenceSwitchItem(
+                        title = "实验性：Moss gRPC TF 标记注入",
+                        summary = "尝试在协议层注入 TF=1 请求官方镜像（默认关闭，仅在确认兼容时开启）",
+                        checked = config.enableMossHook,
+                        onCheckedChange = { onConfigChange(config.copy(enableMossHook = it)) },
+                        enabled = config.enabled && config.blockPcdn
+                    )
                 }
             }
 

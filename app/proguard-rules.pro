@@ -27,9 +27,8 @@
 -adaptresourcefilecontents META-INF/xposed/java_init.list
 -dontwarn io.github.libxposed.**
 
-# Keep Application and Receiver components
+# Keep Application component
 -keep class io.github.jh_mmm.biliaccelerator.BiliAcceleratorApp { *; }
--keep class io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver { *; }
 
 # Keep module hook implementations
 -keep class io.github.jh_mmm.biliaccelerator.hook.** { *; }
@@ -37,9 +36,3 @@
 # Keep ContentProvider and UI components
 -keep class io.github.jh_mmm.biliaccelerator.provider.** { *; }
 -keep class io.github.jh_mmm.biliaccelerator.ui.** { *; }
-
-# Keep isModuleActive hooked via reflection in MainActivity
--keepclassmembers class io.github.jh_mmm.biliaccelerator.ui.MainActivity {
-    boolean isModuleActive();
-}
-

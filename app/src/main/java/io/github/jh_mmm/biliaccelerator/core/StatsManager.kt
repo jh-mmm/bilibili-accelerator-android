@@ -10,6 +10,7 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
@@ -19,6 +20,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 data class RewriteLogEntry(
+    val id: String = UUID.randomUUID().toString(),
     val timestamp: Long,
     val timeFormatted: String,
     val originalHost: String,
@@ -58,6 +60,8 @@ object StatsManager {
     private const val MAX_AVOIDED_HOSTS = 500
     private const val MAX_HOOK_ENTRIES = 100
     private const val MAX_BATCH_SIZE = 200
+    private const val CROSS_PROCESS_DEDUP_WINDOW_MS = 10_000L
+    private const val CROSS_PROCESS_DEDUP_MAX = 256
 
     private val totalRequests = AtomicLong(0)
     private val totalRewrites = AtomicLong(0)
@@ -67,6 +71,11 @@ object StatsManager {
     private val avoidedHosts = ConcurrentHashMap.newKeySet<String>()
     private val recentLogs = CopyOnWriteArrayList<RewriteLogEntry>()
     private val hookStatus = ConcurrentHashMap<String, String>()
+    private val recentCrossProcessSegments = object : LinkedHashMap<String, Long>(CROSS_PROCESS_DEDUP_MAX, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean {
+            return size > CROSS_PROCESS_DEDUP_MAX
+        }
+    }
     private var installedAt = ""
 
     private val logTimeFormatter = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss", Locale.getDefault())
@@ -119,7 +128,7 @@ object StatsManager {
                 try {
                     val list: List<RewriteLogEntry> = gson.fromJson(logsJson, object : TypeToken<List<RewriteLogEntry>>() {}.type)
                     recentLogs.clear()
-                    recentLogs.addAll(list.take(MAX_LOGS))
+                    recentLogs.addAll(sanitizeLogEntries(list).take(MAX_LOGS))
                 } catch (_: Exception) {}
             }
 
@@ -137,6 +146,16 @@ object StatsManager {
         }
     }
 
+    internal fun sanitizeLogEntries(list: List<RewriteLogEntry>): List<RewriteLogEntry> {
+        return list.mapIndexed { index, item ->
+            if (item.id.isNullOrBlank()) {
+                item.copy(id = "${item.timestamp}_${item.originalHost}_${item.reason}_$index")
+            } else {
+                item
+            }
+        }
+    }
+
     fun ensureInitialized(context: Context) {
         if (!isInitialized.get()) {
             init(context.applicationContext ?: context)
@@ -151,14 +170,45 @@ object StatsManager {
         context?.let { scheduleDebouncedSave(it) }
     }
 
+    internal fun mergeHookStatusEntry(existing: String?, incoming: String): String {
+        val safeVal = incoming.trim().take(256)
+        if (existing != null &&
+            !existing.startsWith("未找到") &&
+            !existing.startsWith("未挂载") &&
+            (safeVal.startsWith("未找到") || safeVal.startsWith("未挂载"))
+        ) {
+            return existing
+        }
+        return safeVal
+    }
+
+    internal fun shouldAcceptCrossProcessSegment(
+        result: RewriteResult,
+        now: Long = System.currentTimeMillis()
+    ): Boolean {
+        val segKey = result.segmentKey.trim()
+        if (segKey.isEmpty()) return true
+        val compositeKey = "$segKey|${result.originalHost}|${result.targetHost}|${result.reason}|${result.changed}"
+        synchronized(recentCrossProcessSegments) {
+            val prev = recentCrossProcessSegments[compositeKey]
+            if (prev != null && (now - prev) in 0..CROSS_PROCESS_DEDUP_WINDOW_MS) {
+                return false
+            }
+            recentCrossProcessSegments[compositeKey] = now
+            return true
+        }
+    }
+
     fun recordHookStatus(status: Map<String, String>, context: Context? = null) {
         if (status.isEmpty()) return
         if (context != null) {
             ensureInitialized(context)
         }
         for ((k, v) in status.entries.take(MAX_HOOK_ENTRIES)) {
-            if (hookStatus.size >= MAX_HOOK_ENTRIES && !hookStatus.containsKey(k)) break
-            hookStatus[k.trim().take(64)] = v.trim().take(256)
+            val safeKey = k.trim().take(64)
+            if (safeKey.isEmpty()) continue
+            if (hookStatus.size >= MAX_HOOK_ENTRIES && !hookStatus.containsKey(safeKey)) break
+            hookStatus[safeKey] = mergeHookStatusEntry(hookStatus[safeKey], v)
         }
         io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.updateFromMap(hookStatus)
         context?.let { scheduleDebouncedSave(it) }
@@ -182,7 +232,11 @@ object StatsManager {
     }
 
     private fun recordSingleInternal(result: RewriteResult) {
-        lastHeartbeat.set(System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        lastHeartbeat.set(now)
+        if (!shouldAcceptCrossProcessSegment(result, now)) {
+            return
+        }
         totalRequests.incrementAndGet()
 
         if (result.changed) {
@@ -203,11 +257,11 @@ object StatsManager {
                 mcdnProxied.incrementAndGet()
             }
 
-            val now = System.currentTimeMillis()
             val formattedTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(now), ZoneId.systemDefault())
                 .format(logTimeFormatter)
 
             val entry = RewriteLogEntry(
+                id = UUID.randomUUID().toString(),
                 timestamp = now,
                 timeFormatted = formattedTime,
                 originalHost = rawOriginalHost,
@@ -266,6 +320,9 @@ object StatsManager {
             // 注意：不重置 lastHeartbeat 与 hookStatus，避免指标清零连带将模块健康与激活状态误打回“未激活”
             avoidedHosts.clear()
             recentLogs.clear()
+            synchronized(recentCrossProcessSegments) {
+                recentCrossProcessSegments.clear()
+            }
             try {
                 val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 sp.edit()
@@ -319,6 +376,7 @@ object StatsManager {
         sb.appendLine("PCDN 拦截: ${if (config.blockPcdn) "已开启" else "已关闭"}")
         sb.appendLine("强制统一线路: ${if (config.forceUpos) "开启" else "关闭"}")
         sb.appendLine("端口启发式: ${if (config.portHeuristic) "开启" else "关闭"}")
+        sb.appendLine("Moss gRPC 注入: ${if (config.enableMossHook) "开启 (实验性)" else "关闭 (默认)"}")
         sb.appendLine("-----------------------------------------")
         sb.appendLine("【Hook 挂载状态】")
         try {

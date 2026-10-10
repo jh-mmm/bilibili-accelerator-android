@@ -64,8 +64,16 @@ class MossGrpcHookTest {
         DEFAULT, MIRROR
     }
 
+    private class DummyMossContext
+
+    private class DummyRuntimeHelper {
+        fun tf(featureKey: String): Boolean = false
+        fun tf(flagId: Int): Boolean = false
+        fun tf(ctx: DummyMossContext): DummyTfEnum = DummyTfEnum.DEFAULT
+    }
+
     @Test
-    fun testIsSupportedReturnType() {
+    fun testIsSupportedReturnTypeAndNarrowedParameterCheck() {
         assertTrue("Boolean primitive", MossGrpcHook.isSupportedReturnType(java.lang.Boolean.TYPE))
         assertTrue("Boolean boxed", MossGrpcHook.isSupportedReturnType(java.lang.Boolean::class.java))
         assertTrue("String", MossGrpcHook.isSupportedReturnType(String::class.java))
@@ -74,5 +82,23 @@ class MossGrpcHookTest {
         assertTrue("Enum", MossGrpcHook.isSupportedReturnType(DummyTfEnum::class.java))
         assertFalse("Void", MossGrpcHook.isSupportedReturnType(java.lang.Void.TYPE))
         assertFalse("Object", MossGrpcHook.isSupportedReturnType(Any::class.java))
+
+        // 验证通用 Feature Flag 参数类型（String / Int / Object）被严格排除，仅允许非通用业务上下文对象
+        val stringMethod = DummyRuntimeHelper::class.java.getDeclaredMethod("tf", String::class.java)
+        val intMethod = DummyRuntimeHelper::class.java.getDeclaredMethod("tf", Int::class.javaPrimitiveType)
+        val ctxMethod = DummyRuntimeHelper::class.java.getDeclaredMethod("tf", DummyMossContext::class.java)
+
+        assertFalse("tf(String) feature flag lookup must be rejected by strict candidate check", MossGrpcHook.isCandidateTfMethod(stringMethod, DummyRuntimeHelper::class.java))
+        assertTrue("tf(String) fallback check matches when no domain overload exists", MossGrpcHook.isStringKeyedTfMethod(stringMethod, DummyRuntimeHelper::class.java))
+        assertFalse("tf(int) primitive lookup must be rejected", MossGrpcHook.isCandidateTfMethod(intMethod, DummyRuntimeHelper::class.java))
+        assertTrue("tf(CustomContext) with enum return must be accepted", MossGrpcHook.isCandidateTfMethod(ctxMethod, DummyRuntimeHelper::class.java))
+
+        // 验证运行期入参过滤：String 仅放行明确携带 tf/mirror/upos/pcdn 等流量关键字的 key，拒绝通用 UI/AB 开关
+        assertTrue(MossGrpcHook.shouldAllowRuntimeArg("player.upos.mirror_tf"))
+        assertTrue(MossGrpcHook.shouldAllowRuntimeArg("moss_traffic_pcdn"))
+        assertFalse(MossGrpcHook.shouldAllowRuntimeArg("ab_test_home_feed_redesign"))
+        assertFalse(MossGrpcHook.shouldAllowRuntimeArg("dark_mode_enabled"))
+        assertTrue(MossGrpcHook.shouldAllowRuntimeArg(DummyMossContext()))
     }
 }
+

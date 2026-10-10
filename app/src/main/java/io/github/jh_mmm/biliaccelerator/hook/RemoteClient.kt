@@ -1,7 +1,10 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
 import android.content.Context
+import android.database.ContentObserver
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import com.google.gson.Gson
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
@@ -10,6 +13,7 @@ import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
 import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -35,8 +39,15 @@ object RemoteClient {
     @Volatile
     private var cachedConfig: AcceleratorConfig = AcceleratorConfig(enabled = false)
     private val lastConfigFetchTime = AtomicLong(0L)
+    private val nextRetryAllowedTime = AtomicLong(0L)
     private val isFetching = AtomicBoolean(false)
-    private const val CONFIG_CACHE_TTL = 30_000L // 30 秒缓存刷新
+    private val legacyPrefsCleaned = AtomicBoolean(false)
+    private val observerRegistered = AtomicBoolean(false)
+    private val initialFetchLatch = CountDownLatch(1)
+
+    private const val CONFIG_CACHE_TTL = 5_000L // 5 秒缓存刷新，配合 ContentObserver 实时推送
+    private const val CONFIG_RETRY_BACKOFF_MS = 5_000L // 独立的失败退避窗口，与 TTL 解耦
+    private const val INITIAL_FETCH_WAIT_MS = 250L
 
     // 批量上报双端队列与防抖定时器
     private val pendingBatch = ConcurrentLinkedDeque<RewriteResult>()
@@ -68,10 +79,26 @@ object RemoteClient {
         }
         appContext = app
 
-        // 清理可能遗留的历史目标私有目录缓存文件，杜绝污染目标 App 存储
-        try {
-            app.deleteSharedPreferences(TARGET_PREFS_NAME)
-        } catch (_: Throwable) {}
+        // 将历史遗留缓存清理与 ContentObserver 注册移至后台线程，杜绝 Application.attach 主线程磁盘 I/O
+        configExecutor.execute {
+            if (legacyPrefsCleaned.compareAndSet(false, true)) {
+                try {
+                    app.deleteSharedPreferences(TARGET_PREFS_NAME)
+                } catch (_: Throwable) {}
+            }
+            if (observerRegistered.compareAndSet(false, true)) {
+                try {
+                    val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+                        override fun onChange(selfChange: Boolean) {
+                            lastConfigFetchTime.set(0L)
+                            nextRetryAllowedTime.set(0L)
+                            fetchConfigAsync(app)
+                        }
+                    }
+                    app.contentResolver.registerContentObserver(StatsProvider.CONTENT_URI, false, observer)
+                } catch (_: Throwable) {}
+            }
+        }
 
         // 尽早触发一次异步配置拉取
         fetchConfigAsync(app)
@@ -95,15 +122,34 @@ object RemoteClient {
         val now = System.currentTimeMillis()
         val lastFetch = lastConfigFetchTime.get()
 
-        if (now - lastFetch < CONFIG_CACHE_TTL && lastFetch != 0L) {
+        if (lastFetch != 0L && now - lastFetch < CONFIG_CACHE_TTL) {
+            return cachedConfig
+        }
+        if (now < nextRetryAllowedTime.get()) {
             return cachedConfig
         }
 
         val context = getContext() ?: return cachedConfig
 
-        // 纯后台异步刷新，决不阻塞播放或 gRPC 线程
         fetchConfigAsync(context)
+
+        // 若处于冷启动首次拉取窗口且当前不在主线程（如播放器/gRPC 工作线程），短暂等待首次配置返回以消除冷启动漏加速窗口
+        if (lastFetch == 0L && !isMainThread()) {
+            try {
+                initialFetchLatch.await(INITIAL_FETCH_WAIT_MS, TimeUnit.MILLISECONDS)
+            } catch (_: Throwable) {}
+        }
+
         return cachedConfig
+    }
+
+    private fun isMainThread(): Boolean {
+        return try {
+            val mainLooper = Looper.getMainLooper()
+            mainLooper != null && Looper.myLooper() == mainLooper
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     private fun fetchConfigDirect(context: Context): AcceleratorConfig? {
@@ -132,25 +178,38 @@ object RemoteClient {
             configExecutor.execute {
                 try {
                     val config = fetchConfigDirect(context)
+                    val now = System.currentTimeMillis()
                     if (config != null) {
                         cachedConfig = config
-                        lastConfigFetchTime.set(System.currentTimeMillis())
+                        lastConfigFetchTime.set(now)
+                        nextRetryAllowedTime.set(0L)
                     } else {
-                        // 拉取失败退避 5 秒
-                        lastConfigFetchTime.set(System.currentTimeMillis() - CONFIG_CACHE_TTL + 5_000L)
+                        nextRetryAllowedTime.set(now + CONFIG_RETRY_BACKOFF_MS)
                     }
                 } catch (t: Throwable) {
                     Log.d(TAG, "Async config fetch exception: ${t.message}")
-                    lastConfigFetchTime.set(System.currentTimeMillis() - CONFIG_CACHE_TTL + 5_000L)
+                    nextRetryAllowedTime.set(System.currentTimeMillis() + CONFIG_RETRY_BACKOFF_MS)
                 } finally {
+                    initialFetchLatch.countDown()
                     isFetching.set(false)
                 }
             }
         }
     }
 
+    /**
+     * 隐私脱敏：在进入跨进程上报队列前立即剥离包含 mid / buvid / oi / 签名 token 的完整 URL，
+     * 仅保留裸域名（originalHost / targetHost）与重写原因，与上游隐私设计严格对齐。
+     */
+    internal fun sanitizeForIpc(result: RewriteResult): RewriteResult {
+        val safeKey = result.segmentKey.ifEmpty {
+            BiliAcceleratorCore.parseUri(result.originalUrl)?.let { BiliAcceleratorCore.extractSegmentKey(it.path) } ?: ""
+        }.substringBefore('?').substringAfterLast('/').take(96)
+        return result.copy(originalUrl = "", finalUrl = "", segmentKey = safeKey)
+    }
+
     fun notifyRewrite(result: RewriteResult) {
-        pendingBatch.offer(result)
+        pendingBatch.offer(sanitizeForIpc(result))
 
         if (pendingBatch.size >= BATCH_MAX_SIZE) {
             reportScheduler.execute { flushBatch() }
@@ -218,3 +277,4 @@ object RemoteClient {
         }
     }
 }
+

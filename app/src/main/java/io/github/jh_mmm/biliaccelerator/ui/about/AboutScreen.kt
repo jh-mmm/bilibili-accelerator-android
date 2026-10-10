@@ -127,7 +127,7 @@ fun AboutScreen(
                         )
 
                         Text(
-                            text = "v$versionName ($versionCode) · GPL-3.0-only",
+                            text = "v$versionName ($versionCode) · MIT License",
                             fontSize = 13.sp,
                             color = MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.Medium

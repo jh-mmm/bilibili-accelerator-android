@@ -11,8 +11,6 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.annotation.Keep
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.jh_mmm.biliaccelerator.R
@@ -44,13 +42,13 @@ class MainActivity : ComponentActivity() {
     }
 
     enum class ActivationState {
-        /** 已生效：已实际重写或过滤视频请求（totalRewrites > 0） */
+        /** 已生效：模块当前处于活跃状态（服务已绑定或有近期心跳），且已实际产生视频流重定向（totalRewrites > 0） */
         ACTIVE_EFFECTIVE,
 
-        /** 已激活：LSPosed 框架服务已连接，或 7 天内有心跳通信，等待目标应用产生视频流量 */
+        /** 已激活：LSPosed 框架服务已连接或近期有活跃心跳，等待目标应用产生视频流量 */
         ACTIVE_HEARTBEAT,
 
-        /** 未激活：无框架服务连接且无近期活跃心跳 */
+        /** 未激活：无框架服务连接且无近期活跃心跳（即使存在历史统计也会降级为未激活） */
         INACTIVE;
 
         val isActive: Boolean
@@ -58,24 +56,29 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
+        const val DEFAULT_HEARTBEAT_THRESHOLD_MS = 30L * 60 * 1000L // 30 分钟近期活跃心跳窗口
+
         fun calculateActivationState(
             totalRewrites: Long,
             isServiceBound: Boolean,
             lastHeartbeat: Long,
             now: Long = System.currentTimeMillis(),
-            heartbeatThresholdMs: Long = 7L * 24 * 3600 * 1000L
+            heartbeatThresholdMs: Long = DEFAULT_HEARTBEAT_THRESHOLD_MS
         ): ActivationState {
-            if (totalRewrites > 0) {
-                return ActivationState.ACTIVE_EFFECTIVE
-            }
-            if (isServiceBound) {
-                return ActivationState.ACTIVE_HEARTBEAT
-            }
             val diff = now - lastHeartbeat
-            if (lastHeartbeat > 0L && diff in 0..heartbeatThresholdMs) {
-                return ActivationState.ACTIVE_HEARTBEAT
+            val hasRecentHeartbeat = lastHeartbeat > 0L && diff in 0..heartbeatThresholdMs
+            val isCurrentlyActive = isServiceBound || hasRecentHeartbeat
+
+            // 必须当前在线（服务存活或近期心跳有效）才可视为激活，防止关闭/卸载模块后因历史累计统计导致状态永远停留在“运行正常”
+            if (!isCurrentlyActive) {
+                return ActivationState.INACTIVE
             }
-            return ActivationState.INACTIVE
+
+            return if (totalRewrites > 0L) {
+                ActivationState.ACTIVE_EFFECTIVE
+            } else {
+                ActivationState.ACTIVE_HEARTBEAT
+            }
         }
     }
 
@@ -87,10 +90,6 @@ class MainActivity : ComponentActivity() {
             lastHeartbeat = snapshot.lastHeartbeatTimestamp
         )
     }
-
-    // 保留向后兼容供反射或外部查询
-    @Keep
-    fun isModuleActive(): Boolean = getActivationState().isActive
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()

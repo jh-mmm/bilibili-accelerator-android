@@ -88,6 +88,6 @@
 
 ## 鸣谢与开源协议
 
-本项目基于 [MIT License](https://www.google.com/search?q=LICENSE) 许可协议开源。
+本项目基于 [MIT License](LICENSE) 许可协议开源。
 
 特别感谢上游项目 [realzza/bilibili-accelerator](https://github.com/realzza/bilibili-accelerator) 的原作者。本 Android 模块的核心逻辑架构与拦截规则均参考自该项目！

@@ -65,6 +65,14 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
+/**
+ * 生成稳定且不依赖列表下标的 LazyColumn 条目 key，避免新日志插入头部时导致全部条目 key 变化与列表抖动。
+ */
+internal fun logItemKey(log: RewriteLogEntry): String {
+    return log.id.takeIf { !it.isNullOrBlank() }
+        ?: "${log.timestamp}_${log.originalHost}_${log.targetHost}_${log.reason}"
+}
+
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun DashboardScreen(
@@ -149,7 +157,7 @@ fun DashboardScreen(
             } else {
                 items(
                     items = snapshot.recentLogs,
-                    key = { log -> "${log.timestamp}_${log.originalHost}_${log.reason}" }
+                    key = { log -> logItemKey(log) }
                 ) { logItem ->
                     RewriteLogCard(
                         log = logItem,
