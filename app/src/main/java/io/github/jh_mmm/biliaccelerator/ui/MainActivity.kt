@@ -143,9 +143,9 @@ class MainActivity : ComponentActivity() {
                 @Suppress("DEPRECATION")
                 pInfo.versionCode.toLong()
             }
-            (pInfo.versionName ?: "1.0.7") to code
+            (pInfo.versionName ?: "1.0.8") to code
         } catch (_: Exception) {
-            "1.0.7" to 107L
+            "1.0.8" to 108L
         }
 
         refreshStats()
