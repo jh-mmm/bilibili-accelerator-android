@@ -11,6 +11,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.annotation.Keep
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.jh_mmm.biliaccelerator.R
@@ -42,13 +43,13 @@ class MainActivity : ComponentActivity() {
     }
 
     enum class ActivationState {
-        /** 已生效：模块当前处于活跃状态（服务已绑定或有近期心跳），且已实际产生视频流重定向（totalRewrites > 0） */
+        /** 已生效：模块已激活且已实际产生视频流重定向（totalRewrites > 0） */
         ACTIVE_EFFECTIVE,
 
-        /** 已激活：LSPosed 框架服务已连接或近期有活跃心跳，等待目标应用产生视频流量 */
+        /** 已激活：LSPosed 模块开关已开启且作用域生效（或有心跳通信/服务连接），等待目标应用产生视频流量 */
         ACTIVE_HEARTBEAT,
 
-        /** 未激活：无框架服务连接且无近期活跃心跳（即使存在历史统计也会降级为未激活） */
+        /** 未激活：未检测到框架激活、服务绑定或通信回执 */
         INACTIVE;
 
         val isActive: Boolean
@@ -58,19 +59,42 @@ class MainActivity : ComponentActivity() {
     companion object {
         const val DEFAULT_HEARTBEAT_THRESHOLD_MS = 30L * 60 * 1000L // 30 分钟近期活跃心跳窗口
 
+        /**
+         * 经典 Xposed / LSPosed 模块自检测入口。
+         * 默认返回 false；当模块自身处于作用域中并被框架成功注入加载时，
+         * HookEntry 会将此方法 hook 替换返回 true。
+         */
+        @Keep
+        @JvmStatic
+        fun isModuleActive(): Boolean = false
+
         fun calculateActivationState(
             totalRewrites: Long,
             isServiceBound: Boolean,
             lastHeartbeat: Long,
+            isSelfInjected: Boolean = false,
+            hasHistoricalActivation: Boolean = false,
             now: Long = System.currentTimeMillis(),
             heartbeatThresholdMs: Long = DEFAULT_HEARTBEAT_THRESHOLD_MS
         ): ActivationState {
             val diff = now - lastHeartbeat
             val hasRecentHeartbeat = lastHeartbeat > 0L && diff in 0..heartbeatThresholdMs
-            val isCurrentlyActive = isServiceBound || hasRecentHeartbeat
 
-            // 必须当前在线（服务存活或近期心跳有效）才可视为激活，防止关闭/卸载模块后因历史累计统计导致状态永远停留在“运行正常”
-            if (!isCurrentlyActive) {
+            // 只要满足任一激活凭据，模块即处于激活状态：
+            // 1. 模块自身被框架注入 (isSelfInjected: LSPosed 开启开关并勾选作用域)
+            // 2. 现代 LibXposed 框架服务已绑定 (isServiceBound)
+            // 3. 目标应用近期有活跃心跳通信 (hasRecentHeartbeat)
+            // 4. 目标应用曾有历史心跳记录 (lastHeartbeat > 0L)
+            // 5. 本地持久化记录曾被激活 (hasHistoricalActivation)
+            // 6. 已产生加速重写记录 (totalRewrites > 0L)
+            val isActivated = isSelfInjected ||
+                    isServiceBound ||
+                    hasRecentHeartbeat ||
+                    hasHistoricalActivation ||
+                    lastHeartbeat > 0L ||
+                    totalRewrites > 0L
+
+            if (!isActivated) {
                 return ActivationState.INACTIVE
             }
 
@@ -84,10 +108,16 @@ class MainActivity : ComponentActivity() {
 
     fun getActivationState(): ActivationState {
         val snapshot = StatsManager.getSnapshot()
+        val isSelfInjected = isModuleActive() ||
+                StatsManager.isFrameworkSelfInjected ||
+                io.github.jh_mmm.biliaccelerator.hook.HookEntry.isSelfHookInjected
+
         return calculateActivationState(
             totalRewrites = snapshot.totalRewrites,
             isServiceBound = XposedServiceProvider.isServiceBound,
-            lastHeartbeat = snapshot.lastHeartbeatTimestamp
+            lastHeartbeat = snapshot.lastHeartbeatTimestamp,
+            isSelfInjected = isSelfInjected,
+            hasHistoricalActivation = StatsManager.hasHistoricalActivation(this) || snapshot.isFrameworkActivated
         )
     }
 
@@ -96,6 +126,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         StatsManager.init(this)
+        if (isModuleActive() || StatsManager.isFrameworkSelfInjected || io.github.jh_mmm.biliaccelerator.hook.HookEntry.isSelfHookInjected) {
+            StatsManager.recordFrameworkActivated(this)
+        }
         uiPreferencesStore = UiPreferencesStore(this)
 
         val loadedConfig = StatsProvider.loadConfig(this)

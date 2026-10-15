@@ -19,9 +19,12 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.jh_mmm.biliaccelerator.core.StatsManager
 import io.github.jh_mmm.biliaccelerator.core.StatsSnapshot
+import io.github.jh_mmm.biliaccelerator.hook.HookEntry
 import io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker
 import io.github.jh_mmm.biliaccelerator.provider.XposedServiceProvider
+import io.github.jh_mmm.biliaccelerator.ui.MainActivity
 import io.github.jh_mmm.biliaccelerator.ui.MainActivity.ActivationState
 import java.time.Instant
 import java.time.LocalDateTime
@@ -38,6 +41,10 @@ fun StatusDetailDialog(
         snapshot.hookStatus.ifEmpty { HookStatusTracker.getSnapshot() }
     )
     val isServiceBound = XposedServiceProvider.isServiceBound
+    val isSelfInjected = MainActivity.isModuleActive() ||
+            StatsManager.isFrameworkSelfInjected ||
+            HookEntry.isSelfHookInjected ||
+            snapshot.isFrameworkActivated
 
     val lastHbDesc = if (snapshot.lastHeartbeatTimestamp > 0L) {
         LocalDateTime.ofInstant(
@@ -85,10 +92,11 @@ fun StatusDetailDialog(
                         ActivationState.ACTIVE_EFFECTIVE ->
                             "已成功拦截并加速视频播放，累计完成 ${snapshot.totalRewrites} 次视频流重定向。"
                         ActivationState.ACTIVE_HEARTBEAT ->
-                            if (isServiceBound) "LSPosed 框架服务已成功连接，播放任意 B 站视频即可开始加速。"
+                            if (isSelfInjected) "LSPosed 模块已激活并就绪，播放任意 B 站视频即可开始加速。"
+                            else if (isServiceBound) "LSPosed 框架服务已成功连接，播放任意 B 站视频即可开始加速。"
                             else "目标应用（哔哩哔哩）已挂载并建立通信，播放视频即可开始加速。"
                         ActivationState.INACTIVE ->
-                            "排查指引：\n1. 打开 LSPosed 管理器确认模块开关已开启\n2. 确认推荐作用域已勾选“哔哩哔哩”\n3. 强行停止哔哩哔哩后重新打开测试。"
+                            "排查指引：\n1. 打开 LSPosed 管理器确认模块开关已开启\n2. 确认推荐作用域已勾选“哔哩哔哩”与模块自身\n3. 强行停止哔哩哔哩后重新打开测试。"
                     },
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -107,8 +115,14 @@ fun StatusDetailDialog(
                     color = MaterialTheme.colorScheme.onSurface
                 )
                 Spacer(Modifier.height(4.dp))
+                val frameworkDesc = when {
+                    isSelfInjected -> "已挂载 (LSPosed 作用域生效)"
+                    isServiceBound -> "已连接 (现代系统服务)"
+                    snapshot.lastHeartbeatTimestamp > 0L -> "已建立通信 (来自哔哩哔哩)"
+                    else -> "未连接"
+                }
                 Text(
-                    text = "框架 Service 绑定: ${if (isServiceBound) "已连接" else "未连接"}\n最近心跳回执: $lastHbDesc",
+                    text = "框架运行状态: $frameworkDesc\n框架 Service 绑定: ${if (isServiceBound) "已连接" else "未连接"}\n最近心跳回执: $lastHbDesc",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     lineHeight = 18.sp

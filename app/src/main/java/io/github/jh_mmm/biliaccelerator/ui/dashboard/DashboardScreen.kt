@@ -228,8 +228,8 @@ private fun RuntimeStatusCard(
 
     val summary = when (state) {
         ActivationState.ACTIVE_EFFECTIVE -> "视频流原生加速与 PCDN 过滤已生效"
-        ActivationState.ACTIVE_HEARTBEAT -> "LSPosed 服务已挂载 · 播放视频即可加速"
-        ActivationState.INACTIVE -> "未检测到框架绑定或心跳，点击查看排查指引"
+        ActivationState.ACTIVE_HEARTBEAT -> "LSPosed 模块已激活 · 播放视频即可加速"
+        ActivationState.INACTIVE -> "未检测到框架激活或通信，点击查看排查指引"
     }
 
     Card(

@@ -26,7 +26,8 @@ class ActivationStateTest {
             avoidedHosts = listOf("pcdn.sz.bili.com"),
             recentLogs = emptyList(),
             installedAt = "2026-10-07 18:00:00",
-            lastHeartbeatTimestamp = 1760000000000L
+            lastHeartbeatTimestamp = 1760000000000L,
+            isFrameworkActivated = true
         )
 
         val json = gson.toJson(snapshot)
@@ -35,6 +36,7 @@ class ActivationStateTest {
         assertEquals(snapshot.totalRequests, deserialized.totalRequests)
         assertEquals(snapshot.totalRewrites, deserialized.totalRewrites)
         assertEquals(snapshot.lastHeartbeatTimestamp, deserialized.lastHeartbeatTimestamp)
+        assertTrue(deserialized.isFrameworkActivated)
     }
 
     @Test
@@ -55,20 +57,47 @@ class ActivationStateTest {
         assertEquals(50L, deserialized.totalRequests)
         assertEquals(10L, deserialized.totalRewrites)
         assertEquals(0L, deserialized.lastHeartbeatTimestamp)
+        assertFalse(deserialized.isFrameworkActivated)
     }
 
     @Test
-    fun testCalculateActivationStateDowngradesWhenInactiveEvenWithHistoricalRewrites() {
+    fun testCalculateActivationStateInactiveOnlyWhenNoCredentials() {
         val now = 1_760_000_000_000L
-        // 历史有 totalRewrites = 100，但当前未绑定框架服务且心跳已过期（或为 0）-> 必须降级为 INACTIVE
-        val stateWhenNoHeartbeat = MainActivity.calculateActivationState(
-            totalRewrites = 100L,
+        // 全新状态：无自注入、无框架服务、无心跳、无历史激活记录与重写 -> 才是真正 INACTIVE
+        val stateClean = MainActivity.calculateActivationState(
+            totalRewrites = 0L,
             isServiceBound = false,
             lastHeartbeat = 0L,
+            isSelfInjected = false,
+            hasHistoricalActivation = false,
             now = now
         )
-        assertEquals("Historical rewrites without active service or heartbeat must be INACTIVE", ActivationState.INACTIVE, stateWhenNoHeartbeat)
+        assertEquals("Clean installation without framework credentials must be INACTIVE", ActivationState.INACTIVE, stateClean)
+    }
 
+    @Test
+    fun testCalculateActivationStateSelfInjectedInLsposedScope() {
+        val now = 1_760_000_000_000L
+        // LSPosed 开启并勾选作用域后自注入生效：即使尚未运行哔哩哔哩且无流量 -> 必须直接处于激活待命中状态 (ACTIVE_HEARTBEAT)
+        val stateSelfInjected = MainActivity.calculateActivationState(
+            totalRewrites = 0L,
+            isServiceBound = false,
+            lastHeartbeat = 0L,
+            isSelfInjected = true,
+            hasHistoricalActivation = false,
+            now = now
+        )
+        assertEquals(
+            "LSPosed scope enabled with self-injection must show activated state",
+            ActivationState.ACTIVE_HEARTBEAT,
+            stateSelfInjected
+        )
+    }
+
+    @Test
+    fun testCalculateActivationStateHistoricalRewritesMaintainsEffective() {
+        val now = 1_760_000_000_000L
+        // 历史已有重写记录：即使心跳已过期且未常驻绑定服务 -> 依然保持 ACTIVE_EFFECTIVE，不可降级为 INACTIVE
         val expiredHeartbeat = now - MainActivity.DEFAULT_HEARTBEAT_THRESHOLD_MS - 1_000L
         val stateWhenHeartbeatExpired = MainActivity.calculateActivationState(
             totalRewrites = 100L,
@@ -76,7 +105,30 @@ class ActivationStateTest {
             lastHeartbeat = expiredHeartbeat,
             now = now
         )
-        assertEquals("Expired heartbeat without service binding must downgrade to INACTIVE", ActivationState.INACTIVE, stateWhenHeartbeatExpired)
+        assertEquals("Historical rewrites must maintain ACTIVE_EFFECTIVE", ActivationState.ACTIVE_EFFECTIVE, stateWhenHeartbeatExpired)
+
+        // 即使心跳为 0 但有重写记录 -> 依然保持 ACTIVE_EFFECTIVE
+        val stateWithRewritesNoHb = MainActivity.calculateActivationState(
+            totalRewrites = 10L,
+            isServiceBound = false,
+            lastHeartbeat = 0L,
+            now = now
+        )
+        assertEquals("Rewrites without heartbeat must be ACTIVE_EFFECTIVE", ActivationState.ACTIVE_EFFECTIVE, stateWithRewritesNoHb)
+    }
+
+    @Test
+    fun testCalculateActivationStateHistoricalHeartbeatMaintainsActivated() {
+        val now = 1_760_000_000_000L
+        // 曾与目标应用建立通信握手：即使心跳过期且尚未重写 -> 保持已激活待命中 (ACTIVE_HEARTBEAT)
+        val expiredHeartbeat = now - MainActivity.DEFAULT_HEARTBEAT_THRESHOLD_MS - 1_000L
+        val state = MainActivity.calculateActivationState(
+            totalRewrites = 0L,
+            isServiceBound = false,
+            lastHeartbeat = expiredHeartbeat,
+            now = now
+        )
+        assertEquals("Historical heartbeat must maintain ACTIVE_HEARTBEAT", ActivationState.ACTIVE_HEARTBEAT, state)
     }
 
     @Test

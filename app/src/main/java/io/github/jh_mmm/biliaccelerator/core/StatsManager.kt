@@ -39,7 +39,8 @@ data class StatsSnapshot(
     val recentLogs: List<RewriteLogEntry> = emptyList(),
     val installedAt: String = "",
     val lastHeartbeatTimestamp: Long = 0L,
-    val hookStatus: Map<String, String> = emptyMap()
+    val hookStatus: Map<String, String> = emptyMap(),
+    val isFrameworkActivated: Boolean = false
 )
 
 object StatsManager {
@@ -54,6 +55,7 @@ object StatsManager {
     private const val KEY_INSTALLED_AT = "stat_installed_at"
     private const val KEY_LAST_HEARTBEAT = "stat_last_heartbeat"
     private const val KEY_HOOK_STATUS = "stat_hook_status"
+    private const val KEY_FRAMEWORK_ACTIVATED = "stat_framework_activated"
 
     private const val TAG = "BiliAccelerator-Stats"
     private const val MAX_LOGS = 100
@@ -68,6 +70,8 @@ object StatsManager {
     private val pcdnBlocked = AtomicLong(0)
     private val mcdnProxied = AtomicLong(0)
     private val lastHeartbeat = AtomicLong(0L)
+    private val frameworkInjected = AtomicBoolean(false)
+    private val everActivated = AtomicBoolean(false)
     private val avoidedHosts = ConcurrentHashMap.newKeySet<String>()
     private val recentLogs = CopyOnWriteArrayList<RewriteLogEntry>()
     private val hookStatus = ConcurrentHashMap<String, String>()
@@ -107,6 +111,7 @@ object StatsManager {
             pcdnBlocked.set(sp.getLong(KEY_PCDN_BLOCKED, 0))
             mcdnProxied.set(sp.getLong(KEY_MCDN_PROXIED, 0))
             lastHeartbeat.set(sp.getLong(KEY_LAST_HEARTBEAT, 0L))
+            everActivated.set(sp.getBoolean(KEY_FRAMEWORK_ACTIVATED, false))
 
             installedAt = sp.getString(KEY_INSTALLED_AT, null) ?: run {
                 val now = LocalDateTime.now().format(installTimeFormatter)
@@ -162,11 +167,36 @@ object StatsManager {
         }
     }
 
+    @JvmStatic
+    fun markFrameworkSelfInjected() {
+        frameworkInjected.set(true)
+        everActivated.set(true)
+    }
+
+    val isFrameworkSelfInjected: Boolean
+        get() = frameworkInjected.get()
+
+    fun hasHistoricalActivation(context: Context? = null): Boolean {
+        if (context != null) {
+            ensureInitialized(context)
+        }
+        return everActivated.get()
+    }
+
+    fun recordFrameworkActivated(context: Context? = null) {
+        if (context != null) {
+            ensureInitialized(context)
+        }
+        everActivated.set(true)
+        context?.let { scheduleDebouncedSave(it) }
+    }
+
     fun recordHeartbeat(context: Context? = null) {
         if (context != null) {
             ensureInitialized(context)
         }
         lastHeartbeat.set(System.currentTimeMillis())
+        everActivated.set(true)
         context?.let { scheduleDebouncedSave(it) }
     }
 
@@ -298,6 +328,7 @@ object StatsManager {
                     .putLong(KEY_PCDN_BLOCKED, pcdnBlocked.get())
                     .putLong(KEY_MCDN_PROXIED, mcdnProxied.get())
                     .putLong(KEY_LAST_HEARTBEAT, lastHeartbeat.get())
+                    .putBoolean(KEY_FRAMEWORK_ACTIVATED, everActivated.get())
                     .putString(KEY_AVOIDED_HOSTS, gson.toJson(avoidedHosts.toList()))
                     .putString(KEY_RECENT_LOGS, gson.toJson(recentLogs.toList()))
                     .putString(KEY_HOOK_STATUS, gson.toJson(hookStatus))
@@ -347,7 +378,8 @@ object StatsManager {
             recentLogs = recentLogs.toList(),
             installedAt = installedAt,
             lastHeartbeatTimestamp = lastHeartbeat.get(),
-            hookStatus = HashMap(hookStatus)
+            hookStatus = HashMap(hookStatus),
+            isFrameworkActivated = everActivated.get() || frameworkInjected.get()
         )
     }
 

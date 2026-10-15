@@ -77,14 +77,47 @@ class HookEntry : XposedModule() {
                     .takeIf { it.isNotEmpty() }
             }.getOrNull()
         }
+
+        @Volatile
+        var isSelfHookInjected: Boolean = false
+            internal set
+    }
+
+    private fun handleModuleSelfLoaded(param: PackageLoadedParam) {
+        isSelfHookInjected = true
+        Log.i(TAG, "LSPosed injected into module self package (${param.packageName}), module is active")
+
+        val classLoader = try {
+            param.defaultClassLoader
+        } catch (_: Throwable) {
+            null
+        } ?: Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader()
+
+        try {
+            val mainActivityClass = classLoader.loadClass("io.github.jh_mmm.biliaccelerator.ui.MainActivity")
+            val isModuleActiveMethod = mainActivityClass.getDeclaredMethod("isModuleActive")
+            hook(isModuleActiveMethod).intercept {
+                true
+            }
+            Log.i(TAG, "Successfully hooked MainActivity.isModuleActive -> true")
+        } catch (t: Throwable) {
+            Log.d(TAG, "Self-hook MainActivity.isModuleActive fallback: ${t.message}")
+        }
+
+        try {
+            val statsManagerClass = classLoader.loadClass("io.github.jh_mmm.biliaccelerator.core.StatsManager")
+            val markMethod = statsManagerClass.getDeclaredMethod("markFrameworkSelfInjected")
+            markMethod.invoke(null)
+        } catch (_: Throwable) {}
     }
 
     @android.annotation.SuppressLint("NewApi")
     override fun onPackageLoaded(param: PackageLoadedParam) {
         val packageName = param.packageName
 
-        // 1. 忽略模块自身包名与非主包加载
+        // 1. 模块自身包名：框架已将本模块纳入作用域并成功注入，标记激活状态
         if (packageName == BiliAcceleratorCore.MODULE_PACKAGE) {
+            handleModuleSelfLoaded(param)
             return
         }
         val isFirst = try {
