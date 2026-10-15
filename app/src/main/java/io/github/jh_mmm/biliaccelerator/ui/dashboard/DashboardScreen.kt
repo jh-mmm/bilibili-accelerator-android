@@ -56,6 +56,7 @@ import io.github.jh_mmm.biliaccelerator.ui.theme.BiliBlue
 import io.github.jh_mmm.biliaccelerator.ui.theme.LocalUiStyle
 import io.github.jh_mmm.biliaccelerator.ui.theme.TagMcdn
 import io.github.jh_mmm.biliaccelerator.ui.theme.TagPcdn
+import io.github.jh_mmm.biliaccelerator.ui.theme.TagMoss
 import io.github.jh_mmm.biliaccelerator.ui.theme.TagSched
 import io.github.jh_mmm.biliaccelerator.ui.theme.TagUpos
 import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
@@ -536,9 +537,10 @@ private fun RewriteLogCard(
     val cornerRadius = if (uiStyle == UiStyle.MIUIX) 14.dp else 10.dp
 
     val (tagLabel, tagColor) = when {
+        log.reason.contains("moss") -> "Moss 优化" to TagMoss
+        log.reason.contains("source") -> "线路调度" to TagSched
         log.isPcdn -> "PCDN 阻断" to TagPcdn
         log.isMcdn -> "MCDN 代理" to TagMcdn
-        log.reason.contains("source") -> "线路调度" to TagSched
         else -> "UPOS 重定向" to TagUpos
     }
 

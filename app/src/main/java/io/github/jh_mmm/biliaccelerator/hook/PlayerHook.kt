@@ -135,7 +135,7 @@ object PlayerHook {
                 if (hasUrlInfo && config.blockPcdn) {
                     val filtered = BiliAcceleratorCore.filterLiveUrlInfo(raw, config)
                     if (filtered.changed) {
-                        filtered.rewrites.firstOrNull()?.let { RemoteClient.notifyRewrite(it) }
+                        filtered.rewrites.forEach { RemoteClient.notifyRewrite(it) }
                         return@intercept filtered.json
                     }
                 }
@@ -412,7 +412,7 @@ object PlayerHook {
                 if (trimmed.contains("\"url_info\"")) {
                     val liveFiltered = BiliAcceleratorCore.filterLiveUrlInfo(originalUrl, config)
                     if (liveFiltered.changed) {
-                        liveFiltered.rewrites.firstOrNull()?.let { RemoteClient.notifyRewrite(it) }
+                        liveFiltered.rewrites.forEach { RemoteClient.notifyRewrite(it) }
                         val targetArray = newArgs ?: args.toTypedArray().also { newArgs = it }
                         targetArray[i] = liveFiltered.json
                     }

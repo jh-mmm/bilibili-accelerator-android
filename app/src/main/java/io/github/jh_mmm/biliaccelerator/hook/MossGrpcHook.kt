@@ -1,6 +1,7 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
 import android.util.Log
+import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.libxposed.api.XposedModule
 import java.lang.reflect.Method
 import java.math.BigDecimal
@@ -68,6 +69,7 @@ object MossGrpcHook {
                             if (returnType == java.lang.Boolean.TYPE || returnType == java.lang.Boolean::class.java || result is Boolean) {
                                 if (result == false) {
                                     logSampledInjection(methodSignature, argDesc, result, true)
+                                    reportMossInjection(methodSignature, argDesc, result, true)
                                     return@intercept true
                                 }
                                 return@intercept result
@@ -78,6 +80,7 @@ object MossGrpcHook {
                                 val str = result.toString()
                                 if (str == "0" || str.equals("false", ignoreCase = true) || str.isEmpty()) {
                                     logSampledInjection(methodSignature, argDesc, result, "1")
+                                    reportMossInjection(methodSignature, argDesc, result, "1")
                                     return@intercept "1"
                                 }
                                 return@intercept result
@@ -88,6 +91,7 @@ object MossGrpcHook {
                                 if (result.toDouble() == 0.0) {
                                     val modified = convertNumberToTfOne(returnType, result)
                                     logSampledInjection(methodSignature, argDesc, result, modified)
+                                    reportMossInjection(methodSignature, argDesc, result, modified)
                                     return@intercept modified
                                 }
                                 return@intercept result
@@ -106,6 +110,7 @@ object MossGrpcHook {
                                     val mirrorTf = forNumberMethod.invoke(null, 1)
                                     if (mirrorTf != null) {
                                         logSampledInjection(methodSignature, argDesc, result, mirrorTf)
+                                        reportMossInjection(methodSignature, argDesc, result, mirrorTf)
                                         return@intercept mirrorTf
                                     }
                                 }
@@ -138,9 +143,10 @@ object MossGrpcHook {
 
     private fun summarizeArg(arg: Any?): String {
         if (arg == null) return "null"
-        val className = arg.javaClass.name
-        val str = runCatching { arg.toString().take(80) }.getOrDefault(className)
-        return "$className($str)"
+        if (arg is CharSequence) return arg.toString().take(80)
+        val simpleName = arg.javaClass.simpleName.ifEmpty { arg.javaClass.name }
+        val str = runCatching { arg.toString().take(60) }.getOrDefault(simpleName)
+        return if (str.startsWith(simpleName)) str else "$simpleName($str)"
     }
 
     private fun logSampledObservation(signature: String, argDesc: String, currentVal: Any) {
@@ -154,6 +160,25 @@ object MossGrpcHook {
         val count = sampleLogCount.incrementAndGet()
         if (count <= MAX_SAMPLE_LOGS) {
             Log.i(TAG, "[Sample #$count/$MAX_SAMPLE_LOGS] Moss TF override on [$signature] arg=[$argDesc]: $oldVal -> $newVal")
+        }
+    }
+
+    private fun reportMossInjection(signature: String, argDesc: String, oldVal: Any, newVal: Any) {
+        runCatching {
+            val safeSig = signature.substringBefore('(').substringAfterLast('.').take(48)
+            val safeArg = argDesc.take(64)
+            val result = RewriteResult(
+                changed = true,
+                originalUrl = "",
+                finalUrl = "",
+                originalHost = "TF=$oldVal ($safeArg)",
+                targetHost = "TF=$newVal (官方优质镜像)",
+                reason = "moss-tf-inject",
+                isPcdn = false,
+                isMcdn = false,
+                segmentKey = "moss:$safeSig"
+            )
+            RemoteClient.notifyRewrite(result)
         }
     }
 

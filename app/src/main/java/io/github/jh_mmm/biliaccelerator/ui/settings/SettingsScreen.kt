@@ -12,6 +12,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -19,24 +22,45 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Route
 import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import io.github.jh_mmm.biliaccelerator.ui.theme.isAcceleratorDarkTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.net.InetSocketAddress
+import java.net.Socket
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.ui.components.AcceleratorPage
 import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceActionItem
 import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceDivider
@@ -63,6 +87,8 @@ fun SettingsScreen(
     bottomContentPadding: Dp = 80.dp
 ) {
     var showUposDialog by rememberSaveable { mutableStateOf(false) }
+    var showSpeedTestDialog by rememberSaveable { mutableStateOf(false) }
+    var showProxyHostDialog by rememberSaveable { mutableStateOf(false) }
     var showStyleDialog by rememberSaveable { mutableStateOf(false) }
     var showThemeModeDialog by rememberSaveable { mutableStateOf(false) }
     var showConfirmClearDialog by rememberSaveable { mutableStateOf(false) }
@@ -79,6 +105,32 @@ fun SettingsScreen(
                 showUposDialog = false
             },
             onDismiss = { showUposDialog = false }
+        )
+    }
+
+    // Dialog 1.2: UPOS Speed Test
+    if (showSpeedTestDialog) {
+        UposSpeedTestDialog(
+            uposEntries = uposEntries,
+            uposValues = uposValues,
+            currentTargetHost = config.targetHost,
+            onSelectTargetHost = { newHost ->
+                onConfigChange(config.copy(targetHost = newHost))
+                showSpeedTestDialog = false
+            },
+            onDismiss = { showSpeedTestDialog = false }
+        )
+    }
+
+    // Dialog 1.5: Select MCDN Proxy Host
+    if (showProxyHostDialog) {
+        ProxyHostDialog(
+            currentHost = config.proxyHost,
+            onSelect = { newHost ->
+                onConfigChange(config.copy(proxyHost = newHost))
+                showProxyHostDialog = false
+            },
+            onDismiss = { showProxyHostDialog = false }
         )
     }
 
@@ -180,6 +232,15 @@ fun SettingsScreen(
 
                     PreferenceDivider()
 
+                    PreferenceActionItem(
+                        title = "测试 UPOS 镜像速度",
+                        summary = "测试各镜像节点延迟并推荐最佳线路",
+                        icon = Icons.Outlined.Speed,
+                        onClick = { showSpeedTestDialog = true }
+                    )
+
+                    PreferenceDivider()
+
                     PreferenceSwitchItem(
                         title = "全局强制统一 UPOS 线路",
                         summary = "忽略服务端下发调度，强行覆盖全部视频流",
@@ -213,6 +274,23 @@ fun SettingsScreen(
                         checked = config.proxyMcdn,
                         onCheckedChange = { onConfigChange(config.copy(proxyMcdn = it)) },
                         enabled = config.enabled
+                    )
+
+                    PreferenceDivider()
+
+                    val currentProxyLabel = when (config.proxyHost) {
+                        "proxy-tf-all-ws.bilivideo.com" -> "网宿"
+                        "proxy-tf-all-tx.bilivideo.com" -> "腾讯云"
+                        "proxy-tf-all-hw.bilivideo.com" -> "华为云"
+                        else -> config.proxyHost.substringBefore('.').removePrefix("proxy-")
+                    }
+
+                    PreferenceDropdownItem(
+                        title = "MCDN 中继代理节点",
+                        summary = "当前中继: ${config.proxyHost}",
+                        selectedValue = currentProxyLabel,
+                        onClick = { showProxyHostDialog = true },
+                        enabled = config.enabled && config.proxyMcdn
                     )
 
                     PreferenceDivider()
@@ -340,3 +418,332 @@ private fun SingleChoiceDialog(
         shape = RoundedCornerShape(20.dp)
     )
 }
+
+@Composable
+private fun ProxyHostDialog(
+    currentHost: String,
+    onSelect: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val presets = listOf(
+        "proxy-tf-all-ws.bilivideo.com" to "网宿 CDN (默认)",
+        "proxy-tf-all-tx.bilivideo.com" to "腾讯云 CDN",
+        "proxy-tf-all-hw.bilivideo.com" to "华为云 CDN"
+    )
+    val presetIndex = presets.indexOfFirst { it.first == currentHost }
+    val isPreset = presetIndex >= 0
+    var selectedPresetIndex by rememberSaveable {
+        mutableStateOf(if (isPreset) presetIndex else presets.size)
+    }
+    var customHost by rememberSaveable {
+        mutableStateOf(if (isPreset) "" else currentHost)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("MCDN 中继代理节点") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                presets.forEachIndexed { index, (host, label) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .selectable(
+                                selected = (selectedPresetIndex == index),
+                                onClick = { selectedPresetIndex = index }
+                            )
+                            .padding(vertical = 10.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = (selectedPresetIndex == index),
+                            onClick = { selectedPresetIndex = index }
+                        )
+                        Column(modifier = Modifier.padding(start = 8.dp)) {
+                            Text(text = label, fontSize = 14.sp)
+                            Text(
+                                text = host,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .selectable(
+                            selected = (selectedPresetIndex == presets.size),
+                            onClick = { selectedPresetIndex = presets.size }
+                        )
+                        .padding(vertical = 10.dp, horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(
+                        selected = (selectedPresetIndex == presets.size),
+                        onClick = { selectedPresetIndex = presets.size }
+                    )
+                    Text(
+                        text = "自定义中继域名",
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(start = 8.dp)
+                    )
+                }
+
+                if (selectedPresetIndex == presets.size) {
+                    OutlinedTextField(
+                        value = customHost,
+                        onValueChange = { customHost = it },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 4.dp, vertical = 6.dp),
+                        placeholder = { Text("例: proxy-tf-all-ws.bilivideo.com", fontSize = 13.sp) },
+                        singleLine = true
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val chosenHost = if (selectedPresetIndex in presets.indices) {
+                    presets[selectedPresetIndex].first
+                } else {
+                    val cleaned = BiliAcceleratorCore.cleanHost(customHost).substringBefore(':')
+                    cleaned.ifBlank { "proxy-tf-all-ws.bilivideo.com" }
+                }
+                onSelect(chosenHost)
+            }) {
+                Text("确定")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("取消")
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+
+data class UposTestState(
+    val host: String,
+    val latencyMs: Long? = null,
+    val isTesting: Boolean = false,
+    val error: String? = null
+)
+
+@Composable
+private fun UposSpeedTestDialog(
+    uposEntries: List<String>,
+    uposValues: List<String>,
+    currentTargetHost: String,
+    onSelectTargetHost: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val coroutineScope = rememberCoroutineScope()
+    var isTestingAll by remember { mutableStateOf(false) }
+    var testStates by remember {
+        mutableStateOf(uposValues.associateWith { host ->
+            UposTestState(host = host, isTesting = false)
+        })
+    }
+
+    fun startSpeedTest() {
+        if (isTestingAll) return
+        isTestingAll = true
+        testStates = uposValues.associateWith { host ->
+            UposTestState(host = host, isTesting = true)
+        }
+        coroutineScope.launch {
+            withContext(Dispatchers.IO) {
+                uposValues.map { host ->
+                    async {
+                        val result = runCatching {
+                            val t0 = System.currentTimeMillis()
+                            Socket().use { socket ->
+                                socket.connect(InetSocketAddress(host, 443), 2500)
+                            }
+                            val cost = System.currentTimeMillis() - t0
+                            UposTestState(host = host, latencyMs = cost, isTesting = false)
+                        }.getOrElse {
+                            UposTestState(host = host, latencyMs = null, isTesting = false, error = "超时/失败")
+                        }
+                        withContext(Dispatchers.Main) {
+                            testStates = testStates + (host to result)
+                        }
+                    }
+                }.awaitAll()
+            }
+            isTestingAll = false
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        startSpeedTest()
+    }
+
+    val dark = isAcceleratorDarkTheme()
+
+    val sortedHosts = remember(testStates, isTestingAll) {
+        if (isTestingAll && testStates.values.all { it.isTesting }) {
+            uposValues
+        } else {
+            uposValues.sortedWith { a, b ->
+                val latA = testStates[a]?.latencyMs ?: Long.MAX_VALUE
+                val latB = testStates[b]?.latencyMs ?: Long.MAX_VALUE
+                latA.compareTo(latB)
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(text = "UPOS 镜像测速", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                if (isTestingAll) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = if (isTestingAll) "正在并发探测各节点连接时延 (TTFB)..." else "测速完成。点击任意镜像线路可直接切换应用：",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+
+                sortedHosts.forEach { host ->
+                    val state = testStates[host] ?: UposTestState(host = host)
+                    val isCurrent = host.equals(currentTargetHost, ignoreCase = true)
+                    val displayName = io.github.jh_mmm.biliaccelerator.ui.dashboard.resolveUposDisplayName(
+                        targetHost = host,
+                        uposEntries = uposEntries,
+                        uposValues = uposValues
+                    )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable {
+                                onSelectTargetHost(host)
+                            }
+                            .padding(vertical = 8.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = displayName,
+                                    fontSize = 14.sp,
+                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                )
+                                if (isCurrent) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = "当前使用",
+                                        fontSize = 10.sp,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                                    )
+                                }
+                            }
+                            Text(
+                                text = host,
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f)
+                            )
+                        }
+
+                        Spacer(Modifier.width(8.dp))
+
+                        if (state.isTesting) {
+                            Text(
+                                text = "测试中…",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else if (state.latencyMs != null) {
+                            val latency = state.latencyMs
+                            val (badgeBg, badgeTextColor) = when {
+                                latency < 80L -> (if (dark) Color(0xFF143320) else Color(0xFFE8F8F0)) to Color(0xFF2ECC71)
+                                latency < 200L -> (if (dark) Color(0xFF112938) else Color(0xFFE3F2FD)) to Color(0xFF00AEEC)
+                                latency < 400L -> (if (dark) Color(0xFF382E11) else Color(0xFFFFF8E1)) to Color(0xFFF39C12)
+                                else -> (if (dark) Color(0xFF381818) else Color(0xFFFFEBEE)) to Color(0xFFE74C3C)
+                            }
+
+                            Text(
+                                text = "${latency} ms",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = badgeTextColor,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(badgeBg)
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        } else {
+                            Text(
+                                text = state.error ?: "超时",
+                                fontSize = 11.sp,
+                                color = Color(0xFFE74C3C),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(if (dark) Color(0xFF381818) else Color(0xFFFFEBEE))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { startSpeedTest() },
+                enabled = !isTestingAll
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Outlined.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text("重新测速")
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("关闭")
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+

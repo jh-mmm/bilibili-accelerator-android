@@ -22,6 +22,7 @@ val TagPcdn = Color(0xFFE53935)
 val TagMcdn = Color(0xFFFB8C00)
 val TagUpos = Color(0xFF43A047)
 val TagSched = Color(0xFF00AEEC)
+val TagMoss = Color(0xFF9C27B0)
 
 // Miuix / HyperOS Colors
 val MiuixLightBackground = Color(0xFFF4F5F7)
