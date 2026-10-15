@@ -21,7 +21,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
 import io.github.jh_mmm.biliaccelerator.core.StatsSnapshot
-import io.github.jh_mmm.biliaccelerator.hook.HookEntry
 import io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker
 import io.github.jh_mmm.biliaccelerator.provider.XposedServiceProvider
 import io.github.jh_mmm.biliaccelerator.ui.MainActivity
@@ -43,7 +42,6 @@ fun StatusDetailDialog(
     val isServiceBound = XposedServiceProvider.isServiceBound
     val isSelfInjected = MainActivity.isModuleActive() ||
             StatsManager.isFrameworkSelfInjected ||
-            HookEntry.isSelfHookInjected ||
             snapshot.isFrameworkActivated
 
     val lastHbDesc = if (snapshot.lastHeartbeatTimestamp > 0L) {

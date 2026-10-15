@@ -108,9 +108,7 @@ class MainActivity : ComponentActivity() {
 
     fun getActivationState(): ActivationState {
         val snapshot = StatsManager.getSnapshot()
-        val isSelfInjected = isModuleActive() ||
-                StatsManager.isFrameworkSelfInjected ||
-                io.github.jh_mmm.biliaccelerator.hook.HookEntry.isSelfHookInjected
+        val isSelfInjected = isModuleActive() || StatsManager.isFrameworkSelfInjected
 
         return calculateActivationState(
             totalRewrites = snapshot.totalRewrites,
@@ -126,7 +124,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         StatsManager.init(this)
-        if (isModuleActive() || StatsManager.isFrameworkSelfInjected || io.github.jh_mmm.biliaccelerator.hook.HookEntry.isSelfHookInjected) {
+        if (isModuleActive() || StatsManager.isFrameworkSelfInjected) {
             StatsManager.recordFrameworkActivated(this)
         }
         uiPreferencesStore = UiPreferencesStore(this)
