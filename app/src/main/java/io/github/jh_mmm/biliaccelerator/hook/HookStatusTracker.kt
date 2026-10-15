@@ -26,6 +26,7 @@ object HookStatusTracker {
         }
         sb.appendLine("Player Segment Builder: ${map["player_segment"] ?: "未挂载"}")
         sb.appendLine("Player Fallback: ${map["player_fallback"] ?: "未挂载"}")
+        sb.appendLine("Player OkHttp Pipeline: ${map["player_okhttp"] ?: "未挂载"}")
         sb.appendLine("Moss gRPC Helper: ${map["moss_grpc"] ?: "未挂载"}")
         return sb.toString().trimEnd()
     }

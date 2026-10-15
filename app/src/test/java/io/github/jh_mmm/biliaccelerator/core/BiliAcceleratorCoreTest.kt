@@ -151,6 +151,30 @@ class BiliAcceleratorCoreTest {
     }
 
     @Test
+    fun testAkamaiUposRewrittenInForceMode() {
+        val akamaiUrl = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/34567.m4s?sign=abc"
+        val forceConfig = defaultConfig.copy(forceUpos = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
+        val result = BiliAcceleratorCore.rewriteUrl(akamaiUrl, forceConfig)
+        assertTrue("Akamai UPOS stream should be rewritten to chosen UPOS in force mode", result.changed)
+        assertEquals("upos-sz-mirrorcos.bilivideo.com", result.targetHost)
+    }
+
+    @Test
+    fun testIsTargetPackageGeneralization() {
+        assertTrue(BiliAcceleratorCore.isTargetPackage("tv.danmaku.bili"))
+        assertTrue(BiliAcceleratorCore.isTargetPackage("com.bilibili.app.in"))
+        assertTrue(BiliAcceleratorCore.isTargetPackage("com.bstar.intl"))
+        assertTrue(BiliAcceleratorCore.isTargetPackage("com.bilibili.app.blue"))
+        assertTrue(BiliAcceleratorCore.isTargetPackage("tv.danmaku.bilibilihd"))
+        assertTrue(BiliAcceleratorCore.isTargetPackage("tv.danmaku.bilipr"))
+        assertTrue(BiliAcceleratorCore.isTargetPackage("com.bilibili.studio"))
+        assertTrue(BiliAcceleratorCore.isTargetPackage("com.bilibili.comic"))
+        assertTrue(BiliAcceleratorCore.isTargetPackage("tv.danmaku.bili.pad"))
+        assertTrue(BiliAcceleratorCore.isTargetPackage("com.bstar.intl.play"))
+        assertFalse(BiliAcceleratorCore.isTargetPackage("com.example.other"))
+    }
+
+    @Test
     fun testThirdPartyVideoAndAkamaiWithPortNotRewritten() {
         // 第三方广告或外部视频（包括非 B 站旗下的第三方 akamaized.net 节点）即使走非标端口，也绝不误判为 PCDN
         val externalAd = "http://ad-server.example.com:8080/commercial/intro.mp4"
@@ -305,6 +329,42 @@ class BiliAcceleratorCoreTest {
         assertEquals("upos-sz-mirrorali.bilivideo.com", verdict.winner)
         assertEquals("upos-sz-mirrorali.bilivideo.com", verdict.switchTo)
         RouteEngine.clearSessions()
+    }
+
+    @Test
+    fun testFilterLiveUrlInfoHtmlEscapingNotCorrupted() {
+        val jsonWithQueries = """
+            {
+              "url_info": [
+                { "host": "https://d1--cn-gotcha04.bilivideo.com", "extra": "?expires=12345&token=abc=def" },
+                { "host": "https://xy1x1x1x1xy.mcdn.bilivideo.cn:486", "extra": "?os=mcdn" }
+              ]
+            }
+        """.trimIndent()
+
+        val filtered = BiliAcceleratorCore.filterLiveUrlInfo(jsonWithQueries, defaultConfig)
+        assertTrue(filtered.changed)
+        assertTrue("Query string & must not be converted to \\u0026", filtered.json.contains("&token="))
+        assertTrue("Query string = must not be converted to \\u003d", filtered.json.contains("=def"))
+        assertFalse("Must not contain HTML escaped \\u0026", filtered.json.contains("\\u0026"))
+        assertFalse("Must not contain HTML escaped \\u003d", filtered.json.contains("\\u003d"))
+    }
+
+    @Test
+    fun testCleanHostProtocolRelative() {
+        assertEquals("upos-sz-mirrorali.bilivideo.com", BiliAcceleratorCore.cleanHost("//upos-sz-mirrorali.bilivideo.com/live/1.m4s"))
+        assertEquals("upos-sz-mirrorali.bilivideo.com", BiliAcceleratorCore.cleanHost("https://upos-sz-mirrorali.bilivideo.com/live/1.m4s"))
+        assertEquals("upos-sz-mirrorali.bilivideo.com", BiliAcceleratorCore.cleanHost("http://upos-sz-mirrorali.bilivideo.com/live/1.m4s"))
+    }
+
+    @Test
+    fun testIsIpAddressIPv6Validation() {
+        assertFalse("Incomplete IPv6 without :: must be false", BiliAcceleratorCore.isIpAddress("1:2:3:4"))
+        assertFalse("Incomplete IPv6 with 6 groups without :: must be false", BiliAcceleratorCore.isIpAddress("2001:db8:85a3:8a2e:370:7334"))
+        assertTrue("Compressed IPv6 with :: is valid", BiliAcceleratorCore.isIpAddress("2001:db8::1"))
+        assertTrue("Full 8-group IPv6 is valid", BiliAcceleratorCore.isIpAddress("2001:0db8:85a3:0000:0000:8a2e:0370:7334"))
+        assertTrue("IPv4 is valid", BiliAcceleratorCore.isIpAddress("192.168.1.1"))
+        assertFalse("Hostname is not IP", BiliAcceleratorCore.isIpAddress("upos-sz-mirrorcos.bilivideo.com"))
     }
 }
 

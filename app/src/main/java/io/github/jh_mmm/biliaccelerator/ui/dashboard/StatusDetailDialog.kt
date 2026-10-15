@@ -19,6 +19,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.app.Activity
+import android.os.Process
+import androidx.compose.ui.platform.LocalContext
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
 import io.github.jh_mmm.biliaccelerator.core.StatsSnapshot
 import io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker
@@ -36,6 +39,7 @@ fun StatusDetailDialog(
     snapshot: StatsSnapshot,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
     val hookReport = HookStatusTracker.formatReport(
         snapshot.hookStatus.ifEmpty { HookStatusTracker.getSnapshot() }
     )
@@ -44,11 +48,16 @@ fun StatusDetailDialog(
             StatsManager.isFrameworkSelfInjected ||
             snapshot.isFrameworkActivated
 
+    val now = System.currentTimeMillis()
+    val hasRecentHeartbeat = snapshot.lastHeartbeatTimestamp > 0L &&
+            (now - snapshot.lastHeartbeatTimestamp) in 0..MainActivity.DEFAULT_HEARTBEAT_THRESHOLD_MS
+
     val lastHbDesc = if (snapshot.lastHeartbeatTimestamp > 0L) {
-        LocalDateTime.ofInstant(
+        val formatted = LocalDateTime.ofInstant(
             Instant.ofEpochMilli(snapshot.lastHeartbeatTimestamp),
             ZoneId.systemDefault()
         ).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+        if (hasRecentHeartbeat) "$formatted (活跃)" else "$formatted (已超时离线)"
     } else {
         "暂无记录"
     }
@@ -72,7 +81,7 @@ fun StatusDetailDialog(
                 Text(
                     text = when (state) {
                         ActivationState.ACTIVE_EFFECTIVE -> "● 运行状态：已生效 (运行正常)"
-                        ActivationState.ACTIVE_HEARTBEAT -> "● 运行状态：已激活 (等待流量)"
+                        ActivationState.ACTIVE_HEARTBEAT -> "● 运行状态：等待拦截 (等待流量)"
                         ActivationState.INACTIVE -> "● 运行状态：未激活"
                     },
                     fontWeight = FontWeight.SemiBold,
@@ -89,12 +98,28 @@ fun StatusDetailDialog(
                     text = when (state) {
                         ActivationState.ACTIVE_EFFECTIVE ->
                             "已成功拦截并加速视频播放，累计完成 ${snapshot.totalRewrites} 次视频流重定向。"
-                        ActivationState.ACTIVE_HEARTBEAT ->
-                            if (isSelfInjected) "LSPosed 模块已激活并就绪，播放任意 B 站视频即可开始加速。"
-                            else if (isServiceBound) "LSPosed 框架服务已成功连接，播放任意 B 站视频即可开始加速。"
-                            else "目标应用（哔哩哔哩）已挂载并建立通信，播放视频即可开始加速。"
-                        ActivationState.INACTIVE ->
-                            "排查指引：\n1. 打开 LSPosed 管理器确认模块开关已开启\n2. 确认推荐作用域已勾选“哔哩哔哩”与模块自身\n3. 强行停止哔哩哔哩后重新打开测试。"
+                        ActivationState.ACTIVE_HEARTBEAT -> {
+                            val clientName = if (!snapshot.clientPackage.isNullOrEmpty()) {
+                                "${snapshot.clientPackage} (v${snapshot.clientVersion ?: "就绪"})"
+                            } else if (snapshot.hasTargetScope) {
+                                snapshot.frameworkScope.filter { io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isTargetPackage(it) }.joinToString(", ")
+                            } else {
+                                "哔哩哔哩客户端"
+                            }
+                            "监控目标：$clientName\n模块已就绪并处于等待拦截状态，播放任意视频即可开始加速。"
+                        }
+                        ActivationState.INACTIVE -> {
+                            if (isServiceBound && snapshot.hasQueriedScope && !snapshot.hasTargetScope) {
+                                val scopeListDesc = if (snapshot.frameworkScope.isEmpty()) {
+                                    "（当前未勾选任何应用）"
+                                } else {
+                                    "（当前已勾选: ${snapshot.frameworkScope.joinToString(", ")}）"
+                                }
+                                "模块已成功连接框架服务，但作用域未勾选哔哩哔哩。\n\n排查指引：\n1. 打开 LSPosed 管理器，进入本模块的作用域设置；\n2. 勾选“哔哩哔哩”（支持国内版、国际版、概念版等）；\n3. 启动哔哩哔哩播放任意视频即可开始加速。\n\n$scopeListDesc"
+                            } else {
+                                "未检测到活跃框架服务连接。\n\n排查指引：\n1. 打开 LSPosed 管理器，确认本模块开关已开启；\n2. 在模块作用域中勾选“哔哩哔哩”（无需勾选本模块自身）；\n3. 若刚在 LSPosed 中开启模块，请完全重启本应用（强制停止后重开，或点击下方“重启连接”按钮），以接收框架服务推送；\n4. 启动哔哩哔哩播放任意视频即可建立实时握手与加速重定向。"
+                            }
+                        }
                     },
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -116,11 +141,21 @@ fun StatusDetailDialog(
                 val frameworkDesc = when {
                     isSelfInjected -> "已挂载 (LSPosed 作用域生效)"
                     isServiceBound -> "已连接 (现代系统服务)"
-                    snapshot.lastHeartbeatTimestamp > 0L -> "已建立通信 (来自哔哩哔哩)"
+                    hasRecentHeartbeat && !snapshot.clientPackage.isNullOrEmpty() -> "已建立通信 (来自 ${snapshot.clientPackage})"
+                    snapshot.lastHeartbeatTimestamp > 0L -> "通信离线 (最近会话: $lastHbDesc)"
                     else -> "未连接"
                 }
+                val scopeDesc = if (snapshot.hasQueriedScope) {
+                    if (snapshot.frameworkScope.isEmpty()) {
+                        "未勾选任何应用"
+                    } else {
+                        snapshot.frameworkScope.joinToString(", ")
+                    }
+                } else {
+                    "未获取 (等待框架同步)"
+                }
                 Text(
-                    text = "框架运行状态: $frameworkDesc\n框架 Service 绑定: ${if (isServiceBound) "已连接" else "未连接"}\n最近心跳回执: $lastHbDesc",
+                    text = "框架运行状态: $frameworkDesc\n框架 Service 绑定: ${if (isServiceBound) "已连接" else "未连接"}\n已勾选作用域: $scopeDesc\n最近心跳回执: $lastHbDesc",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     lineHeight = 18.sp
@@ -151,6 +186,20 @@ fun StatusDetailDialog(
             TextButton(onClick = onDismiss) {
                 Text("确定")
             }
+        },
+        dismissButton = if (state == ActivationState.INACTIVE && !isServiceBound) {
+            {
+                TextButton(
+                    onClick = {
+                        (context as? Activity)?.finishAffinity()
+                        Process.killProcess(Process.myPid())
+                    }
+                ) {
+                    Text("重启应用连接框架")
+                }
+            }
+        } else {
+            null
         },
         shape = RoundedCornerShape(20.dp)
     )

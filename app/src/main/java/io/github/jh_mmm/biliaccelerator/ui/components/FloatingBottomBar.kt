@@ -32,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -131,14 +132,15 @@ private fun MiuixFloatingBottomBar(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
+                            val title = stringResource(dest.titleRes)
                             Icon(
                                 imageVector = if (selected) dest.selectedIcon else dest.unselectedIcon,
-                                contentDescription = dest.title,
+                                contentDescription = title,
                                 tint = contentColor,
                                 modifier = Modifier.size(20.dp)
                             )
                             Text(
-                                text = dest.title,
+                                text = title,
                                 color = contentColor,
                                 fontSize = 13.sp,
                                 fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
@@ -165,16 +167,17 @@ private fun Material3BottomBar(
     ) {
         destinations.forEach { dest ->
             val selected = dest == currentDestination
+            val title = stringResource(dest.titleRes)
             NavigationBarItem(
                 selected = selected,
                 onClick = { onNavigateToDestination(dest) },
                 icon = {
                     Icon(
                         imageVector = if (selected) dest.selectedIcon else dest.unselectedIcon,
-                        contentDescription = dest.title
+                        contentDescription = title
                     )
                 },
-                label = { Text(dest.title) },
+                label = { Text(title) },
                 colors = NavigationBarItemDefaults.colors(
                     indicatorColor = MaterialTheme.colorScheme.primaryContainer,
                     selectedIconColor = MaterialTheme.colorScheme.onPrimaryContainer,

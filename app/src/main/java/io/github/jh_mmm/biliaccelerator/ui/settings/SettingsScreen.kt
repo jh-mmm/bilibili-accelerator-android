@@ -46,12 +46,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.res.stringResource
+import io.github.jh_mmm.biliaccelerator.R
 import io.github.jh_mmm.biliaccelerator.ui.theme.isAcceleratorDarkTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.net.InetSocketAddress
 import java.net.Socket
 import androidx.compose.ui.Modifier
@@ -168,26 +171,26 @@ fun SettingsScreen(
     if (showConfirmClearDialog) {
         AlertDialog(
             onDismissRequest = { showConfirmClearDialog = false },
-            title = { Text("确认清空") },
-            text = { Text("确定要清空当前的拦截与重定向统计数据吗？此操作不可恢复。") },
+            title = { Text(stringResource(R.string.dialog_clear_title)) },
+            text = { Text(stringResource(R.string.dialog_clear_message)) },
             confirmButton = {
                 TextButton(onClick = {
                     onClearStats()
                     showConfirmClearDialog = false
                 }) {
-                    Text("清空", color = TagPcdn)
+                    Text(stringResource(R.string.dialog_confirm), color = TagPcdn)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showConfirmClearDialog = false }) {
-                    Text("取消")
+                    Text(stringResource(R.string.dialog_cancel))
                 }
             },
             shape = RoundedCornerShape(20.dp)
         )
     }
 
-    AcceleratorPage(title = "设置") { pagePadding, scrollBehavior ->
+    AcceleratorPage(title = stringResource(R.string.title_settings)) { pagePadding, scrollBehavior ->
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -203,13 +206,13 @@ fun SettingsScreen(
         ) {
             // Group 1: 核心路由与拦截策略
             item(key = "header-core") {
-                PreferenceGroupTitle("线路与加速策略")
+                PreferenceGroupTitle(stringResource(R.string.group_core_routing))
             }
             item(key = "card-core") {
                 PreferenceGroupCard {
                     PreferenceSwitchItem(
-                        title = "启用视频加速与防卡顿",
-                        summary = "控制全局 Hook 重定向与加速核心",
+                        title = stringResource(R.string.label_module_enabled),
+                        summary = stringResource(R.string.summary_module_enabled),
                         checked = config.enabled,
                         onCheckedChange = { onConfigChange(config.copy(enabled = it)) },
                         icon = Icons.Outlined.Route
@@ -224,7 +227,7 @@ fun SettingsScreen(
                     )
 
                     PreferenceDropdownItem(
-                        title = "首选 UPOS 镜像",
+                        title = stringResource(R.string.label_target_host),
                         summary = config.targetHost,
                         selectedValue = currentUposLabel,
                         onClick = { showUposDialog = true }
@@ -233,8 +236,8 @@ fun SettingsScreen(
                     PreferenceDivider()
 
                     PreferenceActionItem(
-                        title = "测试 UPOS 镜像速度",
-                        summary = "测试各镜像节点延迟并推荐最佳线路",
+                        title = stringResource(R.string.label_speed_test),
+                        summary = stringResource(R.string.summary_speed_test),
                         icon = Icons.Outlined.Speed,
                         onClick = { showSpeedTestDialog = true }
                     )
@@ -242,8 +245,8 @@ fun SettingsScreen(
                     PreferenceDivider()
 
                     PreferenceSwitchItem(
-                        title = "全局强制统一 UPOS 线路",
-                        summary = "忽略服务端下发调度，强行覆盖全部视频流",
+                        title = stringResource(R.string.label_force_upos),
+                        summary = stringResource(R.string.summary_force_upos),
                         checked = config.forceUpos,
                         onCheckedChange = { onConfigChange(config.copy(forceUpos = it)) },
                         enabled = config.enabled
@@ -253,13 +256,13 @@ fun SettingsScreen(
 
             // Group 2: PCDN 与网络过滤
             item(key = "header-network") {
-                PreferenceGroupTitle("防卡顿与 PCDN 过滤")
+                PreferenceGroupTitle(stringResource(R.string.group_pcdn_network))
             }
             item(key = "card-network") {
                 PreferenceGroupCard {
                     PreferenceSwitchItem(
-                        title = "拦截 PCDN 调度节点",
-                        summary = "阻断低质 P2P/CDN 调度，回退至官方高质量骨干网",
+                        title = stringResource(R.string.label_enable_pcdn_block),
+                        summary = stringResource(R.string.summary_enable_pcdn_block),
                         checked = config.blockPcdn,
                         onCheckedChange = { onConfigChange(config.copy(blockPcdn = it)) },
                         icon = Icons.Outlined.Security,
@@ -269,8 +272,8 @@ fun SettingsScreen(
                     PreferenceDivider()
 
                     PreferenceSwitchItem(
-                        title = "MCDN 官方代理中继",
-                        summary = "将边缘小运营商节点中继至官方高速 CDN 代理",
+                        title = stringResource(R.string.label_enable_mcdn_proxy),
+                        summary = stringResource(R.string.summary_enable_mcdn_proxy),
                         checked = config.proxyMcdn,
                         onCheckedChange = { onConfigChange(config.copy(proxyMcdn = it)) },
                         enabled = config.enabled
@@ -286,7 +289,7 @@ fun SettingsScreen(
                     }
 
                     PreferenceDropdownItem(
-                        title = "MCDN 中继代理节点",
+                        title = stringResource(R.string.label_proxy_host),
                         summary = "当前中继: ${config.proxyHost}",
                         selectedValue = currentProxyLabel,
                         onClick = { showProxyHostDialog = true },
@@ -296,8 +299,8 @@ fun SettingsScreen(
                     PreferenceDivider()
 
                     PreferenceSwitchItem(
-                        title = "端口特征启发式拦截",
-                        summary = "将非标准 HTTP/HTTPS 端口视为 PCDN 拦截",
+                        title = stringResource(R.string.label_port_heuristic),
+                        summary = stringResource(R.string.summary_port_heuristic),
                         checked = config.portHeuristic,
                         onCheckedChange = { onConfigChange(config.copy(portHeuristic = it)) },
                         enabled = config.enabled
@@ -306,8 +309,8 @@ fun SettingsScreen(
                     PreferenceDivider()
 
                     PreferenceSwitchItem(
-                        title = "实验性：Moss gRPC TF 标记注入",
-                        summary = "尝试在协议层注入 TF=1 请求官方镜像（默认关闭，仅在确认兼容时开启）",
+                        title = stringResource(R.string.label_enable_moss),
+                        summary = stringResource(R.string.summary_enable_moss),
                         checked = config.enableMossHook,
                         onCheckedChange = { onConfigChange(config.copy(enableMossHook = it)) },
                         enabled = config.enabled && config.blockPcdn
@@ -317,13 +320,13 @@ fun SettingsScreen(
 
             // Group 3: 数据统计与诊断
             item(key = "header-diag") {
-                PreferenceGroupTitle("数据与诊断")
+                PreferenceGroupTitle(stringResource(R.string.group_data_diag))
             }
             item(key = "card-diag") {
                 PreferenceGroupCard {
                     PreferenceActionItem(
-                        title = "复制诊断报告",
-                        summary = "一键导出系统环境、配置与 Hook 挂载报告",
+                        title = stringResource(R.string.btn_export_diag),
+                        summary = stringResource(R.string.summary_export_diag),
                         icon = Icons.Outlined.ContentCopy,
                         onClick = onExportDiagnostic
                     )
@@ -331,8 +334,8 @@ fun SettingsScreen(
                     PreferenceDivider()
 
                     PreferenceActionItem(
-                        title = "清空统计数据",
-                        summary = "重置总重定向、拦截及已规避节点记录",
+                        title = stringResource(R.string.btn_clear_stats),
+                        summary = stringResource(R.string.summary_clear_stats),
                         icon = Icons.Outlined.Delete,
                         tintColor = TagPcdn,
                         onClick = { showConfirmClearDialog = true }
@@ -342,13 +345,13 @@ fun SettingsScreen(
 
             // Group 4: 界面风格与外观
             item(key = "header-ui") {
-                PreferenceGroupTitle("界面与外观")
+                PreferenceGroupTitle(stringResource(R.string.group_ui_appearance))
             }
             item(key = "card-ui") {
                 PreferenceGroupCard {
                     PreferenceDropdownItem(
-                        title = "界面渲染风格",
-                        summary = "支持 MIUIX 与 Material 3 实时切换",
+                        title = stringResource(R.string.label_ui_style),
+                        summary = stringResource(R.string.summary_ui_style),
                         selectedValue = uiPreferences.style.label,
                         icon = Icons.Outlined.Palette,
                         onClick = { showStyleDialog = true }
@@ -357,8 +360,8 @@ fun SettingsScreen(
                     PreferenceDivider()
 
                     PreferenceDropdownItem(
-                        title = "主题外观模式",
-                        summary = "选择浅色、深色或随系统自动切换",
+                        title = stringResource(R.string.label_theme_mode),
+                        summary = stringResource(R.string.summary_theme_mode),
                         selectedValue = uiPreferences.themeMode.label,
                         onClick = { showThemeModeDialog = true }
                     )
@@ -564,12 +567,14 @@ private fun UposSpeedTestDialog(
                 uposValues.map { host ->
                     async {
                         val result = runCatching {
-                            val t0 = System.currentTimeMillis()
-                            Socket().use { socket ->
-                                socket.connect(InetSocketAddress(host, 443), 2500)
+                            withTimeout(3000L) {
+                                val t0 = System.currentTimeMillis()
+                                Socket().use { socket ->
+                                    socket.connect(InetSocketAddress(host, 443), 2500)
+                                }
+                                val cost = System.currentTimeMillis() - t0
+                                UposTestState(host = host, latencyMs = cost, isTesting = false)
                             }
-                            val cost = System.currentTimeMillis() - t0
-                            UposTestState(host = host, latencyMs = cost, isTesting = false)
                         }.getOrElse {
                             UposTestState(host = host, latencyMs = null, isTesting = false, error = "超时/失败")
                         }
@@ -590,7 +595,7 @@ private fun UposSpeedTestDialog(
     val dark = isAcceleratorDarkTheme()
 
     val sortedHosts = remember(testStates, isTestingAll) {
-        if (isTestingAll && testStates.values.all { it.isTesting }) {
+        if (isTestingAll) {
             uposValues
         } else {
             uposValues.sortedWith { a, b ->
@@ -609,7 +614,7 @@ private fun UposSpeedTestDialog(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text(text = "UPOS 镜像测速", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                Text(text = stringResource(R.string.speed_test_dialog_title), fontWeight = FontWeight.Bold, fontSize = 18.sp)
                 if (isTestingAll) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(18.dp),
@@ -626,7 +631,7 @@ private fun UposSpeedTestDialog(
                     .verticalScroll(rememberScrollState())
             ) {
                 Text(
-                    text = if (isTestingAll) "正在并发探测各节点连接时延 (TTFB)..." else "测速完成。点击任意镜像线路可直接切换应用：",
+                    text = if (isTestingAll) stringResource(R.string.speed_test_testing_desc) else stringResource(R.string.speed_test_done_desc),
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(bottom = 8.dp)
@@ -663,7 +668,7 @@ private fun UposSpeedTestDialog(
                                 if (isCurrent) {
                                     Spacer(Modifier.width(6.dp))
                                     Text(
-                                        text = "当前使用",
+                                        text = stringResource(R.string.speed_test_current),
                                         fontSize = 10.sp,
                                         color = MaterialTheme.colorScheme.primary,
                                         modifier = Modifier
@@ -684,7 +689,7 @@ private fun UposSpeedTestDialog(
 
                         if (state.isTesting) {
                             Text(
-                                text = "测试中…",
+                                text = stringResource(R.string.speed_test_testing),
                                 fontSize = 12.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -709,7 +714,7 @@ private fun UposSpeedTestDialog(
                             )
                         } else {
                             Text(
-                                text = state.error ?: "超时",
+                                text = state.error ?: stringResource(R.string.speed_test_timeout),
                                 fontSize = 11.sp,
                                 color = Color(0xFFE74C3C),
                                 modifier = Modifier
@@ -734,13 +739,13 @@ private fun UposSpeedTestDialog(
                         modifier = Modifier.size(16.dp)
                     )
                     Spacer(Modifier.width(4.dp))
-                    Text("重新测速")
+                    Text(stringResource(R.string.speed_test_retest))
                 }
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("关闭")
+                Text(stringResource(R.string.dialog_close))
             }
         },
         shape = RoundedCornerShape(20.dp)

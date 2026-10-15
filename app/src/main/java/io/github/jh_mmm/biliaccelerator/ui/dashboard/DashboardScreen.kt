@@ -40,15 +40,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.jh_mmm.biliaccelerator.R
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.RewriteLogEntry
 import io.github.jh_mmm.biliaccelerator.core.StatsSnapshot
+import io.github.jh_mmm.biliaccelerator.ui.MainActivity
 import io.github.jh_mmm.biliaccelerator.ui.MainActivity.ActivationState
 import io.github.jh_mmm.biliaccelerator.ui.components.AcceleratorPage
 import io.github.jh_mmm.biliaccelerator.ui.components.StatCard
@@ -122,7 +125,7 @@ fun DashboardScreen(
     }
 
     AcceleratorPage(
-        title = "看板",
+        title = stringResource(R.string.title_dashboard),
         actions = {
             IconButton(onClick = onRefresh) {
                 Icon(
@@ -174,7 +177,7 @@ fun DashboardScreen(
             // 4. Section Header for Logs
             item(key = "logs-header") {
                 SectionHeader(
-                    title = "最近拦截与重定向",
+                    title = stringResource(R.string.title_recent_logs),
                     count = snapshot.recentLogs.size
                 )
             }
@@ -223,14 +226,28 @@ private fun RuntimeStatusCard(
 
     val title = when (state) {
         ActivationState.ACTIVE_EFFECTIVE -> "运行正常"
-        ActivationState.ACTIVE_HEARTBEAT -> "等待流量"
+        ActivationState.ACTIVE_HEARTBEAT -> "等待拦截"
         ActivationState.INACTIVE -> "模块未激活"
     }
 
+    val now = System.currentTimeMillis()
+    val hasRecentHeartbeat = snapshot.lastHeartbeatTimestamp > 0L &&
+            (now - snapshot.lastHeartbeatTimestamp) in 0..MainActivity.DEFAULT_HEARTBEAT_THRESHOLD_MS
+
     val summary = when (state) {
         ActivationState.ACTIVE_EFFECTIVE -> "视频流原生加速与 PCDN 过滤已生效"
-        ActivationState.ACTIVE_HEARTBEAT -> "LSPosed 模块已激活 · 播放视频即可加速"
-        ActivationState.INACTIVE -> "未检测到框架激活或通信，点击查看排查指引"
+        ActivationState.ACTIVE_HEARTBEAT -> if (hasRecentHeartbeat && !snapshot.clientPackage.isNullOrEmpty()) {
+            "已连接 ${snapshot.clientPackage} · 播放视频即可加速"
+        } else if (!snapshot.clientPackage.isNullOrEmpty()) {
+            "已连接 ${snapshot.clientPackage} · 处于等待拦截状态"
+        } else {
+            "LSPosed 模块就绪 · 处于等待拦截状态"
+        }
+        ActivationState.INACTIVE -> if (snapshot.hasQueriedScope && !snapshot.hasTargetScope) {
+            "模块已连接 · 但作用域未勾选哔哩哔哩"
+        } else {
+            "未检测到框架激活或通信，点击查看排查指引"
+        }
     }
 
     Card(
@@ -290,9 +307,9 @@ private fun RuntimeStatusCard(
                     ) {
                         Text(
                             text = when (state) {
-                                ActivationState.ACTIVE_EFFECTIVE -> "已生效"
-                                ActivationState.ACTIVE_HEARTBEAT -> "待命中"
-                                ActivationState.INACTIVE -> "未激活"
+                                ActivationState.ACTIVE_EFFECTIVE -> stringResource(R.string.status_badge_in_effect)
+                                ActivationState.ACTIVE_HEARTBEAT -> stringResource(R.string.status_badge_active)
+                                ActivationState.INACTIVE -> stringResource(R.string.status_badge_inactive)
                             },
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,

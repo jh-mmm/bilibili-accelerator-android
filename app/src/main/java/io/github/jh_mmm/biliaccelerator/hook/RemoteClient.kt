@@ -100,8 +100,60 @@ object RemoteClient {
             }
         }
 
-        // 尽早触发一次异步配置拉取
+        // 尽早触发一次启动握手与异步配置拉取，并开启保活心跳
+        sendHandshakeAsync(app)
         fetchConfigAsync(app)
+        startPeriodicHeartbeat(app)
+    }
+
+    fun sendHandshakeAsync(context: Context) {
+        configExecutor.execute {
+            sendHandshakeDirect(context)
+        }
+    }
+
+    private fun sendHandshakeDirect(context: Context) {
+        try {
+            val pkgName = context.packageName
+            val pm = context.packageManager
+            val pInfo = runCatching { pm.getPackageInfo(pkgName, 0) }.getOrNull()
+            val verName = pInfo?.versionName ?: "unknown"
+            val procName = HookEntry.resolveCurrentProcessName() ?: pkgName
+
+            val extras = Bundle().apply {
+                putString(StatsProvider.EXTRA_CLIENT_PACKAGE, pkgName)
+                putString(StatsProvider.EXTRA_CLIENT_VERSION, verName)
+                putString(StatsProvider.EXTRA_CLIENT_PROCESS, procName)
+                putString(StatsProvider.EXTRA_HOOK_STATUS_JSON, gson.toJson(HookStatusTracker.getSnapshot()))
+            }
+            context.contentResolver.call(
+                StatsProvider.CONTENT_URI,
+                StatsProvider.METHOD_HANDSHAKE,
+                null,
+                extras
+            )
+            Log.i(TAG, "Successfully sent handshake to module provider from $pkgName (v$verName)")
+        } catch (t: Throwable) {
+            Log.d(TAG, "sendHandshakeDirect error: ${t.message}")
+        }
+    }
+
+    private val heartbeatStarted = AtomicBoolean(false)
+
+    private fun startPeriodicHeartbeat(context: Context) {
+        val procName = HookEntry.resolveCurrentProcessName()
+        // 仅在主进程中启动周期保活心跳，媒体子进程无需独立跑心跳定时器，彻底避免多进程频繁唤醒
+        val isMain = procName == null || procName == context.packageName || !procName.contains(':')
+        if (!isMain) return
+
+        if (!heartbeatStarted.compareAndSet(false, true)) return
+        reportScheduler.scheduleWithFixedDelay({
+            try {
+                sendHandshakeDirect(context)
+            } catch (t: Throwable) {
+                Log.d(TAG, "Periodic heartbeat exception: ${t.message}")
+            }
+        }, 5L, 5L, TimeUnit.MINUTES)
     }
 
     fun getContext(): Context? {
@@ -154,8 +206,15 @@ object RemoteClient {
 
     private fun fetchConfigDirect(context: Context): AcceleratorConfig? {
         return try {
+            val pkgName = context.packageName
+            val pInfo = runCatching { context.packageManager.getPackageInfo(pkgName, 0) }.getOrNull()
+            val verName = pInfo?.versionName ?: "unknown"
+            val procName = HookEntry.resolveCurrentProcessName() ?: pkgName
             val extras = Bundle().apply {
                 putString(StatsProvider.EXTRA_HOOK_STATUS_JSON, gson.toJson(HookStatusTracker.getSnapshot()))
+                putString(StatsProvider.EXTRA_CLIENT_PACKAGE, pkgName)
+                putString(StatsProvider.EXTRA_CLIENT_VERSION, verName)
+                putString(StatsProvider.EXTRA_CLIENT_PROCESS, procName)
             }
             val response = context.contentResolver.call(
                 StatsProvider.CONTENT_URI,

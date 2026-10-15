@@ -12,6 +12,11 @@
         <package android:name="tv.danmaku.bilipr" />
         <package android:name="tv.danmaku.bilibilihd" />
         <package android:name="com.bilibili.app.blue" />
+        <package android:name="com.bilibili.studio" />
+        <package android:name="com.bilibili.comic" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+        </intent>
     </queries>
 
     <application
@@ -33,15 +38,6 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-
-            <!-- Package Visibility Anchors: Allows Bilibili to discover and query this package on Android 11+ via queryIntentActivities. MainActivity does not read or process intent data. -->
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="biliaccelerator.jh-mmm.github.io" />
-                <data android:scheme="http" android:host="biliaccelerator.jh-mmm.github.io" />
             </intent-filter>
         </activity>
 

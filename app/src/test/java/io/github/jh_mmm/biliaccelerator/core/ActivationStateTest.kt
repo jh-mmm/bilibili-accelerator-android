@@ -1,5 +1,6 @@
 package io.github.jh_mmm.biliaccelerator.core
 
+import android.os.IBinder
 import com.google.gson.Gson
 import io.github.jh_mmm.biliaccelerator.hook.RemoteClient
 import io.github.jh_mmm.biliaccelerator.provider.RewriteResultDto
@@ -69,7 +70,6 @@ class ActivationStateTest {
             isServiceBound = false,
             lastHeartbeat = 0L,
             isSelfInjected = false,
-            hasHistoricalActivation = false,
             now = now
         )
         assertEquals("Clean installation without framework credentials must be INACTIVE", ActivationState.INACTIVE, stateClean)
@@ -84,7 +84,6 @@ class ActivationStateTest {
             isServiceBound = false,
             lastHeartbeat = 0L,
             isSelfInjected = true,
-            hasHistoricalActivation = false,
             now = now
         )
         assertEquals(
@@ -95,40 +94,114 @@ class ActivationStateTest {
     }
 
     @Test
-    fun testCalculateActivationStateHistoricalRewritesMaintainsEffective() {
+    fun testCalculateActivationStateLsposedScopeBoundWaitingForTraffic() {
         val now = 1_760_000_000_000L
-        // 历史已有重写记录：即使心跳已过期且未常驻绑定服务 -> 依然保持 ACTIVE_EFFECTIVE，不可降级为 INACTIVE
-        val expiredHeartbeat = now - MainActivity.DEFAULT_HEARTBEAT_THRESHOLD_MS - 1_000L
-        val stateWhenHeartbeatExpired = MainActivity.calculateActivationState(
-            totalRewrites = 100L,
-            isServiceBound = false,
-            lastHeartbeat = expiredHeartbeat,
-            now = now
-        )
-        assertEquals("Historical rewrites must maintain ACTIVE_EFFECTIVE", ActivationState.ACTIVE_EFFECTIVE, stateWhenHeartbeatExpired)
 
-        // 即使心跳为 0 但有重写记录 -> 依然保持 ACTIVE_EFFECTIVE
-        val stateWithRewritesNoHb = MainActivity.calculateActivationState(
-            totalRewrites = 10L,
-            isServiceBound = false,
+        // 勾选即等待拦截：LSPosed 中启用模块后，服务实时在线绑定且作用域包含目标应用 (isServiceBound = true, hasFrameworkScope = true)，
+        // 在未产生视频重写时必须判定为“等待拦截” (ACTIVE_HEARTBEAT)
+        val stateWaitingForTraffic = MainActivity.calculateActivationState(
+            totalRewrites = 0L,
+            isServiceBound = true,
             lastHeartbeat = 0L,
+            isSelfInjected = false,
+            hasFrameworkScope = true,
             now = now
         )
-        assertEquals("Rewrites without heartbeat must be ACTIVE_EFFECTIVE", ActivationState.ACTIVE_EFFECTIVE, stateWithRewritesNoHb)
+        assertEquals(
+            "LSPosed enabled with service bound and target scope must be ACTIVE_HEARTBEAT (等待拦截)",
+            ActivationState.ACTIVE_HEARTBEAT,
+            stateWaitingForTraffic
+        )
+
+        // 产生视频重定向后，状态流转为已生效 (ACTIVE_EFFECTIVE)
+        val stateEffective = MainActivity.calculateActivationState(
+            totalRewrites = 10L,
+            isServiceBound = true,
+            lastHeartbeat = 0L,
+            isSelfInjected = false,
+            hasFrameworkScope = true,
+            now = now
+        )
+        assertEquals(
+            "Service bound with rewrites must be ACTIVE_EFFECTIVE (已生效)",
+            ActivationState.ACTIVE_EFFECTIVE,
+            stateEffective
+        )
+
+        // 若服务在线但作用域未勾选目标应用 (hasFrameworkScope = false)，无其他凭据时必须回落至未激活 (INACTIVE)
+        val stateWithoutTargetScope = MainActivity.calculateActivationState(
+            totalRewrites = 0L,
+            isServiceBound = true,
+            lastHeartbeat = 0L,
+            isSelfInjected = false,
+            hasFrameworkScope = false,
+            now = now
+        )
+        assertEquals(
+            "Service bound without target scope must be INACTIVE (未激活)",
+            ActivationState.INACTIVE,
+            stateWithoutTargetScope
+        )
     }
 
     @Test
-    fun testCalculateActivationStateHistoricalHeartbeatMaintainsActivated() {
+    fun testCalculateActivationStateModuleDisabledInLsposedBecomesInactiveWithoutHistoricalPersistence() {
         val now = 1_760_000_000_000L
-        // 曾与目标应用建立通信握手：即使心跳过期且尚未重写 -> 保持已激活待命中 (ACTIVE_HEARTBEAT)
         val expiredHeartbeat = now - MainActivity.DEFAULT_HEARTBEAT_THRESHOLD_MS - 1_000L
-        val state = MainActivity.calculateActivationState(
+
+        // 关闭即未激活：在 LSPosed 中禁用模块后，服务断开 (isServiceBound = false)，
+        // 即使本地曾有历史重定向记录，也不得误判为已激活，必须立即判定为未激活 (INACTIVE)
+        val stateDisabledWithHistory = MainActivity.calculateActivationState(
+            totalRewrites = 10L,
+            isServiceBound = false,
+            lastHeartbeat = expiredHeartbeat,
+            isSelfInjected = false,
+            now = now
+        )
+        assertEquals(
+            "Disabled module must show INACTIVE even if historical rewrites exist",
+            ActivationState.INACTIVE,
+            stateDisabledWithHistory
+        )
+
+        val stateDisabledWithoutRewrites = MainActivity.calculateActivationState(
             totalRewrites = 0L,
             isServiceBound = false,
             lastHeartbeat = expiredHeartbeat,
+            isSelfInjected = false,
             now = now
         )
-        assertEquals("Historical heartbeat must maintain ACTIVE_HEARTBEAT", ActivationState.ACTIVE_HEARTBEAT, state)
+        assertEquals(
+            "Disabled module must show INACTIVE regardless of historical state",
+            ActivationState.INACTIVE,
+            stateDisabledWithoutRewrites
+        )
+    }
+
+    @Test
+    fun testCalculateActivationStateLiveWithRewritesMaintainsEffective() {
+        val now = 1_760_000_000_000L
+        val recentHeartbeat = now - 60_000L // 1 分钟前
+
+        // 宿主在近期心跳窗口内活跃且有重定向 -> ACTIVE_EFFECTIVE
+        val stateRecentHb = MainActivity.calculateActivationState(
+            totalRewrites = 20L,
+            isServiceBound = false,
+            lastHeartbeat = recentHeartbeat,
+            isSelfInjected = false,
+            now = now
+        )
+        assertEquals("Recent heartbeat with rewrites must be ACTIVE_EFFECTIVE", ActivationState.ACTIVE_EFFECTIVE, stateRecentHb)
+
+        // 模块自身被框架注入且有历史重定向 -> ACTIVE_EFFECTIVE
+        val stateSelfInjectedWithRewrites = MainActivity.calculateActivationState(
+            totalRewrites = 20L,
+            isServiceBound = false,
+            lastHeartbeat = 0L,
+            isSelfInjected = true,
+            now = now
+        )
+        assertEquals("Self-injected module with rewrites must be ACTIVE_EFFECTIVE", ActivationState.ACTIVE_EFFECTIVE, stateSelfInjectedWithRewrites)
     }
 
     @Test
@@ -163,7 +236,120 @@ class ActivationStateTest {
 
     @Test
     fun testFrameworkServiceBindingDefaultState() {
+        XposedServiceProvider.resetForTesting()
         assertFalse("Initial framework service binding state must be false", XposedServiceProvider.isServiceBound)
+    }
+
+    @Test
+    fun testXposedServiceProviderCallerAuthorization() {
+        // 关键改动：放行 root (uid = 0，LSPosed 守护进程/系统服务)
+        assertTrue("Root caller (uid=0) must be authorized", XposedServiceProvider.isCallerAuthorized(null, 0))
+
+        // 放行 system_server (uid = 1000)
+        assertTrue("System caller (uid=1000) must be authorized", XposedServiceProvider.isCallerAuthorized(null, 1000))
+
+        // 拒绝任意未授权第三方普通应用 UID
+        assertFalse("Unauthorized uid must be rejected", XposedServiceProvider.isCallerAuthorized(null, 99999))
+    }
+
+    @Test
+    fun testXposedServiceProviderBinderVerificationAndLifecycle() {
+        XposedServiceProvider.resetForTesting()
+        assertFalse("Initially unbound", XposedServiceProvider.isServiceBound)
+
+        val validBinder = java.lang.reflect.Proxy.newProxyInstance(
+            IBinder::class.java.classLoader,
+            arrayOf(IBinder::class.java)
+        ) { _, method, _ ->
+            when (method.name) {
+                "getInterfaceDescriptor" -> XposedServiceProvider.DESCRIPTOR
+                "isBinderAlive" -> true
+                "pingBinder" -> true
+                else -> null
+            }
+        } as IBinder
+
+        val invalidBinder = java.lang.reflect.Proxy.newProxyInstance(
+            IBinder::class.java.classLoader,
+            arrayOf(IBinder::class.java)
+        ) { _, method, _ ->
+            when (method.name) {
+                "getInterfaceDescriptor" -> "com.invalid.service.Fake"
+                "isBinderAlive" -> true
+                "pingBinder" -> true
+                else -> null
+            }
+        } as IBinder
+
+        val deadBinder = java.lang.reflect.Proxy.newProxyInstance(
+            IBinder::class.java.classLoader,
+            arrayOf(IBinder::class.java)
+        ) { _, method, _ ->
+            when (method.name) {
+                "getInterfaceDescriptor" -> XposedServiceProvider.DESCRIPTOR
+                "isBinderAlive" -> false
+                "pingBinder" -> false
+                else -> null
+            }
+        } as IBinder
+
+        // 校验合法的 IXposedService Binder (descriptor == io.github.libxposed.service.IXposedService)
+        assertTrue("Valid IXposedService binder must pass verification", XposedServiceProvider.verifyLibXposedBinder(validBinder))
+
+        // 拒绝非法 descriptor
+        assertFalse("Invalid descriptor binder must be rejected", XposedServiceProvider.verifyLibXposedBinder(invalidBinder))
+
+        // 拒绝死亡 binder
+        assertFalse("Dead binder must be rejected", XposedServiceProvider.verifyLibXposedBinder(deadBinder))
+
+        // 测试绑定状态流转：设置存活 binder 后 isServiceBound 为 true，并同步作用域
+        XposedServiceProvider.setServiceBoundForTesting(true, validBinder, listOf("tv.danmaku.bili"))
+        assertTrue("Service bound state must be true", XposedServiceProvider.isServiceBound)
+        val snapshotWithScope = StatsManager.getSnapshot()
+        assertTrue("Scope must be marked queried", snapshotWithScope.hasQueriedScope)
+        assertTrue("Scope must detect target package", snapshotWithScope.hasTargetScope)
+        assertEquals(listOf("tv.danmaku.bili"), snapshotWithScope.frameworkScope)
+
+        // 测试 Binder 死亡回调：重置 isServiceBound 并清空作用域
+        XposedServiceProvider.triggerBinderDiedForTesting()
+        assertFalse("Service bound state must be false after binder died", XposedServiceProvider.isServiceBound)
+        val snapshotAfterDeath = StatsManager.getSnapshot()
+        assertFalse("Scope queried flag must be false after binder died", snapshotAfterDeath.hasQueriedScope)
+        assertFalse("Target scope flag must be false after binder died", snapshotAfterDeath.hasTargetScope)
+        assertTrue("Scope list must be empty after binder died", snapshotAfterDeath.frameworkScope.isEmpty())
+
+        // 重置/解绑后置回 false
+        XposedServiceProvider.resetForTesting()
+        assertFalse("Service bound state must be false after reset", XposedServiceProvider.isServiceBound)
+    }
+
+    @Test
+    fun testStatsManagerFrameworkScopeManagement() {
+        StatsManager.clearFrameworkScope()
+        var snapshot = StatsManager.getSnapshot()
+        assertFalse(snapshot.hasQueriedScope)
+        assertFalse(snapshot.hasTargetScope)
+        assertTrue(snapshot.frameworkScope.isEmpty())
+
+        // 记录包含 B 站的作用域列表
+        StatsManager.recordFrameworkScope(listOf("com.other.app", "tv.danmaku.bili"))
+        snapshot = StatsManager.getSnapshot()
+        assertTrue(snapshot.hasQueriedScope)
+        assertTrue("Must detect tv.danmaku.bili as target package", snapshot.hasTargetScope)
+        assertEquals(listOf("com.other.app", "tv.danmaku.bili"), snapshot.frameworkScope)
+
+        // 记录不包含 B 站的作用域列表
+        StatsManager.recordFrameworkScope(listOf("com.other.app"))
+        snapshot = StatsManager.getSnapshot()
+        assertTrue(snapshot.hasQueriedScope)
+        assertFalse("com.other.app is not a target package", snapshot.hasTargetScope)
+
+        // 清空作用域
+        StatsManager.clearFrameworkScope()
+        snapshot = StatsManager.getSnapshot()
+        assertFalse(snapshot.hasQueriedScope)
+        assertFalse(snapshot.hasTargetScope)
+        assertTrue(snapshot.frameworkScope.isEmpty())
     }
 
     @Test

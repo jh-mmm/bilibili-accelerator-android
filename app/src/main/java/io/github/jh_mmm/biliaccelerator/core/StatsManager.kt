@@ -12,7 +12,6 @@ import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -40,7 +39,13 @@ data class StatsSnapshot(
     val installedAt: String = "",
     val lastHeartbeatTimestamp: Long = 0L,
     val hookStatus: Map<String, String> = emptyMap(),
-    val isFrameworkActivated: Boolean = false
+    val isFrameworkActivated: Boolean = false,
+    val clientPackage: String? = null,
+    val clientVersion: String? = null,
+    val clientProcess: String? = null,
+    val frameworkScope: List<String> = emptyList(),
+    val hasTargetScope: Boolean = false,
+    val hasQueriedScope: Boolean = false
 )
 
 object StatsManager {
@@ -56,6 +61,9 @@ object StatsManager {
     private const val KEY_LAST_HEARTBEAT = "stat_last_heartbeat"
     private const val KEY_HOOK_STATUS = "stat_hook_status"
     private const val KEY_FRAMEWORK_ACTIVATED = "stat_framework_activated"
+    private const val KEY_CLIENT_PACKAGE = "stat_client_package"
+    private const val KEY_CLIENT_VERSION = "stat_client_version"
+    private const val KEY_CLIENT_PROCESS = "stat_client_process"
 
     private const val TAG = "BiliAccelerator-Stats"
     private const val MAX_LOGS = 100
@@ -71,9 +79,11 @@ object StatsManager {
     private val mcdnProxied = AtomicLong(0)
     private val lastHeartbeat = AtomicLong(0L)
     private val frameworkInjected = AtomicBoolean(false)
-    private val everActivated = AtomicBoolean(false)
+    private val frameworkScope = java.util.concurrent.CopyOnWriteArrayList<String>()
+    private val hasQueriedScopeFlag = AtomicBoolean(false)
     private val avoidedHosts = ConcurrentHashMap.newKeySet<String>()
-    private val recentLogs = CopyOnWriteArrayList<RewriteLogEntry>()
+    private val recentLogs = ArrayList<RewriteLogEntry>()
+    private val logsLock = Any()
     private val hookStatus = ConcurrentHashMap<String, String>()
     private val recentCrossProcessSegments = object : LinkedHashMap<String, Long>(CROSS_PROCESS_DEDUP_MAX, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean {
@@ -81,6 +91,12 @@ object StatsManager {
         }
     }
     private var installedAt = ""
+    @Volatile
+    private var connectedClientPackage: String? = null
+    @Volatile
+    private var connectedClientVersion: String? = null
+    @Volatile
+    private var connectedClientProcess: String? = null
 
     private val logTimeFormatter = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss", Locale.getDefault())
     private val installTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
@@ -111,7 +127,13 @@ object StatsManager {
             pcdnBlocked.set(sp.getLong(KEY_PCDN_BLOCKED, 0))
             mcdnProxied.set(sp.getLong(KEY_MCDN_PROXIED, 0))
             lastHeartbeat.set(sp.getLong(KEY_LAST_HEARTBEAT, 0L))
-            everActivated.set(sp.getBoolean(KEY_FRAMEWORK_ACTIVATED, false))
+            // 清理旧版本遗留的历史激活持久化，杜绝在 LSPosed 中禁用模块后出现假阳性未激活回落失败
+            if (sp.contains(KEY_FRAMEWORK_ACTIVATED)) {
+                sp.edit().remove(KEY_FRAMEWORK_ACTIVATED).apply()
+            }
+            connectedClientPackage = sp.getString(KEY_CLIENT_PACKAGE, null)
+            connectedClientVersion = sp.getString(KEY_CLIENT_VERSION, null)
+            connectedClientProcess = sp.getString(KEY_CLIENT_PROCESS, null)
 
             installedAt = sp.getString(KEY_INSTALLED_AT, null) ?: run {
                 val now = LocalDateTime.now().format(installTimeFormatter)
@@ -132,8 +154,10 @@ object StatsManager {
             if (!logsJson.isNullOrEmpty()) {
                 try {
                     val list: List<RewriteLogEntry> = gson.fromJson(logsJson, object : TypeToken<List<RewriteLogEntry>>() {}.type)
-                    recentLogs.clear()
-                    recentLogs.addAll(sanitizeLogEntries(list).take(MAX_LOGS))
+                    synchronized(logsLock) {
+                        recentLogs.clear()
+                        recentLogs.addAll(sanitizeLogEntries(list).take(MAX_LOGS))
+                    }
                 } catch (_: Exception) {}
             }
 
@@ -170,34 +194,35 @@ object StatsManager {
     @JvmStatic
     fun markFrameworkSelfInjected() {
         frameworkInjected.set(true)
-        everActivated.set(true)
     }
 
     val isFrameworkSelfInjected: Boolean
         get() = frameworkInjected.get()
 
-    fun hasHistoricalActivation(context: Context? = null): Boolean {
-        if (context != null) {
-            ensureInitialized(context)
-        }
-        return everActivated.get()
+
+    fun recordFrameworkScope(scope: List<String>) {
+        frameworkScope.clear()
+        frameworkScope.addAll(scope)
+        hasQueriedScopeFlag.set(true)
     }
 
-    fun recordFrameworkActivated(context: Context? = null) {
-        if (context != null) {
-            ensureInitialized(context)
-        }
-        everActivated.set(true)
-        context?.let { scheduleDebouncedSave(it) }
+    fun clearFrameworkScope() {
+        frameworkScope.clear()
+        hasQueriedScopeFlag.set(false)
     }
+
+    val frameworkScopeList: List<String>
+        get() = frameworkScope.toList()
+
+    val isScopeQueried: Boolean
+        get() = hasQueriedScopeFlag.get()
 
     fun recordHeartbeat(context: Context? = null) {
         if (context != null) {
             ensureInitialized(context)
         }
         lastHeartbeat.set(System.currentTimeMillis())
-        everActivated.set(true)
-        context?.let { scheduleDebouncedSave(it) }
+        context?.let { saveHeartbeatToPrefs(it) }
     }
 
     internal fun mergeHookStatusEntry(existing: String?, incoming: String): String {
@@ -245,6 +270,36 @@ object StatsManager {
     }
 
     fun getLastHeartbeat(): Long = lastHeartbeat.get()
+
+    private fun saveHeartbeatToPrefs(context: Context) {
+        try {
+            val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            sp.edit()
+                .putLong(KEY_LAST_HEARTBEAT, lastHeartbeat.get())
+                .putString(KEY_CLIENT_PACKAGE, connectedClientPackage)
+                .putString(KEY_CLIENT_VERSION, connectedClientVersion)
+                .putString(KEY_CLIENT_PROCESS, connectedClientProcess)
+                .apply()
+        } catch (_: Exception) {}
+    }
+
+    fun recordHandshake(pkg: String?, version: String?, process: String?, context: Context? = null) {
+        if (context != null) {
+            ensureInitialized(context)
+        }
+        val now = System.currentTimeMillis()
+        lastHeartbeat.set(now)
+        if (!pkg.isNullOrBlank()) {
+            connectedClientPackage = pkg.trim().take(128)
+        }
+        if (!version.isNullOrBlank()) {
+            connectedClientVersion = version.trim().take(64)
+        }
+        if (!process.isNullOrBlank()) {
+            connectedClientProcess = process.trim().take(128)
+        }
+        context?.let { saveHeartbeatToPrefs(it) }
+    }
 
     fun recordRequests(results: List<RewriteResult>, context: Context? = null) {
         if (results.isEmpty()) return
@@ -301,9 +356,11 @@ object StatsManager {
                 isMcdn = result.isMcdn
             )
 
-            recentLogs.add(0, entry)
-            while (recentLogs.size > MAX_LOGS) {
-                recentLogs.removeAt(recentLogs.lastIndex)
+            synchronized(logsLock) {
+                recentLogs.add(0, entry)
+                while (recentLogs.size > MAX_LOGS) {
+                    recentLogs.removeAt(recentLogs.lastIndex)
+                }
             }
         }
     }
@@ -322,16 +379,20 @@ object StatsManager {
         synchronized(statsLock) {
             try {
                 val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val logsCopy = synchronized(logsLock) { recentLogs.toList() }
                 sp.edit()
                     .putLong(KEY_TOTAL_REQUESTS, totalRequests.get())
                     .putLong(KEY_TOTAL_REWRITES, totalRewrites.get())
                     .putLong(KEY_PCDN_BLOCKED, pcdnBlocked.get())
                     .putLong(KEY_MCDN_PROXIED, mcdnProxied.get())
                     .putLong(KEY_LAST_HEARTBEAT, lastHeartbeat.get())
-                    .putBoolean(KEY_FRAMEWORK_ACTIVATED, everActivated.get())
+                    .remove(KEY_FRAMEWORK_ACTIVATED)
                     .putString(KEY_AVOIDED_HOSTS, gson.toJson(avoidedHosts.toList()))
-                    .putString(KEY_RECENT_LOGS, gson.toJson(recentLogs.toList()))
+                    .putString(KEY_RECENT_LOGS, gson.toJson(logsCopy))
                     .putString(KEY_HOOK_STATUS, gson.toJson(hookStatus))
+                    .putString(KEY_CLIENT_PACKAGE, connectedClientPackage)
+                    .putString(KEY_CLIENT_VERSION, connectedClientVersion)
+                    .putString(KEY_CLIENT_PROCESS, connectedClientProcess)
                     .apply()
             } catch (_: Exception) {}
         }
@@ -350,7 +411,9 @@ object StatsManager {
             mcdnProxied.set(0)
             // 注意：不重置 lastHeartbeat 与 hookStatus，避免指标清零连带将模块健康与激活状态误打回“未激活”
             avoidedHosts.clear()
-            recentLogs.clear()
+            synchronized(logsLock) {
+                recentLogs.clear()
+            }
             synchronized(recentCrossProcessSegments) {
                 recentCrossProcessSegments.clear()
             }
@@ -369,17 +432,25 @@ object StatsManager {
     }
 
     fun getSnapshot(): StatsSnapshot {
+        val scopeList = frameworkScope.toList()
+        val hasTarget = scopeList.any { BiliAcceleratorCore.isTargetPackage(it) }
         return StatsSnapshot(
             totalRequests = totalRequests.get(),
             totalRewrites = totalRewrites.get(),
             pcdnBlocked = pcdnBlocked.get(),
             mcdnProxied = mcdnProxied.get(),
             avoidedHosts = avoidedHosts.toList().sorted(),
-            recentLogs = recentLogs.toList(),
+            recentLogs = synchronized(logsLock) { recentLogs.toList() },
             installedAt = installedAt,
             lastHeartbeatTimestamp = lastHeartbeat.get(),
             hookStatus = HashMap(hookStatus),
-            isFrameworkActivated = everActivated.get() || frameworkInjected.get()
+            isFrameworkActivated = frameworkInjected.get(),
+            clientPackage = connectedClientPackage,
+            clientVersion = connectedClientVersion,
+            clientProcess = connectedClientProcess,
+            frameworkScope = scopeList,
+            hasTargetScope = hasTarget,
+            hasQueriedScope = hasQueriedScopeFlag.get()
         )
     }
 
@@ -400,6 +471,13 @@ object StatsManager {
             "无心跳记录"
         }
         sb.appendLine("最近活跃心跳: $lastHbDesc")
+        if (snapshot.hasQueriedScope) {
+            sb.appendLine("LSPosed 模块作用域: ${if (snapshot.frameworkScope.isEmpty()) "未勾选任何应用" else snapshot.frameworkScope.joinToString(", ")}")
+        }
+        if (!snapshot.clientPackage.isNullOrEmpty()) {
+            sb.appendLine("已连接宿主应用: ${snapshot.clientPackage} (v${snapshot.clientVersion ?: "unknown"})")
+            sb.appendLine("宿主活动进程: ${snapshot.clientProcess ?: "unknown"}")
+        }
         sb.appendLine("-----------------------------------------")
         sb.appendLine("【当前配置】")
         sb.appendLine("加速开关: ${if (config.enabled) "已启用" else "已关闭"}")

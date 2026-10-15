@@ -5,6 +5,7 @@ import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
@@ -57,7 +58,7 @@ object RouteEngine {
     const val UNKNOWN_HOST_MBPS: Double = 10.0
     private const val MAX_SESSIONS: Int = 16
 
-    val AUDIO_ID_RE = Regex("^30(2\\d\\d|25\\d)$")
+    val AUDIO_ID_RE = Regex("^302\\d\\d$")
     private val FILE_EXT_RE = Regex("\\.(m4s|mp4|flv)$", RegexOption.IGNORE_CASE)
     private val CID_PREFIX_RE = Regex("^(\\d+)")
     private val REP_ID_RE = Regex("-(\\d+)\\.(?:m4s|mp4|flv)$", RegexOption.IGNORE_CASE)
@@ -86,8 +87,8 @@ object RouteEngine {
         val kind: String = "video",
         val bandwidth: Long = 0L,
         val codecs: String = "",
-        val urls: MutableMap<String, String> = LinkedHashMap(),
-        val issued: MutableList<String> = mutableListOf()
+        val urls: MutableMap<String, String> = ConcurrentHashMap(),
+        val issued: MutableList<String> = CopyOnWriteArrayList()
     )
 
     data class SessionTable(
@@ -385,16 +386,14 @@ object RouteEngine {
     }
 
     fun sessionFor(cid: String): SessionState {
-        sessions[cid]?.let { return it }
-        val created = SessionState(cid = cid)
-        sessions[cid] = created
+        val session = sessions.computeIfAbsent(cid) { SessionState(cid = cid) }
         if (sessions.size > MAX_SESSIONS) {
             val oldest = sessions.keys.firstOrNull { it != currentSessionCid && it != cid }
             if (oldest != null) {
                 sessions.remove(oldest)
             }
         }
-        return created
+        return session
     }
 
     fun getSession(cid: String): SessionState? = sessions[cid]

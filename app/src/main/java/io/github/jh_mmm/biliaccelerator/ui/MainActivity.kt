@@ -14,6 +14,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.annotation.Keep
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.jh_mmm.biliaccelerator.BuildConfig
 import io.github.jh_mmm.biliaccelerator.R
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.RewriteLogEntry
@@ -73,28 +74,21 @@ class MainActivity : ComponentActivity() {
             isServiceBound: Boolean,
             lastHeartbeat: Long,
             isSelfInjected: Boolean = false,
-            hasHistoricalActivation: Boolean = false,
+            hasFrameworkScope: Boolean = true,
             now: Long = System.currentTimeMillis(),
             heartbeatThresholdMs: Long = DEFAULT_HEARTBEAT_THRESHOLD_MS
         ): ActivationState {
             val diff = now - lastHeartbeat
             val hasRecentHeartbeat = lastHeartbeat > 0L && diff in 0..heartbeatThresholdMs
 
-            // 只要满足任一激活凭据，模块即处于激活状态：
-            // 1. 模块自身被框架注入 (isSelfInjected: LSPosed 开启开关并勾选作用域)
-            // 2. 现代 LibXposed 框架服务已绑定 (isServiceBound)
-            // 3. 目标应用近期有活跃心跳通信 (hasRecentHeartbeat)
-            // 4. 目标应用曾有历史心跳记录 (lastHeartbeat > 0L)
-            // 5. 本地持久化记录曾被激活 (hasHistoricalActivation)
-            // 6. 已产生加速重写记录 (totalRewrites > 0L)
-            val isActivated = isSelfInjected ||
-                    isServiceBound ||
-                    hasRecentHeartbeat ||
-                    hasHistoricalActivation ||
-                    lastHeartbeat > 0L ||
-                    totalRewrites > 0L
+            // 实时在线激活凭据（不依赖陈旧历史数据，确保“勾选即等待拦截，关闭即未激活”）：
+            // 1. 现代 LibXposed 框架服务在线绑定且包含有效作用域 (isServiceBound && hasFrameworkScope)
+            // 2. 模块自身在作用域中被注入 (isSelfInjected)
+            // 3. 目标宿主在近期活跃窗口内有心跳通信 (hasRecentHeartbeat)
+            val isBoundWithScope = isServiceBound && hasFrameworkScope
+            val isLiveActive = isBoundWithScope || isSelfInjected || hasRecentHeartbeat
 
-            if (!isActivated) {
+            if (!isLiveActive) {
                 return ActivationState.INACTIVE
             }
 
@@ -110,12 +104,18 @@ class MainActivity : ComponentActivity() {
         val snapshot = StatsManager.getSnapshot()
         val isSelfInjected = isModuleActive() || StatsManager.isFrameworkSelfInjected
 
+        val hasFrameworkScope = if (snapshot.hasQueriedScope) {
+            snapshot.hasTargetScope
+        } else {
+            true // 冷启动未完成查询前，先宽容信任服务绑定，防闪烁
+        }
+
         return calculateActivationState(
             totalRewrites = snapshot.totalRewrites,
             isServiceBound = XposedServiceProvider.isServiceBound,
             lastHeartbeat = snapshot.lastHeartbeatTimestamp,
             isSelfInjected = isSelfInjected,
-            hasHistoricalActivation = StatsManager.hasHistoricalActivation(this) || snapshot.isFrameworkActivated
+            hasFrameworkScope = hasFrameworkScope
         )
     }
 
@@ -124,9 +124,6 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         StatsManager.init(this)
-        if (isModuleActive() || StatsManager.isFrameworkSelfInjected) {
-            StatsManager.recordFrameworkActivated(this)
-        }
         uiPreferencesStore = UiPreferencesStore(this)
 
         val loadedConfig = StatsProvider.loadConfig(this)
@@ -143,9 +140,9 @@ class MainActivity : ComponentActivity() {
                 @Suppress("DEPRECATION")
                 pInfo.versionCode.toLong()
             }
-            (pInfo.versionName ?: "1.0.8") to code
+            (pInfo.versionName ?: BuildConfig.VERSION_NAME) to code
         } catch (_: Exception) {
-            "1.0.8" to 108L
+            BuildConfig.VERSION_NAME to BuildConfig.VERSION_CODE.toLong()
         }
 
         refreshStats()
@@ -202,6 +199,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        XposedServiceProvider.triggerScopeQueryAsync(force = true)
         refreshStats()
         refreshHandler.removeCallbacks(refreshRunnable)
         refreshHandler.postDelayed(refreshRunnable, 2000L)
@@ -215,17 +213,13 @@ class MainActivity : ComponentActivity() {
     private fun refreshStats() {
         val snapshot = StatsManager.getSnapshot()
         currentSnapshot.value = snapshot
-        currentActivationState.value = calculateActivationState(
-            totalRewrites = snapshot.totalRewrites,
-            isServiceBound = XposedServiceProvider.isServiceBound,
-            lastHeartbeat = snapshot.lastHeartbeatTimestamp
-        )
+        currentActivationState.value = getActivationState()
     }
 
     private fun copyLogToClipboard(entry: RewriteLogEntry) {
         val detail = "时间: ${entry.timeFormatted}\n来源: ${entry.originalHost}\n重定向至: ${entry.targetHost}\n策略: ${entry.reason}"
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipboard.setPrimaryClip(ClipData.newPlainText("Rewrite Log", detail))
-        Toast.makeText(this, "日志信息已复制到剪贴板", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, R.string.toast_log_copied, Toast.LENGTH_SHORT).show()
     }
 }

@@ -25,7 +25,12 @@ object MossGrpcHook {
         RegexOption.IGNORE_CASE
     )
 
+    @Volatile
+    var isHooked: Boolean = false
+        internal set
+
     fun init(module: XposedModule, classLoader: ClassLoader) {
+        if (isHooked) return
         var hooked = false
         for (className in RUNTIME_HELPER_CLASSES) {
             val runtimeHelper = try {
@@ -127,6 +132,7 @@ object MossGrpcHook {
                 if (hookCount > 0) {
                     Log.i(TAG, "Successfully hooked $hookCount RuntimeHelper.tf() methods on $className (gated by enableMossHook)")
                     hooked = true
+                    isHooked = true
                     HookStatusTracker.recordStatus("moss_grpc", "$className ($hookCount hooks, 实验开关受控)")
                     break
                 }

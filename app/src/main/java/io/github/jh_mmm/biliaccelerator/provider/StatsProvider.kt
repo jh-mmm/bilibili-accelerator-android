@@ -55,10 +55,14 @@ class StatsProvider : ContentProvider() {
 
         const val METHOD_RECORD_BATCH_REWRITE = "recordBatchRewrite"
         const val METHOD_GET_CONFIG = "getConfig"
+        const val METHOD_HANDSHAKE = "handshake"
 
         const val EXTRA_REWRITE_BATCH_JSON = "extra_rewrite_batch_json"
         const val EXTRA_CONFIG_JSON = "extra_config_json"
         const val EXTRA_HOOK_STATUS_JSON = "extra_hook_status_json"
+        const val EXTRA_CLIENT_PACKAGE = "extra_client_package"
+        const val EXTRA_CLIENT_VERSION = "extra_client_version"
+        const val EXTRA_CLIENT_PROCESS = "extra_client_process"
         const val EXTRA_SUCCESS = "success"
 
         const val MAX_BATCH_SIZE = 200
@@ -81,9 +85,16 @@ class StatsProvider : ContentProvider() {
         }
 
         fun isCallerAuthorized(context: Context, uid: Int): Boolean {
-            if (uid == Process.myUid()) return true
+            val myUid = Process.myUid()
+            if (uid == myUid) return true
+            // 兼容多用户与应用双开分身（如 MIUI/HyperOS 应用双开，appId = uid % 100000）
+            val appId = uid % 100000
+            val myAppId = myUid % 100000
+            if (appId == myAppId) return true
+
             val pkgs = context.packageManager.getPackagesForUid(uid).orEmpty()
-            if (pkgs.any { it in BiliAcceleratorCore.TARGET_PACKAGES }) return true
+            if (pkgs.any { BiliAcceleratorCore.isTargetPackage(it) }) return true
+
             return BiliAcceleratorCore.TARGET_PACKAGES.any { pkg ->
                 try {
                     val expectedUid = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
@@ -92,7 +103,7 @@ class StatsProvider : ContentProvider() {
                         @Suppress("DEPRECATION")
                         context.packageManager.getPackageUid(pkg, 0)
                     }
-                    expectedUid == uid
+                    expectedUid % 100000 == appId
                 } catch (_: Exception) {
                     false
                 }
@@ -194,6 +205,19 @@ class StatsProvider : ContentProvider() {
                 StatsManager.recordHeartbeat(ctx)
                 val config = loadConfig(ctx)
                 response.putString(EXTRA_CONFIG_JSON, gson.toJson(config))
+            }
+            METHOD_HANDSHAKE -> {
+                val clientPkg = extras?.getString(EXTRA_CLIENT_PACKAGE)
+                val clientVer = extras?.getString(EXTRA_CLIENT_VERSION)
+                val clientProc = extras?.getString(EXTRA_CLIENT_PROCESS)
+                StatsManager.recordHandshake(
+                    pkg = clientPkg,
+                    version = clientVer,
+                    process = clientProc,
+                    context = ctx
+                )
+                response.putBoolean(EXTRA_SUCCESS, true)
+                log("已记录宿主握手心跳: pkg=$clientPkg ver=$clientVer proc=$clientProc (来自 uid=$uid)")
             }
         }
         return response

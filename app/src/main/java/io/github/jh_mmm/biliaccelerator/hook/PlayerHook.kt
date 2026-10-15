@@ -9,6 +9,7 @@ import io.github.jh_mmm.biliaccelerator.core.RouteEngine
 import io.github.libxposed.api.XposedModule
 import java.util.Collections
 import java.util.WeakHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 object PlayerHook {
 
@@ -22,6 +23,13 @@ object PlayerHook {
         "tv.danmaku.ijk.media.player.IjkMediaAsset\$MediaAssetSegment\$Builder",
         "tv.danmaku.ijk.media.player.IjkMediaAsset\$MediaSegment\$Builder"
     )
+
+    @Volatile
+    var isHooked: Boolean = false
+        internal set
+
+    private val isOkHttpHooked = AtomicBoolean(false)
+    private val isPlayInfoHooked = AtomicBoolean(false)
 
     data class PromotedSegmentResult(
         val baseUrl: String,
@@ -69,7 +77,9 @@ object PlayerHook {
     }
 
     fun init(module: XposedModule, classLoader: ClassLoader) {
+        if (isHooked) return
         hookPlayInfoResponse(module, classLoader)
+        hookOkHttpRequestBuilder(module, classLoader)
 
         var hooked = false
         for (className in SEGMENT_BUILDER_CLASSES) {
@@ -89,6 +99,7 @@ object PlayerHook {
         }
 
         if (hooked) {
+            isHooked = true
             // Segment Builder 已成功挂载时不再重复挂载 IjkMediaPlayer fallback，杜绝同一请求被双重拦截与重复统计
             HookStatusTracker.recordStatus("player_fallback", "未启用 (Segment Builder 已就绪)")
             return
@@ -102,11 +113,55 @@ object PlayerHook {
     }
 
     /**
+     * 通用网络层拦截：拦截 OkHttp Request.Builder.url(String)，通杀 ExoPlayer、自研组件等各类非 ijkplayer 播放器内核
+     */
+    private fun hookOkHttpRequestBuilder(module: XposedModule, classLoader: ClassLoader) {
+        if (isOkHttpHooked.get()) return
+        val builderClass = try {
+            Class.forName("okhttp3.Request\$Builder", false, classLoader)
+        } catch (_: Throwable) {
+            null
+        } ?: return
+
+        var hookedCount = 0
+        try {
+            val urlStringMethod = builderClass.getDeclaredMethod("url", String::class.java)
+            module.hook(urlStringMethod).intercept { chain ->
+                val rawUrl = chain.args.firstOrNull() as? String
+                if (rawUrl != null && BiliAcceleratorCore.hasMediaSignal(rawUrl)) {
+                    val config = RemoteClient.fetchConfig()
+                    if (config.enabled) {
+                        val result = BiliAcceleratorCore.rewriteUrl(rawUrl, config)
+                        if (shouldReportSegment(rawUrl, result)) {
+                            RemoteClient.notifyRewrite(result)
+                        }
+                        if (result.changed) {
+                            Log.i(TAG, "Rewrote OkHttp Request.Builder url: ${result.originalHost} -> ${result.targetHost}")
+                            return@intercept chain.proceed(arrayOf(result.finalUrl))
+                        }
+                    }
+                }
+                chain.proceed()
+            }
+            hookedCount++
+        } catch (_: Throwable) {}
+
+        if (hookedCount > 0) {
+            isOkHttpHooked.set(true)
+            HookStatusTracker.recordStatus("player_okhttp", "okhttp3.Request.Builder (已挂载)")
+            Log.i(TAG, "Successfully hooked okhttp3.Request.Builder url")
+        } else {
+            HookStatusTracker.recordStatus("player_okhttp", "未挂载")
+        }
+    }
+
+    /**
      * 拦截 OkHttp ResponseBody.string() 中携带的 getRoomPlayInfo 直播 url_info 与 DASH playurl JSON：
      * - 对 getRoomPlayInfo 的 url_info 候选主机列表执行 filterLiveUrlInfo，剔除 PCDN/MCDN 节点；
      * - 对 DASH playurl JSON 执行 RouteEngine.ingestPlayurlJson，构建会话表示层映射表。
      */
     private fun hookPlayInfoResponse(module: XposedModule, classLoader: ClassLoader) {
+        if (isPlayInfoHooked.get()) return
         val responseBodyClass = try {
             Class.forName("okhttp3.ResponseBody", false, classLoader)
         } catch (_: Throwable) {
@@ -121,7 +176,13 @@ object PlayerHook {
                     return@intercept raw
                 }
                 val hasUrlInfo = raw.contains("\"url_info\"")
-                val hasDash = raw.contains("\"dash\"") && raw.contains("bilivideo")
+                val hasDash = raw.contains("\"dash\"") && (
+                    raw.contains("bilivideo") ||
+                    raw.contains("akamaized") ||
+                    raw.contains("bstar") ||
+                    raw.contains("/upgcxcode/") ||
+                    raw.contains(".m4s")
+                )
                 if (!hasUrlInfo && !hasDash) {
                     return@intercept raw
                 }
@@ -141,6 +202,7 @@ object PlayerHook {
                 }
                 raw
             }
+            isPlayInfoHooked.set(true)
         } catch (_: Throwable) {}
     }
 
@@ -236,7 +298,15 @@ object PlayerHook {
                                 runCatching {
                                     urlSetterMethod.isAccessible = true
                                     urlSetterMethod.invoke(thisObj, promoted.baseUrl)
-                                    promoted.promoteResult?.let { RemoteClient.notifyRewrite(it) }
+                                    val alreadyReported = synchronized(builderStates) {
+                                        builderStates[thisObj]?.reported == true
+                                    }
+                                    if (!alreadyReported) {
+                                        promoted.promoteResult?.let { RemoteClient.notifyRewrite(it) }
+                                        synchronized(builderStates) {
+                                            builderStates[thisObj]?.reported = true
+                                        }
+                                    }
                                     effectiveRawList = promoted.backupUrls
                                 }
                             }
@@ -422,7 +492,7 @@ object PlayerHook {
 
             if (!BiliAcceleratorCore.hasMediaSignal(originalUrl)) continue
 
-            if (builderInstance != null && i == 0) {
+            if (builderInstance != null) {
                 synchronized(builderStates) {
                     val state = builderStates.getOrPut(builderInstance) { BuilderTrackState() }
                     if (state.rawPrimaryUrl == null) {
@@ -532,6 +602,7 @@ object PlayerHook {
             }
 
             if (fallbackHookCount > 0) {
+                isHooked = true
                 HookStatusTracker.recordStatus("player_fallback", "tv.danmaku.ijk.media.player.IjkMediaPlayer ($fallbackHookCount hooks)")
                 Log.i(TAG, "Successfully hooked IjkMediaPlayer setDataSource methods ($fallbackHookCount hooks)")
             } else {

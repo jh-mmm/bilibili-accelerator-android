@@ -1,6 +1,7 @@
 package io.github.jh_mmm.biliaccelerator.core
 
 import com.google.gson.Gson
+import com.google.gson.GsonBuilder
 import com.google.gson.JsonArray
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
@@ -41,6 +42,8 @@ data class AcceleratorConfig(
 
 object BiliAcceleratorCore {
 
+    private val safeGson: Gson = GsonBuilder().disableHtmlEscaping().create()
+
     val MODULE_PACKAGE: String = BuildConfig.APPLICATION_ID
 
     val TARGET_PACKAGES = setOf(
@@ -51,6 +54,18 @@ object BiliAcceleratorCore {
         "tv.danmaku.bilibilihd",
         "com.bilibili.app.blue"
     )
+
+    fun isTargetPackage(packageName: String?): Boolean {
+        if (packageName.isNullOrBlank()) return false
+        val p = packageName.trim().lowercase()
+        if (TARGET_PACKAGES.contains(p)) return true
+        if (p == MODULE_PACKAGE.lowercase()) return true
+        return p.startsWith("tv.danmaku.bili") ||
+                p.startsWith("com.bilibili.") ||
+                p.startsWith("com.bstar.") ||
+                p.contains(".bilibili.") ||
+                p.contains("biliaccelerator")
+    }
 
     val CANDIDATE_POOL = listOf(
         "upos-sz-mirrorcos.bilivideo.com",
@@ -95,6 +110,7 @@ object BiliAcceleratorCore {
 
         val groups = h.split(':')
         if (groups.size > 8) return false
+        if (!h.contains("::") && groups.size != 8) return false
         val nonEmptyGroups = groups.filter { it.isNotEmpty() }
         return nonEmptyGroups.isNotEmpty() && nonEmptyGroups.all { IPV6_GROUP_REGEX.matches(it) }
     }
@@ -102,7 +118,7 @@ object BiliAcceleratorCore {
     fun cleanHost(raw: String?): String {
         if (raw.isNullOrBlank()) return ""
         var cleaned = raw.trim()
-        cleaned = cleaned.replace(Regex("""^https?://""", RegexOption.IGNORE_CASE), "")
+        cleaned = cleaned.replace(Regex("""^(?:https?:)?//""", RegexOption.IGNORE_CASE), "")
         val slashIdx = cleaned.indexOf('/')
         if (slashIdx != -1) {
             cleaned = cleaned.substring(0, slashIdx)
@@ -317,7 +333,7 @@ object BiliAcceleratorCore {
             val rewrites = mutableListOf<RewriteResult>()
             val changed = filterLiveUrlInfoElement(root, config, rewrites, depth = 0)
             if (changed) {
-                LiveFilterResult(changed = true, json = Gson().toJson(root), rewrites = rewrites)
+                LiveFilterResult(changed = true, json = safeGson.toJson(root), rewrites = rewrites)
             } else {
                 LiveFilterResult(changed = false, json = jsonText, rewrites = emptyList())
             }
@@ -524,9 +540,10 @@ object BiliAcceleratorCore {
         // 3. PCDN 拦截 / Force 模式统一重定向到优质 UPOS 镜像
         val isAkamai = hostname.endsWith(".akamaized.net", ignoreCase = true)
         val isBstar = hostname.endsWith(".bstarstatic.com", ignoreCase = true)
+        val isUposAkamai = isBiliAkamaiHost(hostname)
         val shouldRewrite = (isPcdn && config.blockPcdn) ||
                 (isMcdn && !config.proxyMcdn) ||
-                (config.forceUpos && isBiliCdnHost(hostname) && !isAkamai && !isBstar)
+                (config.forceUpos && (isBiliCdnHost(hostname) || isUposAkamai) && !isBstar)
 
         if (shouldRewrite) {
             val cleanedTarget = cleanHost(config.targetHost)
