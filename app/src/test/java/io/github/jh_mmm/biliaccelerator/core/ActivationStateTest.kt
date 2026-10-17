@@ -519,5 +519,51 @@ class ActivationStateTest {
             io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle.MIUIX.label
         )
     }
+
+    @Test
+    fun testStatsReceiverPayloadLegitimacy() {
+        val legitimateResult = RewriteResult(
+            changed = true,
+            originalUrl = "http://112.34.56.78:8080/upgcxcode/11/22/video.m4s",
+            finalUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/22/video.m4s",
+            originalHost = "112.34.56.78:8080",
+            targetHost = "upos-sz-mirrorcos.bilivideo.com",
+            reason = "pcdn-host",
+            isPcdn = true,
+            isMcdn = false
+        )
+        val validBatchJson = gson.toJson(listOf(legitimateResult))
+        val validSingleJson = gson.toJson(legitimateResult)
+
+        assertTrue(
+            "Valid Bilibili rewrite batch must be legitimate",
+            io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver.isPayloadLegitimate(validBatchJson, null)
+        )
+        assertTrue(
+            "Valid Bilibili rewrite single entry must be legitimate",
+            io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver.isPayloadLegitimate(null, validSingleJson)
+        )
+
+        assertFalse(
+            "Empty or corrupt JSON must not be legitimate",
+            io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver.isPayloadLegitimate("{}", "not_json")
+        )
+
+        val bogusResult = RewriteResult(
+            changed = false,
+            originalUrl = "",
+            finalUrl = "",
+            originalHost = "",
+            targetHost = "",
+            reason = "",
+            isPcdn = false,
+            isMcdn = false
+        )
+        assertFalse(
+            "Empty dummy entry must be rejected",
+            io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver.isPayloadLegitimate(gson.toJson(listOf(bogusResult)), null)
+        )
+    }
 }
+
 

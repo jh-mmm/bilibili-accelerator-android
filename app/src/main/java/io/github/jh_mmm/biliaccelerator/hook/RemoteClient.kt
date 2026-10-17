@@ -178,26 +178,60 @@ object RemoteClient {
     }
 
     private fun sendHandshakeDirect(context: Context) {
-        try {
-            val pkgName = context.packageName
-            val pm = context.packageManager
-            val pInfo = runCatching { pm.getPackageInfo(pkgName, 0) }.getOrNull()
-            val verName = pInfo?.versionName ?: "unknown"
+        val pkgName = context.packageName
+        val pm = context.packageManager
+        val pInfo = runCatching { pm.getPackageInfo(pkgName, 0) }.getOrNull()
+        val verName = pInfo?.versionName ?: "unknown"
+        val hookSnapshotJson = gson.toJson(HookStatusTracker.getSnapshot())
+        var handshakeOk = false
 
+        // 1. 优先尝试 ContentProvider 握手
+        try {
             val extras = Bundle().apply {
                 putString(StatsProvider.EXTRA_CLIENT_PACKAGE, pkgName)
                 putString(StatsProvider.EXTRA_CLIENT_VERSION, verName)
-                putString(StatsProvider.EXTRA_HOOK_STATUS_JSON, gson.toJson(HookStatusTracker.getSnapshot()))
+                putString(StatsProvider.EXTRA_HOOK_STATUS_JSON, hookSnapshotJson)
             }
-            context.contentResolver.call(
+            val res = context.contentResolver.call(
                 StatsProvider.CONTENT_URI,
                 StatsProvider.METHOD_HANDSHAKE,
                 null,
                 extras
             )
-            Log.i(TAG, "Successfully sent handshake to module provider from $pkgName (v$verName)")
+            if (res?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true) {
+                handshakeOk = true
+                Log.i(TAG, "Successfully sent handshake to module provider from $pkgName (v$verName)")
+            }
         } catch (t: Throwable) {
-            Log.d(TAG, "sendHandshakeDirect error: ${t.message}")
+            Log.d(TAG, "sendHandshakeDirect via provider failed: ${t.message}")
+        }
+
+        // 2. 兜底通道：若 Provider 不可达（如高版本 Android 包可见性拦截），发送握手显式广播
+        if (!handshakeOk) {
+            try {
+                val authIntent = Intent().apply {
+                    setPackage(pkgName)
+                }
+                val authToken = PendingIntent.getBroadcast(
+                    context,
+                    0,
+                    authIntent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+
+                val intent = Intent(StatsReceiver.ACTION_HANDSHAKE).apply {
+                    setPackage(BiliAcceleratorCore.MODULE_PACKAGE)
+                    addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                    putExtra(StatsReceiver.EXTRA_CLIENT_PACKAGE, pkgName)
+                    putExtra(StatsReceiver.EXTRA_CLIENT_VERSION, verName)
+                    putExtra(StatsReceiver.EXTRA_HOOK_STATUS_JSON, hookSnapshotJson)
+                    putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, authToken)
+                }
+                context.sendBroadcast(intent)
+                Log.i(TAG, "Successfully sent handshake to module via broadcast fallback from $pkgName (v$verName)")
+            } catch (t: Throwable) {
+                Log.w(TAG, "sendHandshakeDirect via broadcast failed: ${t.message}")
+            }
         }
     }
 
@@ -272,7 +306,8 @@ object RemoteClient {
         // 2. 兜底通道：发送带鉴权 Token 的显式广播，附带限流防止广播风暴（1.0.5 经典双通道）
         if (!reported) {
             val now = System.currentTimeMillis()
-            if (now - lastBroadcastTime.get() >= 1000L) {
+            val timeSinceLastBroadcast = now - lastBroadcastTime.get()
+            if (timeSinceLastBroadcast >= 1000L) {
                 lastBroadcastTime.set(now)
                 try {
                     val authIntent = Intent().apply {
@@ -290,6 +325,7 @@ object RemoteClient {
                         addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
                         putExtra(StatsReceiver.EXTRA_REWRITE_BATCH_JSON, json)
                         putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, authToken)
+                        putExtra(StatsReceiver.EXTRA_CLIENT_PACKAGE, context.packageName)
                     }
                     context.sendBroadcast(intent)
                     Log.i(TAG, "[Broadcast] 备用通道批量发送成功 (${batch.size} 条重定向)")
@@ -297,7 +333,18 @@ object RemoteClient {
                     Log.w(TAG, "[Broadcast] 发送异常: $t")
                 }
             } else {
-                Log.w(TAG, "[Broadcast] 广播限流保护触发，暂缓发送")
+                // 修复丢包缺陷：将尚未发送的批次数据重新回填到队列头部，并安排延迟重试
+                for (item in batch) {
+                    pendingBatch.offer(item)
+                }
+                val retryDelay = maxOf(100L, 1000L - timeSinceLastBroadcast)
+                synchronized(flushLock) {
+                    pendingFlushFuture?.cancel(false)
+                    pendingFlushFuture = reportScheduler.schedule({
+                        flushBatch()
+                    }, retryDelay, TimeUnit.MILLISECONDS)
+                }
+                Log.d(TAG, "[Broadcast] 广播限流保护触发，已回填 ${batch.size} 条数据并将于 ${retryDelay}ms 后重试")
             }
         }
     }

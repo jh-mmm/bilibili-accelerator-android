@@ -85,6 +85,7 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="io.github.jh_mmm.biliaccelerator.ACTION_RECORD_REWRITE" />
+                <action android:name="io.github.jh_mmm.biliaccelerator.ACTION_HANDSHAKE" />
             </intent-filter>
         </receiver>
 
