@@ -29,8 +29,8 @@ data class RewriteResultDto(
     val isMcdn: Boolean? = false,
     val segmentKey: String? = null
 ) {
-    fun toDomain(): RewriteResult? {
-        val origHost = originalHost?.trim()?.take(256) ?: return null
+    fun toDomain(): RewriteResult {
+        val origHost = originalHost?.trim()?.take(256) ?: ""
         val tgtHost = targetHost?.trim()?.take(256) ?: origHost
         val safeSegKey = segmentKey?.substringBefore('?')?.substringAfterLast('/')?.trim()?.take(96) ?: ""
         return RewriteResult(

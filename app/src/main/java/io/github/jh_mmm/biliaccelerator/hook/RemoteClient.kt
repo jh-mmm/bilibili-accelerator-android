@@ -1,6 +1,8 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import com.google.gson.Gson
@@ -8,6 +10,7 @@ import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
+import io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -41,6 +44,7 @@ object RemoteClient {
     private const val FLUSH_INTERVAL_MS = 1500L
     private var pendingFlushFuture: ScheduledFuture<*>? = null
     private val flushLock = Any()
+    private val lastBroadcastTime = AtomicLong(0L)
 
     @Volatile
     private var appContext: Context? = null
@@ -233,7 +237,7 @@ object RemoteClient {
         val batch = mutableListOf<RewriteResult>()
         while (batch.size < 50) {
             val item = pendingBatch.poll() ?: break
-            batch.add(sanitizeForIpc(item))
+            batch.add(item)
         }
         if (batch.isEmpty()) return
 
@@ -244,6 +248,9 @@ object RemoteClient {
         }
 
         val json = gson.toJson(batch)
+        var reported = false
+
+        // 1. 优先尝试 ContentProvider 批量 IPC
         try {
             val extras = Bundle().apply {
                 putString(StatsProvider.EXTRA_REWRITE_BATCH_JSON, json)
@@ -255,10 +262,43 @@ object RemoteClient {
                 extras
             )
             if (response?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true) {
+                reported = true
                 Log.i(TAG, "[Provider] 批量上报成功 (${batch.size} 条重定向)")
             }
         } catch (t: Throwable) {
             Log.d(TAG, "[Provider] 暂不可达: ${t.javaClass.simpleName} (${t.message})")
+        }
+
+        // 2. 兜底通道：发送带鉴权 Token 的显式广播，附带限流防止广播风暴（1.0.5 经典双通道）
+        if (!reported) {
+            val now = System.currentTimeMillis()
+            if (now - lastBroadcastTime.get() >= 1000L) {
+                lastBroadcastTime.set(now)
+                try {
+                    val authIntent = Intent().apply {
+                        setPackage(context.packageName)
+                    }
+                    val authToken = PendingIntent.getBroadcast(
+                        context,
+                        0,
+                        authIntent,
+                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                    )
+
+                    val intent = Intent(StatsReceiver.ACTION_RECORD_REWRITE).apply {
+                        setPackage(BiliAcceleratorCore.MODULE_PACKAGE)
+                        addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                        putExtra(StatsReceiver.EXTRA_REWRITE_BATCH_JSON, json)
+                        putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, authToken)
+                    }
+                    context.sendBroadcast(intent)
+                    Log.i(TAG, "[Broadcast] 备用通道批量发送成功 (${batch.size} 条重定向)")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "[Broadcast] 发送异常: $t")
+                }
+            } else {
+                Log.w(TAG, "[Broadcast] 广播限流保护触发，暂缓发送")
+            }
         }
     }
 }

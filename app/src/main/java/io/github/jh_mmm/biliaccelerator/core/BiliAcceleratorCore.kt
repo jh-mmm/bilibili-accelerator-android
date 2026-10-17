@@ -1,5 +1,6 @@
 package io.github.jh_mmm.biliaccelerator.core
 
+import android.net.Uri
 import io.github.jh_mmm.biliaccelerator.BuildConfig
 import java.net.URI
 import java.net.URLDecoder
@@ -207,6 +208,37 @@ object BiliAcceleratorCore {
     )
 
     fun parseUri(original: String): ParsedUri? {
+        try {
+            val u = Uri.parse(original)
+            val host = u.host
+            if (!host.isNullOrBlank()) {
+                val scheme = u.scheme?.lowercase() ?: "https"
+                if (scheme == "http" || scheme == "https") {
+                    return ParsedUri(
+                        scheme = scheme,
+                        host = host,
+                        port = u.port,
+                        path = u.path ?: "",
+                        queryParam = { key -> u.getQueryParameter(key) },
+                        replaceAuthority = { newAuth ->
+                            val cleanAuth = cleanHost(newAuth)
+                            u.buildUpon().scheme("https").encodedAuthority(cleanAuth).build().toString()
+                        },
+                        proxyWrap = { proxyHost ->
+                            val cleanProxy = cleanHost(proxyHost).substringBefore(':')
+                            Uri.Builder()
+                                .scheme("https")
+                                .encodedAuthority(cleanProxy)
+                                .path("/")
+                                .appendQueryParameter("url", original)
+                                .build().toString()
+                        }
+                    )
+                }
+            }
+        } catch (_: Throwable) {}
+
+        // JVM 单元测试回退（当 android.net.Uri 在非 Android 环境未被模拟时）
         return try {
             val trimmed = original.trim()
             if (trimmed.isEmpty()) return null

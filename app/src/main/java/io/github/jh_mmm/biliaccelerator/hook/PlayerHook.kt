@@ -144,8 +144,8 @@ object PlayerHook {
         if (!config.enabled) return null
 
         val result = BiliAcceleratorCore.rewriteUrl(originalUrl, config)
+        RemoteClient.notifyRewrite(result)
         if (result.changed) {
-            RemoteClient.notifyRewrite(result)
             Log.i(TAG, "Rewrote media url: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
             val newArgs = args.toTypedArray()
             newArgs[strIndex] = result.finalUrl
@@ -173,8 +173,8 @@ object PlayerHook {
                         val config = RemoteClient.fetchConfig()
                         if (config.enabled) {
                             val result = BiliAcceleratorCore.rewriteUrl(original, config)
+                            RemoteClient.notifyRewrite(result)
                             if (result.changed) {
-                                RemoteClient.notifyRewrite(result)
                                 Log.i(TAG, "Rewrote IjkMediaPlayer dataSource: ${result.originalHost} -> ${result.targetHost}")
                                 val newArgs = chain.args.toTypedArray().apply { this[0] = result.finalUrl }
                                 return@intercept chain.proceed(newArgs)
@@ -200,8 +200,8 @@ object PlayerHook {
                                 val config = RemoteClient.fetchConfig()
                                 if (config.enabled) {
                                     val result = BiliAcceleratorCore.rewriteUrl(original, config)
+                                    RemoteClient.notifyRewrite(result)
                                     if (result.changed) {
-                                        RemoteClient.notifyRewrite(result)
                                         Log.i(TAG, "Rewrote IjkMediaPlayer Uri dataSource: ${result.originalHost} -> ${result.targetHost}")
                                         val newArgs = chain.args.toTypedArray().apply { this[1] = Uri.parse(result.finalUrl) }
                                         return@intercept chain.proceed(newArgs)
