@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.util.Log
 import com.google.gson.Gson
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
 import java.util.concurrent.ConcurrentLinkedQueue
