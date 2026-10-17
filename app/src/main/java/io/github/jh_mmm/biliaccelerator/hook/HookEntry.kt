@@ -1,21 +1,19 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
-import android.app.Application
 import android.content.Context
-import android.os.Build
 import android.util.Log
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
-import java.io.File
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
 
 class HookEntry : XposedModule() {
 
     companion object {
         private const val TAG = "BiliAccelerator"
-        private val hookedPackages = ConcurrentHashMap.newKeySet<String>()
+
+        @Volatile
+        var isSelfHookInjected: Boolean = false
+            internal set
 
         private val IGNORED_PROCESS_SUFFIXES = setOf(
             ":push",
@@ -36,17 +34,6 @@ class HookEntry : XposedModule() {
             ":guard"
         )
 
-        private val hookInstallerExecutor = Executors.newSingleThreadExecutor { r ->
-            Thread(r, "BiliAccel-HookInstaller").apply {
-                isDaemon = true
-                priority = Thread.NORM_PRIORITY + 1
-            }
-        }
-
-        /**
-         * 过滤非媒体后台子进程（如 :push、:crash、:channel 等），仅在主进程及播放器/媒体相关子进程挂载 Hook，
-         * 避免多进程无意义重复 Hook、重复拉取配置与统计口径污染。
-         */
         internal fun isRelevantProcess(packageName: String, processName: String?): Boolean {
             val proc = processName?.trim()?.takeIf { it.isNotEmpty() } ?: return true
             if (proc == packageName || !proc.contains(':')) return true
@@ -59,28 +46,6 @@ class HookEntry : XposedModule() {
             }
             return true
         }
-
-        internal fun resolveCurrentProcessName(): String? {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                runCatching {
-                    val name = Application.getProcessName()
-                    if (!name.isNullOrBlank()) return name
-                }
-            }
-            return runCatching {
-                File("/proc/self/cmdline")
-                    .readBytes()
-                    .takeWhile { it != 0.toByte() }
-                    .toByteArray()
-                    .toString(Charsets.UTF_8)
-                    .trim()
-                    .takeIf { it.isNotEmpty() }
-            }.getOrNull()
-        }
-
-        @Volatile
-        var isSelfHookInjected: Boolean = false
-            internal set
     }
 
     private fun handleModuleSelfLoaded(param: PackageLoadedParam) {
@@ -111,125 +76,69 @@ class HookEntry : XposedModule() {
         } catch (_: Throwable) {}
     }
 
-    @android.annotation.SuppressLint("NewApi")
     override fun onPackageLoaded(param: PackageLoadedParam) {
         val packageName = param.packageName
+        val classLoader = try {
+            param.defaultClassLoader
+        } catch (_: Throwable) {
+            null
+        } ?: Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader()
 
-        // 1. 模块自身包名：框架已将本模块纳入作用域并成功注入，标记激活状态
+        // 1. 模块自身包名：若框架将本模块加入注入作用域，标记激活状态
         if (packageName == BiliAcceleratorCore.MODULE_PACKAGE) {
             handleModuleSelfLoaded(param)
             return
         }
-        // 2. Target Bilibili Apps
+
+        // 2. 目标应用：B站国内版、国际版、Bstar 等
         if (BiliAcceleratorCore.isTargetPackage(packageName)) {
-            val processName = resolveCurrentProcessName()
-            if (!isRelevantProcess(packageName, processName)) {
-                Log.d(TAG, "Skipping non-media subprocess: $processName")
-                return
-            }
+            Log.i(TAG, "Injecting into $packageName via LibXposed API 101")
 
-            val processToken = "$packageName@${processName ?: "main"}"
-            if (!hookedPackages.add(processToken)) {
-                return
-            }
+            // 尽早捕获 Application 实例，供统计上报（跨进程 ContentProvider 调用）使用
+            captureApplicationContext(packageName, classLoader)
 
-            val classLoader = try {
-                param.defaultClassLoader
-            } catch (_: Throwable) {
-                null
-            } ?: Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader()
-
-            Log.i(TAG, "Injecting into $packageName (process=${processName ?: "main"}) via LibXposed API 101")
-
-            // 尽早异步预热安装业务 Hook，杜绝生命周期挂载死锁
-            installFeatureHooksAsync(classLoader)
-
-            // 捕获 Application 实例并在 Context 到位后启动握手与配置同步
-            captureApplicationContextAndInstallHooks(packageName, classLoader)
+            // 同步初始化业务 Hook（1.0.5 经典逻辑，杜绝异步线程导致播放器早期实例漏 Hook）
+            PlayerHook.init(this, classLoader)
+            MossGrpcHook.init(this, classLoader)
         }
     }
 
-    private fun installFeatureHooksAsync(classLoader: ClassLoader) {
-        if (PlayerHook.isHooked && MossGrpcHook.isHooked) return
-        hookInstallerExecutor.execute {
-            try {
-                // 尝试尽早获取现有 Application 上下文以提前建立启动握手
-                RemoteClient.getContext()
-                if (!PlayerHook.isHooked) {
-                    PlayerHook.init(this@HookEntry, classLoader)
-                }
-                if (!MossGrpcHook.isHooked) {
-                    MossGrpcHook.init(this@HookEntry, classLoader)
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "Async hook installation error: ${t.message}")
-            }
-        }
-    }
-
-    private fun captureApplicationContextAndInstallHooks(packageName: String, classLoader: ClassLoader) {
-        val appClass = Application::class.java
-
-        // 尽早尝试捕获当前已有的 Application 上下文
-        RemoteClient.getContext()
-
-        // 1. Hook Application.attach(Context)
+    private fun captureApplicationContext(packageName: String, classLoader: ClassLoader) {
+        var attachHooked = false
         try {
+            val appClass = classLoader.loadClass("android.app.Application")
             val attachMethod = appClass.getDeclaredMethod("attach", Context::class.java)
             hook(attachMethod).intercept { chain ->
                 val result = chain.proceed()
                 val ctx = (chain.thisObject as? Context) ?: (chain.args.firstOrNull() as? Context)
-                val procName = resolveCurrentProcessName()
-                if (ctx != null && isRelevantProcess(packageName, procName)) {
+                if (ctx != null) {
                     RemoteClient.setAppContext(ctx)
-                    HookStatusTracker.recordStatus("app_context", "Application.attach (${procName ?: packageName})")
-                    installFeatureHooksAsync(ctx.classLoader ?: classLoader)
+                    HookStatusTracker.recordStatus("app_context", "Application.attach ($packageName)")
                 }
                 result
             }
+            attachHooked = true
             Log.i(TAG, "Successfully hooked Application.attach")
         } catch (t: Throwable) {
-            Log.d(TAG, "Hook Application.attach fallback: ${t.message}")
+            Log.w(TAG, "Failed to hook Application.attach (ROM compatibility): ${t.message}")
         }
 
-        // 2. Hook ContextWrapper.attachBaseContext(Context)
         try {
-            val attachBaseMethod = android.content.ContextWrapper::class.java.getDeclaredMethod("attachBaseContext", Context::class.java)
-            hook(attachBaseMethod).intercept { chain ->
-                val result = chain.proceed()
-                val ctx = (chain.thisObject as? Context) ?: (chain.args.firstOrNull() as? Context)
-                val procName = resolveCurrentProcessName()
-                if (ctx != null && isRelevantProcess(packageName, procName)) {
-                    RemoteClient.setAppContext(ctx)
-                    HookStatusTracker.recordStatus("app_context", "ContextWrapper.attachBaseContext (${procName ?: packageName})")
-                    installFeatureHooksAsync(ctx.classLoader ?: classLoader)
-                }
-                result
-            }
-            Log.i(TAG, "Successfully hooked ContextWrapper.attachBaseContext")
-        } catch (t: Throwable) {
-            Log.d(TAG, "Hook ContextWrapper.attachBaseContext fallback: ${t.message}")
-        }
-
-        // 3. Hook Application.onCreate
-        try {
+            val appClass = classLoader.loadClass("android.app.Application")
             val onCreateMethod = appClass.getDeclaredMethod("onCreate")
             hook(onCreateMethod).intercept { chain ->
                 val result = chain.proceed()
                 (chain.thisObject as? Context)?.let { ctx ->
-                    val procName = resolveCurrentProcessName()
-                    if (isRelevantProcess(packageName, procName)) {
-                        RemoteClient.setAppContext(ctx)
-                        HookStatusTracker.recordStatus("app_context", "Application.onCreate (${procName ?: packageName})")
-                        installFeatureHooksAsync(ctx.classLoader ?: classLoader)
+                    RemoteClient.setAppContext(ctx)
+                    if (!attachHooked) {
+                        HookStatusTracker.recordStatus("app_context", "Application.onCreate ($packageName)")
                     }
                 }
                 result
             }
             Log.i(TAG, "Successfully hooked Application.onCreate")
         } catch (t: Throwable) {
-            Log.d(TAG, "Hook Application.onCreate fallback: ${t.message}")
+            Log.w(TAG, "Failed to hook Application.onCreate (ROM compatibility): ${t.message}")
         }
     }
 }
-

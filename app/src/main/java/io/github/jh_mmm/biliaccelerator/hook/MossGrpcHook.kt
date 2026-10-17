@@ -1,17 +1,17 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
 import android.util.Log
-import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.libxposed.api.XposedModule
-import java.lang.reflect.Method
 import java.math.BigDecimal
 import java.math.BigInteger
-import java.util.concurrent.atomic.AtomicInteger
 
 object MossGrpcHook {
 
     private const val TAG = "BiliAccelerator-Moss"
-    private const val MAX_SAMPLE_LOGS = 20
+
+    @Volatile
+    var isHooked: Boolean = false
+        internal set
 
     private val RUNTIME_HELPER_CLASSES = listOf(
         "com.bilibili.lib.moss.utils.RuntimeHelper",
@@ -19,224 +19,98 @@ object MossGrpcHook {
         "com.bilibili.moss.utils.RuntimeHelper"
     )
 
-    private val sampleLogCount = AtomicInteger(0)
-    private val TF_RUNTIME_KEY_REGEX = Regex(
-        """(?:^|[._:/-])(tf|traffic|mirror|upos|pcdn|mcdn|bcache|cdn)(?:$|[._:/-])""",
-        RegexOption.IGNORE_CASE
-    )
-
-    @Volatile
-    var isHooked: Boolean = false
-        internal set
-
     fun init(module: XposedModule, classLoader: ClassLoader) {
-        if (isHooked) return
         var hooked = false
         for (className in RUNTIME_HELPER_CLASSES) {
             val runtimeHelper = try {
-                Class.forName(className, false, classLoader)
+                classLoader.loadClass(className)
             } catch (_: Throwable) {
                 null
             } ?: continue
 
             try {
-                // 收窄匹配：优先匹配单参数为 B 站业务上下文/Protobuf 对象的 tf() 方法；
-                // 若类中仅存在 tf(String)，则退化为挂载 tf(String) 并在运行期按流量/镜像关键字白名单过滤，杜绝盲翻通用 Feature Flag。
-                val allDeclared = (runtimeHelper.declaredMethods + runtimeHelper.methods).distinct()
-                val strictMethods = allDeclared.filter { isCandidateTfMethod(it, runtimeHelper) }
-                val tfMethods = if (strictMethods.isNotEmpty()) {
-                    strictMethods
-                } else {
-                    allDeclared.filter { isStringKeyedTfMethod(it, runtimeHelper) }
-                }
+                // 仅拦截无参或单个上下文参数的 tf() 方法，避免误命中同名其他重载方法
+                val tfMethods = (runtimeHelper.declaredMethods + runtimeHelper.methods)
+                    .distinct()
+                    .filter { it.name == "tf" && it.returnType != Void.TYPE && it.parameterTypes.size <= 1 }
 
-                var hookCount = 0
                 for (method in tfMethods) {
-                    val methodSignature = method.toGenericString()
-                    try {
-                        module.hook(method).intercept { chain ->
-                            val config = RemoteClient.fetchConfig()
-                            val result = chain.proceed()
-                            if (!config.enabled || !config.blockPcdn || !config.enableMossHook || result == null) {
-                                return@intercept result
-                            }
-
-                            val firstArg = chain.args.firstOrNull()
-                            val argDesc = summarizeArg(firstArg)
-                            if (!shouldAllowRuntimeArg(firstArg)) {
-                                logSampledObservation(methodSignature, argDesc, result)
-                                return@intercept result
-                            }
-
-                            val returnType = method.returnType
-
-                            // 1. Boolean / boolean 返回类型
-                            if (returnType == java.lang.Boolean.TYPE || returnType == java.lang.Boolean::class.java || result is Boolean) {
-                                if (result == false) {
-                                    logSampledInjection(methodSignature, argDesc, result, true)
-                                    reportMossInjection(methodSignature, argDesc, result, true)
-                                    return@intercept true
-                                }
-                                return@intercept result
-                            }
-
-                            // 2. String 返回类型
-                            if (returnType == String::class.java || result is String) {
-                                val str = result.toString()
-                                if (str == "0" || str.equals("false", ignoreCase = true) || str.isEmpty()) {
-                                    logSampledInjection(methodSignature, argDesc, result, "1")
-                                    reportMossInjection(methodSignature, argDesc, result, "1")
-                                    return@intercept "1"
-                                }
-                                return@intercept result
-                            }
-
-                            // 3. Primitive/Boxed number 返回类型：严格按 method.returnType 匹配，杜绝拆箱 ClassCastException
-                            if (result is Number) {
-                                if (result.toDouble() == 0.0) {
-                                    val modified = convertNumberToTfOne(returnType, result)
-                                    logSampledInjection(methodSignature, argDesc, result, modified)
-                                    reportMossInjection(methodSignature, argDesc, result, modified)
-                                    return@intercept modified
-                                }
-                                return@intercept result
-                            }
-
-                            // 4. Protobuf Enum 返回类型
-                            try {
-                                val getNumber = result.javaClass.getMethod("getNumber")
-                                val currentNum = getNumber.invoke(result) as? Int
-                                if (currentNum == 0) {
-                                    val forNumberMethod = try {
-                                        result.javaClass.getMethod("forNumber", Int::class.javaPrimitiveType)
-                                    } catch (_: NoSuchMethodException) {
-                                        result.javaClass.getMethod("valueOf", Int::class.javaPrimitiveType)
-                                    }
-                                    val mirrorTf = forNumberMethod.invoke(null, 1)
-                                    if (mirrorTf != null) {
-                                        logSampledInjection(methodSignature, argDesc, result, mirrorTf)
-                                        reportMossInjection(methodSignature, argDesc, result, mirrorTf)
-                                        return@intercept mirrorTf
-                                    }
-                                }
-                            } catch (_: Throwable) {}
-
-                            result
+                    module.hook(method).intercept { chain ->
+                        val config = RemoteClient.fetchConfig()
+                        val result = chain.proceed()
+                        if (!config.enabled || !config.blockPcdn || result == null) {
+                            return@intercept result
                         }
-                        hookCount++
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "Failed to hook method $methodSignature on $className: ${t.message}")
+
+                        val returnType = method.returnType
+
+                        // 1. Boolean / boolean 返回类型
+                        if (returnType == java.lang.Boolean.TYPE || returnType == java.lang.Boolean::class.java || result is Boolean) {
+                            if (result == false) {
+                                Log.i(TAG, "Injected TF=true (Boolean) to force official mirror CDN from server")
+                                return@intercept true
+                            }
+                            return@intercept result
+                        }
+
+                        // 2. String 返回类型
+                        if (returnType == String::class.java || result is String) {
+                            val str = result.toString()
+                            if (str == "0" || str.equals("false", ignoreCase = true) || str.isEmpty()) {
+                                Log.i(TAG, "Injected TF='1' (String) to force official mirror CDN from server")
+                                return@intercept "1"
+                            }
+                            return@intercept result
+                        }
+
+                        // 3. Primitive/Boxed number 返回类型：严格按 method.returnType 匹配，杜绝拆箱 ClassCastException
+                        if (result is Number) {
+                            if (result.toDouble() == 0.0) {
+                                val modified = convertNumberToTfOne(returnType, result)
+                                Log.i(TAG, "Injected TF=1 (${modified.javaClass.simpleName}) to force official mirror CDN from server")
+                                return@intercept modified
+                            }
+                            return@intercept result
+                        }
+
+                        // 4. Protobuf Enum 返回类型
+                        try {
+                            val getNumber = result.javaClass.getMethod("getNumber")
+                            val currentNum = getNumber.invoke(result) as? Int
+                            if (currentNum == 0) {
+                                val forNumberMethod = try {
+                                    result.javaClass.getMethod("forNumber", Int::class.javaPrimitiveType)
+                                } catch (_: NoSuchMethodException) {
+                                    result.javaClass.getMethod("valueOf", Int::class.javaPrimitiveType)
+                                }
+                                val mirrorTf = forNumberMethod.invoke(null, 1)
+                                if (mirrorTf != null) {
+                                    Log.i(TAG, "Injected TF=1 (protobuf enum: ${result.javaClass.simpleName}) to force official mirror CDN from server")
+                                    return@intercept mirrorTf
+                                }
+                            }
+                        } catch (_: Throwable) {}
+
+                        result
                     }
                 }
 
-                if (hookCount > 0) {
-                    Log.i(TAG, "Successfully hooked $hookCount RuntimeHelper.tf() methods on $className (gated by enableMossHook)")
+                if (tfMethods.isNotEmpty()) {
+                    Log.i(TAG, "Successfully hooked ${tfMethods.size} RuntimeHelper.tf() methods on $className")
                     hooked = true
-                    isHooked = true
-                    HookStatusTracker.recordStatus("moss_grpc", "$className ($hookCount hooks, 实验开关受控)")
+                    HookStatusTracker.recordStatus("moss_grpc", className)
                     break
                 }
             } catch (t: Throwable) {
-                Log.w(TAG, "Failed to process RuntimeHelper on $className: ${t.message}")
+                Log.w(TAG, "Failed to hook RuntimeHelper.tf() on $className: ${t.message}")
             }
         }
 
-        if (!hooked) {
-            HookStatusTracker.recordStatus("moss_grpc", "未找到 (版本不兼容或已收窄跳过)")
-            Log.i(TAG, "RuntimeHelper class not found or no eligible tf() method, skipping Moss TF hook")
+        if (hooked) {
+            isHooked = true
+        } else {
+            Log.i(TAG, "RuntimeHelper class not found, skipping Moss TF hook")
         }
-    }
-
-    private fun summarizeArg(arg: Any?): String {
-        if (arg == null) return "null"
-        if (arg is CharSequence) return arg.toString().take(80)
-        val simpleName = arg.javaClass.simpleName.ifEmpty { arg.javaClass.name }
-        val str = runCatching { arg.toString().take(60) }.getOrDefault(simpleName)
-        return if (str.startsWith(simpleName)) str else "$simpleName($str)"
-    }
-
-    private fun logSampledObservation(signature: String, argDesc: String, currentVal: Any) {
-        val count = sampleLogCount.incrementAndGet()
-        if (count <= MAX_SAMPLE_LOGS) {
-            Log.i(TAG, "[Sample #$count/$MAX_SAMPLE_LOGS] Moss TF skipped non-traffic key on [$signature] arg=[$argDesc] val=$currentVal")
-        }
-    }
-
-    private fun logSampledInjection(signature: String, argDesc: String, oldVal: Any, newVal: Any) {
-        val count = sampleLogCount.incrementAndGet()
-        if (count <= MAX_SAMPLE_LOGS) {
-            Log.i(TAG, "[Sample #$count/$MAX_SAMPLE_LOGS] Moss TF override on [$signature] arg=[$argDesc]: $oldVal -> $newVal")
-        }
-    }
-
-    private fun reportMossInjection(signature: String, argDesc: String, oldVal: Any, newVal: Any) {
-        runCatching {
-            val safeSig = signature.substringBefore('(').substringAfterLast('.').take(48)
-            val safeArg = argDesc.take(64)
-            val result = RewriteResult(
-                changed = true,
-                originalUrl = "",
-                finalUrl = "",
-                originalHost = "TF=$oldVal ($safeArg)",
-                targetHost = "TF=$newVal (官方优质镜像)",
-                reason = "moss-tf-inject",
-                isPcdn = false,
-                isMcdn = false,
-                segmentKey = "moss:$safeSig"
-            )
-            RemoteClient.notifyRewrite(result)
-        }
-    }
-
-    internal fun shouldAllowRuntimeArg(arg: Any?): Boolean {
-        if (arg == null) return false
-        if (arg is CharSequence) {
-            val key = arg.toString().trim()
-            return key.isNotEmpty() && TF_RUNTIME_KEY_REGEX.containsMatchIn(key)
-        }
-        return isAllowedParameterType(arg.javaClass)
-    }
-
-    internal fun isStringKeyedTfMethod(method: Method, declaringTarget: Class<*> = method.declaringClass): Boolean {
-        if (method.name != "tf" || method.declaringClass != declaringTarget || method.parameterTypes.size != 1) {
-            return false
-        }
-        return method.parameterTypes[0] == String::class.java && isSupportedReturnType(method.returnType)
-    }
-
-    internal fun isCandidateTfMethod(method: Method, declaringTarget: Class<*> = method.declaringClass): Boolean {
-        if (method.name != "tf" || method.declaringClass != declaringTarget || method.parameterTypes.size != 1) {
-            return false
-        }
-        val paramType = method.parameterTypes[0]
-        if (!isAllowedParameterType(paramType)) {
-            return false
-        }
-        return isSupportedReturnType(method.returnType)
-    }
-
-    /**
-     * 排除 String、基本数据类型、包装数字/布尔、集合等通用 Feature Flag / Toggle 查询入参，
-     * 仅允许 B 站业务上下文或 Protobuf 对象作为入参，防止误将通用实验开关翻转。
-     */
-    internal fun isAllowedParameterType(paramType: Class<*>): Boolean {
-        if (paramType.isPrimitive || paramType.isArray) return false
-        if (paramType == String::class.java || CharSequence::class.java.isAssignableFrom(paramType)) return false
-        if (paramType == Any::class.java || paramType == java.lang.Boolean::class.java) return false
-        if (Number::class.java.isAssignableFrom(paramType)) return false
-        val pkgName = paramType.name
-        if (pkgName.startsWith("java.") || pkgName.startsWith("javax.") || pkgName.startsWith("kotlin.") || pkgName.startsWith("android.")) {
-            return false
-        }
-        return true
-    }
-
-    internal fun isSupportedReturnType(clazz: Class<*>): Boolean {
-        if (clazz == java.lang.Boolean.TYPE || clazz == java.lang.Boolean::class.java) return true
-        if (clazz == String::class.java) return true
-        if (Number::class.java.isAssignableFrom(clazz) || (clazz.isPrimitive && clazz != java.lang.Void.TYPE)) return true
-        if (clazz.isEnum || clazz.name.contains("Tf", ignoreCase = true) || clazz.name.contains("Traffic", ignoreCase = true)) return true
-        return false
     }
 
     internal fun convertNumberToTfOne(returnType: Class<*>, result: Number): Any {
@@ -253,4 +127,3 @@ object MossGrpcHook {
         }
     }
 }
-
