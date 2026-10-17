@@ -71,11 +71,11 @@ class StatsReceiver : BroadcastReceiver() {
 
         // 1. 严格鉴权：优先校验由 AMS 担保的 PendingIntent 来源包名；
         // 若在 Android 14+ / 沙箱多用户分身环境导致 creatorPackage 为 null，且广播定向给本包名，则进入 Payload 结构兜底鉴权
-        val authToken = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val authToken: PendingIntent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             runCatching { intent.getParcelableExtra(EXTRA_AUTH_TOKEN, PendingIntent::class.java) }.getOrNull()
         } else {
             @Suppress("DEPRECATION")
-            runCatching { intent.getParcelableExtra(EXTRA_AUTH_TOKEN) }.getOrNull()
+            runCatching { intent.getParcelableExtra<PendingIntent>(EXTRA_AUTH_TOKEN) }.getOrNull()
         }
 
         val creatorPackage = authToken?.creatorPackage
