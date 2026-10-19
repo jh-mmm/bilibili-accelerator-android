@@ -103,7 +103,9 @@ object PlayerHook {
                     if (rawList.isEmpty()) return@intercept chain.proceed()
 
                     val config = RemoteClient.fetchConfig()
-                    if (!config.enabled || !config.blockPcdn) return@intercept chain.proceed()
+                    if (!config.enabled || (!config.blockPcdn && !config.proxyMcdn && !config.forceUpos)) {
+                        return@intercept chain.proceed()
+                    }
 
                     val distinctFiltered = filterAndFillBackupUrls(rawList, config) { res ->
                         RemoteClient.notifyRewrite(res)

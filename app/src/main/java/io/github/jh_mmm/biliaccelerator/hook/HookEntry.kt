@@ -92,7 +92,13 @@ class HookEntry : XposedModule() {
 
         // 2. 目标应用：B站国内版、国际版、Bstar 等
         if (BiliAcceleratorCore.isTargetPackage(packageName)) {
-            Log.i(TAG, "Injecting into $packageName via LibXposed API 101")
+            val processName = RemoteClient.resolveProcessName()
+            if (!isRelevantProcess(packageName, processName)) {
+                Log.d(TAG, "Skipping non-player background process: $processName")
+                return
+            }
+
+            Log.i(TAG, "Injecting into $packageName (process=${processName ?: "main"}) via LibXposed API 101")
 
             // 尽早捕获 Application 实例，供统计上报（跨进程 ContentProvider 调用）使用
             captureApplicationContext(packageName, classLoader)

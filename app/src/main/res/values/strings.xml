@@ -54,7 +54,7 @@
     <string name="toast_diag_copied">诊断报告已复制到剪贴板！</string>
     <string name="toast_log_copied">日志信息已复制到剪贴板</string>
     <string name="speed_test_dialog_title">UPOS 镜像测速</string>
-    <string name="speed_test_testing_desc">正在并发探测各节点连接时延 (RTT)...</string>
+    <string name="speed_test_testing_desc">正在并发探测各节点 HTTPS 握手与首包响应时延...</string>
     <string name="speed_test_done_desc">测速完成。点击任意镜像线路可直接切换应用：</string>
     <string name="speed_test_retest">重新测速</string>
     <string name="speed_test_testing">测试中…</string>

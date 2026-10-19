@@ -1,6 +1,7 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
 import android.util.Log
+import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.libxposed.api.XposedModule
 import java.math.BigDecimal
 import java.math.BigInteger
@@ -38,7 +39,7 @@ object MossGrpcHook {
                     module.hook(method).intercept { chain ->
                         val config = RemoteClient.fetchConfig()
                         val result = chain.proceed()
-                        if (!config.enabled || !config.blockPcdn || result == null) {
+                        if (!shouldIntercept(config, result)) {
                             return@intercept result
                         }
 
@@ -74,22 +75,24 @@ object MossGrpcHook {
                         }
 
                         // 4. Protobuf Enum 返回类型
-                        try {
-                            val getNumber = result.javaClass.getMethod("getNumber")
-                            val currentNum = getNumber.invoke(result) as? Int
-                            if (currentNum == 0) {
-                                val forNumberMethod = try {
-                                    result.javaClass.getMethod("forNumber", Int::class.javaPrimitiveType)
-                                } catch (_: NoSuchMethodException) {
-                                    result.javaClass.getMethod("valueOf", Int::class.javaPrimitiveType)
+                        if (result != null) {
+                            try {
+                                val getNumber = result.javaClass.getMethod("getNumber")
+                                val currentNum = getNumber.invoke(result) as? Int
+                                if (currentNum == 0) {
+                                    val forNumberMethod = try {
+                                        result.javaClass.getMethod("forNumber", Int::class.javaPrimitiveType)
+                                    } catch (_: NoSuchMethodException) {
+                                        result.javaClass.getMethod("valueOf", Int::class.javaPrimitiveType)
+                                    }
+                                    val mirrorTf = forNumberMethod.invoke(null, 1)
+                                    if (mirrorTf != null) {
+                                        Log.i(TAG, "Injected TF=1 (protobuf enum: ${result.javaClass.simpleName}) to force official mirror CDN from server")
+                                        return@intercept mirrorTf
+                                    }
                                 }
-                                val mirrorTf = forNumberMethod.invoke(null, 1)
-                                if (mirrorTf != null) {
-                                    Log.i(TAG, "Injected TF=1 (protobuf enum: ${result.javaClass.simpleName}) to force official mirror CDN from server")
-                                    return@intercept mirrorTf
-                                }
-                            }
-                        } catch (_: Throwable) {}
+                            } catch (_: Throwable) {}
+                        }
 
                         result
                     }
@@ -111,6 +114,10 @@ object MossGrpcHook {
         } else {
             Log.i(TAG, "RuntimeHelper class not found, skipping Moss TF hook")
         }
+    }
+
+    internal fun shouldIntercept(config: AcceleratorConfig, result: Any?): Boolean {
+        return config.enabled && config.blockPcdn && config.enableMossHook && result != null
     }
 
     internal fun convertNumberToTfOne(returnType: Class<*>, result: Number): Any {

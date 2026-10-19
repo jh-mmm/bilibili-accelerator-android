@@ -1,5 +1,6 @@
 package io.github.jh_mmm.biliaccelerator.core
 
+import io.github.jh_mmm.biliaccelerator.hook.RemoteClient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -188,6 +189,23 @@ class BiliAcceleratorCoreTest {
         assertTrue(BiliAcceleratorCore.isTargetPackage("tv.danmaku.bili.pad"))
         assertTrue(BiliAcceleratorCore.isTargetPackage("com.bstar.intl.play"))
         assertFalse(BiliAcceleratorCore.isTargetPackage("com.example.other"))
+        assertFalse("Substring .bilibili. spoofing must be rejected", BiliAcceleratorCore.isTargetPackage("com.evil.bilibili.spoof"))
+        assertFalse("Substring biliaccelerator spoofing must be rejected", BiliAcceleratorCore.isTargetPackage("com.fake.biliaccelerator"))
+        assertFalse("Module package itself is not a target host package", BiliAcceleratorCore.isTargetPackage("io.github.jh_mmm.biliaccelerator"))
+    }
+
+    @Test
+    fun testSanitizeForIpcStripsSensitiveUrls() {
+        val original = "http://112.34.56.78:8080/upgcxcode/54/12/34567.m4s?mid=99999&upsig=secret"
+        val rewritten = BiliAcceleratorCore.rewriteUrl(original, defaultConfig)
+        val sanitized = RemoteClient.sanitizeForIpc(rewritten)
+
+        assertEquals("", sanitized.originalUrl)
+        assertEquals("", sanitized.finalUrl)
+        assertEquals(rewritten.originalHost, sanitized.originalHost)
+        assertEquals(rewritten.targetHost, sanitized.targetHost)
+        assertEquals(rewritten.reason, sanitized.reason)
+        assertEquals(rewritten.isPcdn, sanitized.isPcdn)
     }
 
     @Test

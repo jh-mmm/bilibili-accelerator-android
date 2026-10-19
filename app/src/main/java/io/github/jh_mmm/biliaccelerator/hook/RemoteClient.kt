@@ -177,8 +177,28 @@ object RemoteClient {
         }
     }
 
+    internal fun resolveProcessName(context: Context? = null): String? {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            runCatching { android.app.Application.getProcessName() }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { return it }
+        }
+        runCatching {
+            val activityThreadClass = Class.forName("android.app.ActivityThread")
+            val method = activityThreadClass.getDeclaredMethod("currentProcessName")
+            method.isAccessible = true
+            (method.invoke(null) as? String)?.takeIf { it.isNotBlank() }
+        }.getOrNull()?.let { return it }
+        return context?.packageName
+    }
+
     private fun sendHandshakeDirect(context: Context) {
         val pkgName = context.packageName
+        val procName = resolveProcessName(context) ?: pkgName
+        if (!HookEntry.isRelevantProcess(pkgName, procName)) {
+            return
+        }
         val pm = context.packageManager
         val pInfo = runCatching { pm.getPackageInfo(pkgName, 0) }.getOrNull()
         val verName = pInfo?.versionName ?: "unknown"
@@ -190,6 +210,7 @@ object RemoteClient {
             val extras = Bundle().apply {
                 putString(StatsProvider.EXTRA_CLIENT_PACKAGE, pkgName)
                 putString(StatsProvider.EXTRA_CLIENT_VERSION, verName)
+                putString(StatsProvider.EXTRA_CLIENT_PROCESS, procName)
                 putString(StatsProvider.EXTRA_HOOK_STATUS_JSON, hookSnapshotJson)
             }
             val res = context.contentResolver.call(
@@ -200,7 +221,7 @@ object RemoteClient {
             )
             if (res?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true) {
                 handshakeOk = true
-                Log.i(TAG, "Successfully sent handshake to module provider from $pkgName (v$verName)")
+                Log.i(TAG, "Successfully sent handshake to module provider from $pkgName ($procName, v$verName)")
             }
         } catch (t: Throwable) {
             Log.d(TAG, "sendHandshakeDirect via provider failed: ${t.message}")
@@ -224,11 +245,12 @@ object RemoteClient {
                     addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
                     putExtra(StatsReceiver.EXTRA_CLIENT_PACKAGE, pkgName)
                     putExtra(StatsReceiver.EXTRA_CLIENT_VERSION, verName)
+                    putExtra(StatsReceiver.EXTRA_CLIENT_PROCESS, procName)
                     putExtra(StatsReceiver.EXTRA_HOOK_STATUS_JSON, hookSnapshotJson)
                     putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, authToken)
                 }
                 context.sendBroadcast(intent)
-                Log.i(TAG, "Successfully sent handshake to module via broadcast fallback from $pkgName (v$verName)")
+                Log.i(TAG, "Successfully sent handshake to module via broadcast fallback from $pkgName ($procName, v$verName)")
             } catch (t: Throwable) {
                 Log.w(TAG, "sendHandshakeDirect via broadcast failed: ${t.message}")
             }
@@ -236,7 +258,7 @@ object RemoteClient {
     }
 
     fun notifyRewrite(result: RewriteResult) {
-        pendingBatch.offer(result)
+        pendingBatch.offer(sanitizeForIpc(result))
 
         if (pendingBatch.size >= BATCH_MAX_SIZE) {
             reportScheduler.execute { flushBatch() }
@@ -271,7 +293,7 @@ object RemoteClient {
         val batch = mutableListOf<RewriteResult>()
         while (batch.size < 50) {
             val item = pendingBatch.poll() ?: break
-            batch.add(item)
+            batch.add(sanitizeForIpc(item))
         }
         if (batch.isEmpty()) return
 
@@ -320,12 +342,14 @@ object RemoteClient {
                         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                     )
 
+                    val procName = resolveProcessName(context) ?: context.packageName
                     val intent = Intent(StatsReceiver.ACTION_RECORD_REWRITE).apply {
                         setPackage(BiliAcceleratorCore.MODULE_PACKAGE)
                         addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
                         putExtra(StatsReceiver.EXTRA_REWRITE_BATCH_JSON, json)
                         putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, authToken)
                         putExtra(StatsReceiver.EXTRA_CLIENT_PACKAGE, context.packageName)
+                        putExtra(StatsReceiver.EXTRA_CLIENT_PROCESS, procName)
                     }
                     context.sendBroadcast(intent)
                     Log.i(TAG, "[Broadcast] 备用通道批量发送成功 (${batch.size} 条重定向)")

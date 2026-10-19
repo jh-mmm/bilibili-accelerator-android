@@ -44,16 +44,16 @@ object BiliAcceleratorCore {
         "com.bilibili.comic"
     )
 
+    private val PACKAGE_NAME_REGEX = Regex("""^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$""")
+
     fun isTargetPackage(packageName: String?): Boolean {
         if (packageName.isNullOrBlank()) return false
         val p = packageName.trim().lowercase()
+        if (!PACKAGE_NAME_REGEX.matches(p)) return false
         if (TARGET_PACKAGES.contains(p)) return true
-        if (p == MODULE_PACKAGE.lowercase()) return true
-        return p.startsWith("tv.danmaku.bili") ||
+        return p.startsWith("tv.danmaku.bili.") ||
                 p.startsWith("com.bilibili.") ||
-                p.startsWith("com.bstar.") ||
-                p.contains(".bilibili.") ||
-                p.contains("biliaccelerator")
+                p.startsWith("com.bstar.")
     }
 
     val CANDIDATE_POOL = listOf(
@@ -429,6 +429,7 @@ object BiliAcceleratorCore {
         config: AcceleratorConfig,
         onRewrite: ((RewriteResult) -> Unit)? = null
     ): List<String> {
+        if (!config.enabled) return rawList.distinct()
         val target = config.targetHost
         val filtered = mutableListOf<String>()
 
@@ -437,7 +438,7 @@ object BiliAcceleratorCore {
             if (res.changed) {
                 onRewrite?.invoke(res)
                 filtered.add(res.finalUrl)
-            } else if (!res.isPcdn) {
+            } else if (!res.isPcdn || !config.blockPcdn) {
                 filtered.add(url)
             }
         }

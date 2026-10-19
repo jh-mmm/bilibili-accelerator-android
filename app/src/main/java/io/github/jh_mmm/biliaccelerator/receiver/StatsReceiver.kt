@@ -11,6 +11,7 @@ import com.google.gson.reflect.TypeToken
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
+import io.github.jh_mmm.biliaccelerator.provider.RewriteResultDto
 
 class StatsReceiver : BroadcastReceiver() {
 
@@ -28,21 +29,33 @@ class StatsReceiver : BroadcastReceiver() {
         private const val TAG = "BiliAccelerator-StatsReceiver"
         private val gson = Gson()
 
+        private val VALID_REASONS = setOf(
+            "szbdyd-source",
+            "mountaintoys-source",
+            "mcdn-proxy",
+            "pcdn-host",
+            "mcdn-host",
+            "force-upos",
+            "ok",
+            "already-proxied",
+            "live-skip"
+        )
+
         internal fun isPayloadLegitimate(batchJson: String?, singleJson: String?): Boolean {
             if (!batchJson.isNullOrEmpty()) {
                 return try {
-                    val listType = object : TypeToken<List<RewriteResult>>() {}.type
-                    val results: List<RewriteResult> = gson.fromJson(batchJson, listType) ?: return false
+                    val listType = object : TypeToken<List<RewriteResultDto>>() {}.type
+                    val results: List<RewriteResultDto> = gson.fromJson(batchJson, listType) ?: return false
                     if (results.isEmpty() || results.size > 200) return false
-                    results.all { isValidResultItem(it) }
+                    results.all { isValidResultItem(it.toDomain()) }
                 } catch (_: Throwable) {
                     false
                 }
             }
             if (!singleJson.isNullOrEmpty()) {
                 return try {
-                    val result: RewriteResult = gson.fromJson(singleJson, RewriteResult::class.java) ?: return false
-                    isValidResultItem(result)
+                    val result: RewriteResultDto = gson.fromJson(singleJson, RewriteResultDto::class.java) ?: return false
+                    isValidResultItem(result.toDomain())
                 } catch (_: Throwable) {
                     false
                 }
@@ -53,14 +66,14 @@ class StatsReceiver : BroadcastReceiver() {
         private fun isValidResultItem(item: RewriteResult): Boolean {
             val orig = item.originalHost.trim()
             val tgt = item.targetHost.trim()
-            return (orig.isNotBlank() || tgt.isNotBlank()) && (
-                    BiliAcceleratorCore.isBiliFamilyHost(orig) ||
-                            BiliAcceleratorCore.isBiliFamilyHost(tgt) ||
-                            BiliAcceleratorCore.CANDIDATE_POOL.contains(tgt) ||
-                            BiliAcceleratorCore.isIpAddress(orig) ||
-                            orig.contains("bili") || tgt.contains("bili") ||
-                            item.reason.isNotBlank()
-                    )
+            val reason = item.reason.trim()
+            if (orig.isBlank() || tgt.isBlank() || reason !in VALID_REASONS) {
+                return false
+            }
+            return BiliAcceleratorCore.isBiliFamilyHost(orig) ||
+                    BiliAcceleratorCore.isBiliFamilyHost(tgt) ||
+                    BiliAcceleratorCore.CANDIDATE_POOL.contains(tgt) ||
+                    BiliAcceleratorCore.isIpAddress(orig)
         }
     }
 
@@ -142,16 +155,18 @@ class StatsReceiver : BroadcastReceiver() {
         }
 
         val reportPkg = creatorPackage ?: intent.getStringExtra(EXTRA_CLIENT_PACKAGE)
+        val reportProc = intent.getStringExtra(EXTRA_CLIENT_PROCESS)?.trim()?.take(128)
 
         // 优先处理批量上报
         if (!batchJson.isNullOrEmpty()) {
             try {
-                val listType = object : TypeToken<List<RewriteResult>>() {}.type
-                val results: List<RewriteResult> = gson.fromJson(batchJson, listType)
+                val listType = object : TypeToken<List<RewriteResultDto>>() {}.type
+                val dtos: List<RewriteResultDto> = gson.fromJson(batchJson, listType)
+                val results = dtos.take(200).map { it.toDomain() }
                 StatsManager.recordRequests(results, context)
                 StatsManager.recordHeartbeat(context)
                 if (!reportPkg.isNullOrBlank()) {
-                    StatsManager.recordHandshake(pkg = reportPkg, version = null, process = null, context = context)
+                    StatsManager.recordHandshake(pkg = reportPkg, version = null, process = reportProc, context = context)
                 }
                 Log.i(TAG, "通过 Broadcast 成功记录批量重定向 (${results.size} 条)")
                 return
@@ -163,11 +178,12 @@ class StatsReceiver : BroadcastReceiver() {
         // 单条记录兜底兼容
         if (!singleJson.isNullOrEmpty()) {
             try {
-                val result = gson.fromJson(singleJson, RewriteResult::class.java)
+                val dto = gson.fromJson(singleJson, RewriteResultDto::class.java)
+                val result = dto.toDomain()
                 StatsManager.recordRequests(listOf(result), context)
                 StatsManager.recordHeartbeat(context)
                 if (!reportPkg.isNullOrBlank()) {
-                    StatsManager.recordHandshake(pkg = reportPkg, version = null, process = null, context = context)
+                    StatsManager.recordHandshake(pkg = reportPkg, version = null, process = reportProc, context = context)
                 }
                 Log.i(TAG, "通过 Broadcast 成功记录单条重定向: ${result.originalHost} -> ${result.targetHost}")
             } catch (e: Exception) {

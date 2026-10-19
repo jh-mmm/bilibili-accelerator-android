@@ -1,12 +1,37 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
+import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.math.BigDecimal
 import java.math.BigInteger
 
 class MossGrpcHookTest {
+
+    @Test
+    fun testShouldInterceptRespectsEnableMossHookToggle() {
+        val disabledByDefault = AcceleratorConfig(enabled = true, blockPcdn = true, enableMossHook = false)
+        assertFalse(
+            "MossGrpcHook must NOT intercept when enableMossHook is false",
+            MossGrpcHook.shouldIntercept(disabledByDefault, Any())
+        )
+
+        val enabledMoss = AcceleratorConfig(enabled = true, blockPcdn = true, enableMossHook = true)
+        assertTrue(
+            "MossGrpcHook should intercept when enabled, blockPcdn, and enableMossHook are all true",
+            MossGrpcHook.shouldIntercept(enabledMoss, Any())
+        )
+        assertFalse(
+            "MossGrpcHook must NOT intercept when result is null",
+            MossGrpcHook.shouldIntercept(enabledMoss, null)
+        )
+        assertFalse(
+            "MossGrpcHook must NOT intercept when blockPcdn is false",
+            MossGrpcHook.shouldIntercept(enabledMoss.copy(blockPcdn = false), Any())
+        )
+    }
 
     @Test
     fun testConvertNumberToTfOneFloat() {

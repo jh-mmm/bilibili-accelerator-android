@@ -15,9 +15,11 @@
 }
 
 # Keep models & data classes used in Gson serialization
--keep class io.github.jh_mmm.biliaccelerator.core.** { *; }
--keepclassmembers class io.github.jh_mmm.biliaccelerator.core.** { *; }
--keep class io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker$* { *; }
+-keep class io.github.jh_mmm.biliaccelerator.core.RewriteResult { *; }
+-keep class io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig { *; }
+-keep class io.github.jh_mmm.biliaccelerator.core.RewriteLogEntry { *; }
+-keep class io.github.jh_mmm.biliaccelerator.core.StatsSnapshot { *; }
+-keep class io.github.jh_mmm.biliaccelerator.provider.RewriteResultDto { *; }
 
 # Keep LibXposed API 101 entry point and module rules
 -keep public class * extends io.github.libxposed.api.XposedModule {
@@ -27,21 +29,13 @@
 -adaptresourcefilecontents META-INF/xposed/java_init.list
 -dontwarn io.github.libxposed.**
 
-# Keep Application and Receiver components
--keep class io.github.jh_mmm.biliaccelerator.BiliAcceleratorApp { *; }
--keep class io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver { *; }
-
-# Keep module hook implementations
--keep class io.github.jh_mmm.biliaccelerator.hook.** { *; }
-
-# Keep ContentProvider and UI components
--keep class io.github.jh_mmm.biliaccelerator.provider.** { *; }
--keep class io.github.jh_mmm.biliaccelerator.ui.** { *; }
-
-# Keep isModuleActive hooked via reflection in MainActivity
--keepclassmembers class io.github.jh_mmm.biliaccelerator.ui.MainActivity {
-    boolean isModuleActive();
+# Keep methods invoked via reflection in HookEntry self-check
+-keep class io.github.jh_mmm.biliaccelerator.core.StatsManager {
+    public static void markFrameworkSelfInjected();
+}
+-keep class io.github.jh_mmm.biliaccelerator.ui.MainActivity {
+    public static boolean isModuleActive();
 }
 -keepclassmembers class io.github.jh_mmm.biliaccelerator.ui.MainActivity$Companion {
-    boolean isModuleActive();
+    public boolean isModuleActive();
 }

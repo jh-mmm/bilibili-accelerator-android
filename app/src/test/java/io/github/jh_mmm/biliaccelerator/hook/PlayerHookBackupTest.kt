@@ -43,4 +43,24 @@ class PlayerHookBackupTest {
         assertTrue("Clean mirrorali must be preserved", distinctList.contains("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s"))
         assertTrue("PCDN IP must be rewritten to mirrorcos", distinctList.contains("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s"))
     }
+
+    @Test
+    fun testBackupUrlsWithBlockPcdnDisabledAndForceUposEnabled() {
+        val forceOnlyConfig = AcceleratorConfig(
+            enabled = true,
+            targetHost = "upos-sz-mirrorcos.bilivideo.com",
+            blockPcdn = false,
+            proxyMcdn = true,
+            forceUpos = true
+        )
+        val rawList = listOf(
+            "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s",
+            "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/34567.m4s?os=mcdn",
+            "http://112.34.56.78:8080/upgcxcode/54/12/34567.m4s"
+        )
+        val distinctList = PlayerHook.filterAndFillBackupUrls(rawList, forceOnlyConfig)
+        assertTrue("mirrorali should be rewritten to mirrorcos when forceUpos=true", distinctList.contains("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s"))
+        assertTrue("MCDN should be proxied when proxyMcdn=true", distinctList.any { it.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url=") })
+        assertTrue("PCDN URL should be preserved when blockPcdn=false", distinctList.contains("http://112.34.56.78:8080/upgcxcode/54/12/34567.m4s"))
+    }
 }

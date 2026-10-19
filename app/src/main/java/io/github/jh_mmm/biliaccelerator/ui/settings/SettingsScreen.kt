@@ -50,13 +50,14 @@ import androidx.compose.ui.res.stringResource
 import io.github.jh_mmm.biliaccelerator.R
 import io.github.jh_mmm.biliaccelerator.ui.theme.isAcceleratorDarkTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import java.net.InetSocketAddress
-import java.net.Socket
+import java.net.URL
+import javax.net.ssl.HttpsURLConnection
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.unit.Dp
@@ -550,41 +551,65 @@ private fun UposSpeedTestDialog(
 ) {
     val coroutineScope = rememberCoroutineScope()
     var isTestingAll by remember { mutableStateOf(false) }
+    var testJob by remember { mutableStateOf<Job?>(null) }
     var testStates by remember {
         mutableStateOf(uposValues.associateWith { host ->
             UposTestState(host = host, isTesting = false)
         })
     }
 
+    fun probeUposHostLatencyMs(host: String): Long {
+        val t0 = System.currentTimeMillis()
+        val conn = (URL("https://$host/crossdomain.xml").openConnection() as HttpsURLConnection).apply {
+            requestMethod = "HEAD"
+            connectTimeout = 2500
+            readTimeout = 2500
+            instanceFollowRedirects = false
+            useCaches = false
+            setRequestProperty("User-Agent", "Mozilla/5.0 BiliDroid/8.0.0 (bbcallen@gmail.com)")
+            setRequestProperty("Connection", "close")
+        }
+        try {
+            conn.connect()
+            val code = conn.responseCode
+            if (code !in 200..499) {
+                throw IllegalStateException("HTTP $code")
+            }
+            return (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+        } finally {
+            runCatching { conn.disconnect() }
+        }
+    }
+
     fun startSpeedTest() {
         if (isTestingAll) return
+        testJob?.cancel()
         isTestingAll = true
         testStates = uposValues.associateWith { host ->
             UposTestState(host = host, isTesting = true)
         }
-        coroutineScope.launch {
-            withContext(Dispatchers.IO) {
-                uposValues.map { host ->
-                    async {
-                        val result = runCatching {
-                            withTimeout(3000L) {
-                                val t0 = System.currentTimeMillis()
-                                Socket().use { socket ->
-                                    socket.connect(InetSocketAddress(host, 443), 2500)
+        testJob = coroutineScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    uposValues.map { host ->
+                        async {
+                            val result = runCatching {
+                                withTimeout(4500L) {
+                                    val cost = probeUposHostLatencyMs(host)
+                                    UposTestState(host = host, latencyMs = cost, isTesting = false)
                                 }
-                                val cost = System.currentTimeMillis() - t0
-                                UposTestState(host = host, latencyMs = cost, isTesting = false)
+                            }.getOrElse {
+                                UposTestState(host = host, latencyMs = null, isTesting = false, error = "超时/失败")
                             }
-                        }.getOrElse {
-                            UposTestState(host = host, latencyMs = null, isTesting = false, error = "超时/失败")
+                            withContext(Dispatchers.Main) {
+                                testStates = testStates + (host to result)
+                            }
                         }
-                        withContext(Dispatchers.Main) {
-                            testStates = testStates + (host to result)
-                        }
-                    }
-                }.awaitAll()
+                    }.awaitAll()
+                }
+            } finally {
+                isTestingAll = false
             }
-            isTestingAll = false
         }
     }
 
