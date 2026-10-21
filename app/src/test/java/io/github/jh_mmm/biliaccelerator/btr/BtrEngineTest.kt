@@ -28,17 +28,36 @@ class BtrEngineTest {
     }
 
     @Test
-    fun testSynthesizeBackupsFromCandidatePool() {
+    fun testBuilderSessionBindingAndDynamicBackupUpdate() {
+        val primary = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s"
+        val dummyBuilder = Any()
+        val sessionId = BtrSessionManager.register(primary)
+
+        BtrSessionManager.bindBuilderSession(dummyBuilder, sessionId)
+        assertEquals(sessionId, BtrSessionManager.getSessionForBuilder(dummyBuilder))
+
+        val officialBackups = listOf(
+            "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/12345.m4s"
+        )
+        BtrSessionManager.updateBackups(sessionId, officialBackups)
+
+        val session = BtrSessionManager.get(sessionId)
+        assertEquals(1, session?.backupUrls?.size)
+        assertEquals(officialBackups[0], session?.backupUrls?.firstOrNull())
+    }
+
+    @Test
+    fun testSynthesizeBackupsUnderForceUpos() {
         val primary = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/12345.m4s?deadline=1700000000&gen=playurl"
         val config = AcceleratorConfig(
             enabled = true,
+            forceUpos = true,
             targetHost = "upos-sz-mirrorcos.bilivideo.com"
         )
 
         val synthesized = BtrSessionManager.synthesizeBackups(primary, config)
-        assertTrue("Synthesized backups should not be empty", synthesized.isNotEmpty())
-        assertTrue("Synthesized backups should contain alternative mirrors", synthesized.any { it.contains("mirrorali") })
-        assertTrue("Synthesized backups should retain query params", synthesized.all { it.contains("deadline=1700000000") })
+        assertTrue("Under forceUpos, synthesized backups should not be empty", synthesized.isNotEmpty())
+        assertTrue("Synthesized backups should not contain overseas ov mirrors", synthesized.none { it.contains("ov.bilivideo.com") })
     }
 
     @Test

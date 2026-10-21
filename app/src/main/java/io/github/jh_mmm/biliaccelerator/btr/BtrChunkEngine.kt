@@ -23,8 +23,16 @@ object BtrChunkEngine {
     private const val TAG = "BiliAccelerator-BTR"
     private const val DEFAULT_CHUNK_SIZE = 512 * 1024L // 512 KB
     private const val MAX_PREFETCH_CHUNKS = 16          // 内存滑动窗口上限 (约 8MB~16MB，严格防 OOM)
+    private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36 BiliApp/7800300"
 
     private val cdnPenalties = ConcurrentHashMap<String, Long>()
+
+    init {
+        try {
+            System.setProperty("http.keepAlive", "true")
+            System.setProperty("http.maxConnections", "32")
+        } catch (_: Throwable) {}
+    }
 
     data class ChunkTask(
         val index: Long,
@@ -118,7 +126,13 @@ object BtrChunkEngine {
             val isPartial = requestedStart > 0 || actualEnd > 0
             val statusLine = if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n"
             val sb = StringBuilder(statusLine)
-            sb.append("Content-Type: video/mp4\r\n")
+            val contentType = probeResult.contentType
+                ?: if (session.primaryUrl.contains("audio") || session.primaryUrl.contains("sound")) {
+                    "audio/mp4"
+                } else {
+                    "video/mp4"
+                }
+            sb.append("Content-Type: $contentType\r\n")
             sb.append("Accept-Ranges: bytes\r\n")
             sb.append("Connection: keep-alive\r\n")
 
@@ -172,6 +186,7 @@ object BtrChunkEngine {
             val taskMap = ConcurrentHashMap<Long, ChunkTask>()
             val completionLock = Object()
             val isClientAborted = AtomicBoolean(false)
+            val deliveredIndex = AtomicLong(0L)
 
             val workerPool = Executors.newFixedThreadPool(concurrency.coerceIn(2, 12))
 
@@ -181,8 +196,7 @@ object BtrChunkEngine {
                     var dispatchIdx = 0
                     while (dispatchIdx < totalTasks && !isClientAborted.get()) {
                         // 背压控制：未交付分片超过最大预取窗口时挂起，防止 OOM
-                        var deliverIdx = 0L
-                        while (dispatchIdx - deliverIdx >= MAX_PREFETCH_CHUNKS && !isClientAborted.get()) {
+                        while (dispatchIdx - deliveredIndex.get() >= MAX_PREFETCH_CHUNKS && !isClientAborted.get()) {
                             try {
                                 Thread.sleep(15)
                             } catch (_: InterruptedException) {
@@ -226,10 +240,11 @@ object BtrChunkEngine {
                             clientOut.write(data)
                             clientOut.flush()
                         }
-                        // 及时置空，释放堆内存
+                        // 及时置空，释放堆内存并同步已交付游标
                         currentTask.data = null
                         taskMap.remove(nextDeliverIndex)
                         nextDeliverIndex++
+                        deliveredIndex.set(nextDeliverIndex)
                     } catch (e: SocketException) {
                         // 客户端断开连接 (例如用户拖动进度条 Seek 或切集)
                         Log.i(TAG, "Client disconnected (Seek or stop). Session=${session.sessionId}")
@@ -250,6 +265,7 @@ object BtrChunkEngine {
     private data class ProbeResult(
         val totalLength: Long,
         val contentLength: Long,
+        val contentType: String?,
         val firstChunkData: ByteArray?,
         val servingHost: String,
         val probeLatencyMs: Long
@@ -262,6 +278,7 @@ object BtrChunkEngine {
         chunkSize: Long
     ): ProbeResult? {
         val sortedUrls = sortUrlsByHealth(urls)
+        val ua = session.userAgent ?: DEFAULT_USER_AGENT
         for (url in sortedUrls) {
             val host = extractHostname(url)
             val startTime = System.currentTimeMillis()
@@ -274,7 +291,8 @@ object BtrChunkEngine {
                     instanceFollowRedirects = true
                     setRequestProperty("Range", "bytes=$startOffset-$endOffset")
                     setRequestProperty("Referer", session.referer)
-                    session.userAgent?.let { setRequestProperty("User-Agent", it) }
+                    setRequestProperty("User-Agent", ua)
+                    setRequestProperty("Connection", "keep-alive")
                 }
 
                 val code = conn.responseCode
@@ -282,10 +300,11 @@ object BtrChunkEngine {
                     val cr = conn.getHeaderField("Content-Range")
                     val total = cr?.substringAfterLast("/")?.trim()?.toLongOrNull() ?: -1L
                     val cl = conn.contentLengthLong
+                    val ct = conn.contentType?.takeIf { it.isNotBlank() }
 
                     val data = readInputStream(conn.inputStream, chunkSize.toInt())
                     val latency = System.currentTimeMillis() - startTime
-                    return ProbeResult(total, cl, data, host, latency)
+                    return ProbeResult(total, cl, ct, data, host, latency)
                 } else if (code == 403 || code >= 500) {
                     penalizeHost(host, 20_000L)
                     reportFailover(host, "HTTP $code 错误", session.sessionId)
@@ -307,7 +326,17 @@ object BtrChunkEngine {
         statsTracker: StreamStatsTracker
     ) {
         val sortedUrls = sortUrlsByHealth(urls)
-        for (url in sortedUrls) {
+        val healthyUrls = sortedUrls.filterNot { isPenalized(extractHostname(it)) }
+        val tryUrls = if (healthyUrls.isNotEmpty()) {
+            val startIndex = (task.index % healthyUrls.size).toInt()
+            healthyUrls.subList(startIndex, healthyUrls.size) + healthyUrls.subList(0, startIndex)
+        } else {
+            sortedUrls
+        }
+
+        val ua = session.userAgent ?: DEFAULT_USER_AGENT
+
+        for (url in tryUrls) {
             val host = extractHostname(url)
             if (isPenalized(host)) continue
 
@@ -320,7 +349,8 @@ object BtrChunkEngine {
                     instanceFollowRedirects = true
                     setRequestProperty("Range", "bytes=${task.startByte}-${task.endByte}")
                     setRequestProperty("Referer", session.referer)
-                    session.userAgent?.let { setRequestProperty("User-Agent", it) }
+                    setRequestProperty("User-Agent", ua)
+                    setRequestProperty("Connection", "keep-alive")
                 }
 
                 val code = conn.responseCode
@@ -358,6 +388,7 @@ object BtrChunkEngine {
     ) {
         val host = extractHostname(url)
         val startTime = System.currentTimeMillis()
+        val ua = session.userAgent ?: DEFAULT_USER_AGENT
         var conn: HttpURLConnection? = null
         try {
             conn = (URL(url).openConnection() as HttpURLConnection).apply {
@@ -366,7 +397,8 @@ object BtrChunkEngine {
                 instanceFollowRedirects = true
                 setRequestProperty("Range", "bytes=${task.startByte}-${task.endByte}")
                 setRequestProperty("Referer", session.referer)
-                session.userAgent?.let { setRequestProperty("User-Agent", it) }
+                setRequestProperty("User-Agent", ua)
+                setRequestProperty("Connection", "keep-alive")
             }
             if (conn.responseCode in 200..299) {
                 val expectedBytes = (task.endByte - task.startByte + 1).toInt()

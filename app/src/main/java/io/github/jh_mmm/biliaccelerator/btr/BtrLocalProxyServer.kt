@@ -103,6 +103,14 @@ object BtrLocalProxyServer {
                     return
                 }
 
+                // 动态透传播放器发来的真实 User-Agent 与 Referer，杜绝 Dalvik UA 触发 CDN 403 熔断
+                headers["user-agent"]?.let { ua ->
+                    if (ua.isNotBlank()) session.userAgent = ua
+                }
+                headers["referer"]?.let { ref ->
+                    if (ref.isNotBlank()) session.referer = ref
+                }
+
                 // 解析客户端的 Range 请求头: bytes=start-end
                 val rangeHeader = headers["range"]
                 val (rangeStart, rangeEnd) = parseRangeHeader(rangeHeader)
