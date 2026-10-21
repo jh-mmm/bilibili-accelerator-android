@@ -14,6 +14,7 @@ import java.net.URL
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -94,7 +95,7 @@ object BtrChunkEngine {
     ) {
         val chunkSize = (chunkSizeKb.coerceIn(128, 2048) * 1024).toLong()
         val candidateUrls = (listOf(session.primaryUrl) + session.backupUrls).distinct()
-        val primaryHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.extractHostname(session.primaryUrl))
+        val primaryHost = BiliAcceleratorCore.cleanHost(extractHostname(session.primaryUrl))
 
         val statsTracker = StreamStatsTracker(session.sessionId, primaryHost, concurrency, proxyPort)
 
@@ -170,7 +171,7 @@ object BtrChunkEngine {
             val totalTasks = chunkTasks.size
             val taskMap = ConcurrentHashMap<Long, ChunkTask>()
             val completionLock = Object()
-            @Volatile var isClientAborted = false
+            val isClientAborted = AtomicBoolean(false)
 
             val workerPool = Executors.newFixedThreadPool(concurrency.coerceIn(2, 12))
 
@@ -178,23 +179,23 @@ object BtrChunkEngine {
                 // 调度分发协作者
                 workerPool.execute {
                     var dispatchIdx = 0
-                    while (dispatchIdx < totalTasks && !isClientAborted) {
+                    while (dispatchIdx < totalTasks && !isClientAborted.get()) {
                         // 背压控制：未交付分片超过最大预取窗口时挂起，防止 OOM
                         var deliverIdx = 0L
-                        while (dispatchIdx - deliverIdx >= MAX_PREFETCH_CHUNKS && !isClientAborted) {
+                        while (dispatchIdx - deliverIdx >= MAX_PREFETCH_CHUNKS && !isClientAborted.get()) {
                             try {
                                 Thread.sleep(15)
                             } catch (_: InterruptedException) {
                                 break
                             }
                         }
-                        if (isClientAborted) break
+                        if (isClientAborted.get()) break
 
                         val task = chunkTasks[dispatchIdx]
                         taskMap[task.index] = task
 
                         workerPool.execute {
-                            if (!isClientAborted) {
+                            if (!isClientAborted.get()) {
                                 fetchChunkWithFailover(task, candidateUrls, session, statsTracker)
                                 synchronized(completionLock) {
                                     completionLock.notifyAll()
@@ -207,11 +208,11 @@ object BtrChunkEngine {
 
                 // 严格按序 (0, 1, 2...) 写出分片到客户端 Socket
                 var nextDeliverIndex = 0L
-                while (nextDeliverIndex < totalTasks && !isClientAborted) {
+                while (nextDeliverIndex < totalTasks && !isClientAborted.get()) {
                     val currentTask = taskMap[nextDeliverIndex]
                     if (currentTask == null || currentTask.data == null) {
                         synchronized(completionLock) {
-                            if (!isClientAborted && (taskMap[nextDeliverIndex]?.data == null)) {
+                            if (!isClientAborted.get() && (taskMap[nextDeliverIndex]?.data == null)) {
                                 completionLock.wait(400)
                             }
                         }
@@ -231,13 +232,13 @@ object BtrChunkEngine {
                         nextDeliverIndex++
                     } catch (e: SocketException) {
                         // 客户端断开连接 (例如用户拖动进度条 Seek 或切集)
-                        Log.i(TAG, "Client disconnected (Seek or stop). Session=$session.sessionId")
-                        isClientAborted = true
+                        Log.i(TAG, "Client disconnected (Seek or stop). Session=${session.sessionId}")
+                        isClientAborted.set(true)
                         break
                     }
                 }
             } finally {
-                isClientAborted = true
+                isClientAborted.set(true)
                 workerPool.shutdownNow()
                 taskMap.clear()
             }
@@ -262,7 +263,7 @@ object BtrChunkEngine {
     ): ProbeResult? {
         val sortedUrls = sortUrlsByHealth(urls)
         for (url in sortedUrls) {
-            val host = BiliAcceleratorCore.extractHostname(url)
+            val host = extractHostname(url)
             val startTime = System.currentTimeMillis()
             var conn: HttpURLConnection? = null
             try {
@@ -307,7 +308,7 @@ object BtrChunkEngine {
     ) {
         val sortedUrls = sortUrlsByHealth(urls)
         for (url in sortedUrls) {
-            val host = BiliAcceleratorCore.extractHostname(url)
+            val host = extractHostname(url)
             if (isPenalized(host)) continue
 
             val startTime = System.currentTimeMillis()
@@ -355,7 +356,7 @@ object BtrChunkEngine {
         session: BtrMediaSession,
         statsTracker: StreamStatsTracker
     ) {
-        val host = BiliAcceleratorCore.extractHostname(url)
+        val host = extractHostname(url)
         val startTime = System.currentTimeMillis()
         var conn: HttpURLConnection? = null
         try {
@@ -395,10 +396,16 @@ object BtrChunkEngine {
     private fun sortUrlsByHealth(urls: List<String>): List<String> {
         val now = System.currentTimeMillis()
         return urls.sortedBy { url ->
-            val host = BiliAcceleratorCore.extractHostname(url)
+            val host = extractHostname(url)
             val penaltyUntil = cdnPenalties[host] ?: 0L
             if (penaltyUntil > now) penaltyUntil - now else 0L
         }
+    }
+
+    private fun extractHostname(url: String): String {
+        return BiliAcceleratorCore.parseUri(url)?.host
+            ?: runCatching { java.net.URI(url).host }.getOrNull()
+            ?: ""
     }
 
     private fun penalizeHost(host: String, durationMs: Long) {
