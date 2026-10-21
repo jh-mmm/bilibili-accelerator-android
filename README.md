@@ -15,7 +15,8 @@
 
 * 拦截那些容易导致卡顿的 PCDN 节点和劣质节点，强制让视频从官方 CDN 服务器进行加载。
 * 对于其他劣质 PCDN 请求，直接重定向至优质 UPOS 镜像节点。
-* 配有数据可视化的实时统计面板
+* 支持 BTR 多线程并发 Range 切片调度加速（通过业务层 URL Hook + 本地回环代理实现），并发拉取分片按序交付播放器。
+* 配有数据可视化的实时统计面板。
 
 ---
 
@@ -81,7 +82,6 @@
 
 ```
 
-
 4. 编译成功后，在 `app/build/outputs/apk/release/` 目录下获取 `app-release.apk` 并安装。
 
 ---
@@ -90,4 +90,5 @@
 
 本项目基于 [MIT License](LICENSE) 许可协议开源。
 
-特别感谢上游项目 [realzza/bilibili-accelerator](https://github.com/realzza/bilibili-accelerator) 的原作者。本 Android 模块的核心逻辑架构与拦截规则均参考自该项目！
+* 特别感谢上游项目 [realzza/bilibili-accelerator](https://github.com/realzza/bilibili-accelerator) 的原作者。本 Android 模块的核心逻辑架构与拦截规则均参考自该项目！
+* 特别感谢 [MrTangLuyao/Bilibili-thread-ripper (BTR)](https://github.com/MrTangLuyao/Bilibili-thread-ripper) 项目。本模块在业务层通过 URL Hook + 本地回环代理进行多线程 Range 分片并发拉取（BTR 调度加速）的核心思路参考自该项目！

@@ -177,7 +177,30 @@ fun AboutScreen(
                     )
                 }
             }
+
+            // Group: 鸣谢与参考项目
+            item(key = "header-credits") {
+                PreferenceGroupTitle("鸣谢与参考项目")
+            }
+            item(key = "card-credits") {
+                PreferenceGroupCard {
+                    PreferenceActionItem(
+                        title = "realzza/bilibili-accelerator",
+                        summary = "上游网页端加速逻辑与拦截规则参考",
+                        icon = Icons.Outlined.OpenInNew,
+                        onClick = { openUrl("https://github.com/realzza/bilibili-accelerator") }
+                    )
+
+                    PreferenceDivider()
+
+                    PreferenceActionItem(
+                        title = "MrTangLuyao/Bilibili-thread-ripper",
+                        summary = "BTR 多线程并发 Range 切片调度思路参考",
+                        icon = Icons.Outlined.OpenInNew,
+                        onClick = { openUrl("https://github.com/MrTangLuyao/Bilibili-thread-ripper") }
+                    )
+                }
+            }
         }
     }
 }
-
