@@ -28,7 +28,7 @@ object BtrLocalProxyServer {
     }
 
     @Synchronized
-    fun start(concurrency: Int = 6, chunkSizeKb: Int = 512) {
+    fun start(concurrency: Int = 6, chunkSizeKb: Int = 512, autoConcurrency: Boolean = true, autoChunkSize: Boolean = true) {
         if (isRunning && port > 0) return
         try {
             // 绑定 127.0.0.1 回环地址，端口 0 由系统随机分配可用高位端口
@@ -43,7 +43,7 @@ object BtrLocalProxyServer {
                     try {
                         val client = ss.accept() ?: break
                         clientThreadPool.execute {
-                            handleClientSocket(client, concurrency, chunkSizeKb)
+                            handleClientSocket(client, concurrency, chunkSizeKb, autoConcurrency, autoChunkSize)
                         }
                     } catch (e: Exception) {
                         if (!isRunning) break
@@ -69,7 +69,7 @@ object BtrLocalProxyServer {
         port = -1
     }
 
-    private fun handleClientSocket(socket: Socket, concurrency: Int, chunkSizeKb: Int) {
+    private fun handleClientSocket(socket: Socket, concurrency: Int, chunkSizeKb: Int, autoConcurrency: Boolean, autoChunkSize: Boolean) {
         socket.use { s ->
             try {
                 s.soTimeout = 30_000
@@ -123,6 +123,8 @@ object BtrLocalProxyServer {
                     clientOut = out,
                     concurrency = concurrency,
                     chunkSizeKb = chunkSizeKb,
+                    autoConcurrency = autoConcurrency,
+                    autoChunkSize = autoChunkSize,
                     proxyPort = port
                 )
             } catch (_: Exception) {

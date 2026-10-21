@@ -587,6 +587,8 @@ private fun RewriteLogCard(
         log.reason.contains("熔断") || log.reason.contains("failover") -> "BTR 熔断" to TagBtrFailover
         log.isBtr || log.reason.contains("BTR") -> "BTR 并发" to TagBtr
         log.reason.contains("moss") -> "Moss 优化" to TagMoss
+        log.reason.contains("live") -> "直播优化" to TagSched
+        log.reason.contains("akamai") -> "Akamai" to TagUpos
         log.reason.contains("source") -> "线路调度" to TagSched
         log.isPcdn -> "PCDN 阻断" to TagPcdn
         log.isMcdn -> "MCDN 代理" to TagMcdn

@@ -38,7 +38,14 @@ class StatsReceiver : BroadcastReceiver() {
             "force-upos",
             "ok",
             "already-proxied",
-            "live-skip"
+            "live-skip",
+            "live-szbdyd-source",
+            "live-mountaintoys-source",
+            "live-pcdn-filter",
+            "live-pcdn-detected",
+            "live-ok",
+            "akamai-pass",
+            "akamai-redirect"
         )
 
         internal fun isPayloadLegitimate(batchJson: String?, singleJson: String?): Boolean {
@@ -67,8 +74,15 @@ class StatsReceiver : BroadcastReceiver() {
             val orig = item.originalHost.trim()
             val tgt = item.targetHost.trim()
             val reason = item.reason.trim()
-            if (orig.isBlank() || tgt.isBlank() || reason !in VALID_REASONS) {
+            val isKnownReason = reason in VALID_REASONS ||
+                    reason.startsWith("BTR") ||
+                    reason.startsWith("live-") ||
+                    reason.startsWith("akamai-")
+            if (orig.isBlank() || tgt.isBlank() || !isKnownReason) {
                 return false
+            }
+            if (item.isBtr || tgt.startsWith("127.0.0.1") || tgt.contains("BTR") || tgt.contains("镜像")) {
+                return true
             }
             return BiliAcceleratorCore.isBiliFamilyHost(orig) ||
                     BiliAcceleratorCore.isBiliFamilyHost(tgt) ||

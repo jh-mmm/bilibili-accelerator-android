@@ -111,7 +111,9 @@ class HookEntry : XposedModule() {
             if (config.enabled && config.enableBtr) {
                 io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.start(
                     concurrency = config.btrConcurrency,
-                    chunkSizeKb = config.btrChunkSizeKb
+                    chunkSizeKb = config.btrChunkSizeKb,
+                    autoConcurrency = config.btrAutoConcurrency,
+                    autoChunkSize = config.btrAutoChunkSize
                 )
                 if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
                     HookStatusTracker.recordStatus("btr_proxy", "127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")

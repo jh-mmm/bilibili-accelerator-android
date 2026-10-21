@@ -98,7 +98,7 @@ class BiliAcceleratorCoreTest {
         val result = BiliAcceleratorCore.rewriteUrl(liveUrl, defaultConfig)
 
         assertFalse("Live media should not be rewritten", result.changed)
-        assertEquals("live-skip", result.reason)
+        assertEquals("live-ok", result.reason)
     }
 
     @Test
@@ -172,7 +172,7 @@ class BiliAcceleratorCoreTest {
         for (url in livePatterns) {
             val result = BiliAcceleratorCore.rewriteUrl(url, defaultConfig)
             assertFalse("Live URL must be skipped: $url", result.changed)
-            assertEquals("live-skip", result.reason)
+            assertEquals("live-ok", result.reason)
         }
     }
 
@@ -190,7 +190,7 @@ class BiliAcceleratorCoreTest {
         assertTrue(BiliAcceleratorCore.isTargetPackage("com.bstar.intl.play"))
         assertFalse(BiliAcceleratorCore.isTargetPackage("com.example.other"))
         assertFalse("Substring .bilibili. spoofing must be rejected", BiliAcceleratorCore.isTargetPackage("com.evil.bilibili.spoof"))
-        assertFalse("Substring biliaccelerator spoofing must be rejected", BiliAcceleratorCore.isTargetPackage("com.fake.biliaccelerator"))
+        assertFalse("Substring biliaccelerator spoofing must be rejected", BiliAcceleratorCore.isTargetPackage("com.fake.bilibiliaccelerator"))
         assertFalse("Module package itself is not a target host package", BiliAcceleratorCore.isTargetPackage("io.github.jh_mmm.biliaccelerator"))
     }
 
@@ -213,5 +213,117 @@ class BiliAcceleratorCoreTest {
         assertEquals("upos-sz-mirrorali.bilivideo.com", BiliAcceleratorCore.cleanHost("//upos-sz-mirrorali.bilivideo.com/live/1.m4s"))
         assertEquals("upos-sz-mirrorali.bilivideo.com", BiliAcceleratorCore.cleanHost("https://upos-sz-mirrorali.bilivideo.com/live/1.m4s"))
         assertEquals("upos-sz-mirrorali.bilivideo.com", BiliAcceleratorCore.cleanHost("http://upos-sz-mirrorali.bilivideo.com/live/1.m4s"))
+    }
+
+    @Test
+    fun testLiveMediaPcdnDetectionAndRecovery() {
+        // 直播 PCDN 携带源站参数时恢复真源站
+        val liveWithSource = "http://xy123.szbdyd.com:8080/live-bvc/123/live.flv?xy_usource=d1--cn-gotcha01.bilivideo.com"
+        val resSource = BiliAcceleratorCore.rewriteUrl(liveWithSource, defaultConfig)
+        assertTrue("Live stream with source parameter should recover source", resSource.changed)
+        assertTrue(resSource.finalUrl.startsWith("https://d1--cn-gotcha01.bilivideo.com/live-bvc/123/live.flv"))
+        assertEquals("live-szbdyd-source", resSource.reason)
+
+        // 直播纯 PCDN 标记为 live-pcdn-detected
+        val livePcdn = "http://112.34.56.78:8080/live-bvc/123/live.flv?sign=abc"
+        val resPcdn = BiliAcceleratorCore.rewriteUrl(livePcdn, defaultConfig)
+        assertFalse("Live PCDN without source should not be arbitrarily rewritten to VOD host", resPcdn.changed)
+        assertEquals("live-pcdn-detected", resPcdn.reason)
+        assertTrue("isPcdn flag should be true", resPcdn.isPcdn)
+    }
+
+    @Test
+    fun testLiveFilterAndFillBackupUrls() {
+        val liveUrl = "https://d1--cn-gotcha01.bilivideo.com/live-bvc/123/live.flv"
+        val candidateBackups = listOf(
+            "https://d1--cn-gotcha02.bilivideo.com/live-bvc/123/live.flv",
+            "http://xy123.szbdyd.com:8080/live-bvc/123/live.flv",
+            "https://xy1.mcdn.bilivideo.cn/live-bvc/123/live.flv"
+        )
+        val filtered = BiliAcceleratorCore.filterAndFillBackupUrls(liveUrl, candidateBackups, defaultConfig)
+        assertEquals(1, filtered.size)
+        assertEquals("https://d1--cn-gotcha02.bilivideo.com/live-bvc/123/live.flv", filtered[0])
+    }
+
+    @Test
+    fun testMcdnStrategyVariants() {
+        val mcdnUrl = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/34567.m4s?os=mcdn"
+
+        // 1. proxy-all 策略
+        val resProxyAll = BiliAcceleratorCore.rewriteUrl(mcdnUrl, defaultConfig.copy(mcdnStrategy = "proxy-all"))
+        assertTrue(resProxyAll.changed)
+        assertTrue(resProxyAll.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
+        assertEquals("mcdn-proxy", resProxyAll.reason)
+
+        // 2. proxy-v1 策略
+        val resProxyV1 = BiliAcceleratorCore.rewriteUrl(mcdnUrl, defaultConfig.copy(mcdnStrategy = "proxy-v1"))
+        assertTrue(resProxyV1.changed)
+        assertTrue(resProxyV1.finalUrl.contains("mcdn.bilivideo.cn:8000") || resProxyV1.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
+        assertEquals("mcdn-proxy", resProxyV1.reason)
+
+        // 3. replace 策略（直接替换为目标 UPOS 镜像）
+        val resReplace = BiliAcceleratorCore.rewriteUrl(mcdnUrl, defaultConfig.copy(mcdnStrategy = "replace", targetHost = "upos-sz-mirrorcos.bilivideo.com"))
+        assertTrue(resReplace.changed)
+        assertEquals("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s?os=mcdn", resReplace.finalUrl)
+        assertEquals("mcdn-replace", resReplace.reason)
+
+        // 4. proxyMcdn = false 关闭 MCDN 处理
+        val resDisabled = BiliAcceleratorCore.rewriteUrl(mcdnUrl, defaultConfig.copy(proxyMcdn = false))
+        assertFalse(resDisabled.changed)
+        assertEquals("ok", resDisabled.reason)
+    }
+
+    @Test
+    fun testAkamaiHandling() {
+        val akamaiUrl = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/34567.m4s?token=xyz"
+
+        // rewriteAkamai = false 默认放行
+        val resPass = BiliAcceleratorCore.rewriteUrl(akamaiUrl, defaultConfig.copy(rewriteAkamai = false))
+        assertFalse("Akamai should pass through by default", resPass.changed)
+        assertEquals("akamai-pass", resPass.reason)
+
+        // rewriteAkamai = true 允许改写为 targetHost
+        val resRewrite = BiliAcceleratorCore.rewriteUrl(akamaiUrl, defaultConfig.copy(rewriteAkamai = true, targetHost = "upos-sz-mirrorcos.bilivideo.com"))
+        assertTrue("Akamai should be rewritten when enabled", resRewrite.changed)
+        assertEquals("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s?token=xyz", resRewrite.finalUrl)
+        assertEquals("force-upos", resRewrite.reason)
+    }
+
+    @Test
+    fun testAudioTrackDetection() {
+        assertTrue(BiliAcceleratorCore.isAudioTrack("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567-30280.m4s"))
+        assertTrue(BiliAcceleratorCore.isAudioTrack("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567-30216.m4s"))
+        assertTrue(BiliAcceleratorCore.isAudioTrack("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s?rep_id=30280&mid=123"))
+        assertFalse(BiliAcceleratorCore.isAudioTrack("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567-30080.m4s"))
+    }
+
+    @Test
+    fun testResolveTargetHostAkamaiSafety() {
+        // 如果用户配置的是 Akamai 域名或非法域名，resolveTargetHost 必须回退到安全的官方镜像
+        val host = BiliAcceleratorCore.resolveTargetHost("upos-hz-mirrorakam.akamaized.net")
+        assertFalse("Resolved target host must never be Akamai", BiliAcceleratorCore.isAkamaiHost(host))
+        assertEquals("upos-sz-mirrorcos.bilivideo.com", host)
+    }
+
+    @Test
+    fun testEffectiveCdnPoolBehavior() {
+        val defaultConfig = AcceleratorConfig()
+        val defaultPool = BiliAcceleratorCore.getEffectiveCdnPool(defaultConfig)
+        assertEquals(8, defaultPool.size)
+        assertTrue(defaultPool.contains("upos-sz-mirrorcos.bilivideo.com"))
+
+        // 用户自定义白名单过滤非法与 Akamai 节点，上限 32
+        val custom = listOf(
+            "upos-sz-mirrorali.bilivideo.com",
+            "upos-tf-all-hw.bilivideo.com",
+            "invalid domain name",
+            "upos-hz-mirrorakam.akamaized.net"
+        )
+        val customConfig = AcceleratorConfig(customCdnPool = custom)
+        val customEffective = BiliAcceleratorCore.getEffectiveCdnPool(customConfig)
+        assertEquals(2, customEffective.size)
+        assertTrue(customEffective.contains("upos-sz-mirrorali.bilivideo.com"))
+        assertTrue(customEffective.contains("upos-tf-all-hw.bilivideo.com"))
+        assertFalse(customEffective.contains("upos-hz-mirrorakam.akamaized.net"))
     }
 }

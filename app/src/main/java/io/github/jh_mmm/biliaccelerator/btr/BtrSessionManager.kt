@@ -14,6 +14,7 @@ data class BtrMediaSession(
     @Volatile var backupUrls: List<String>,
     @Volatile var userAgent: String?,
     @Volatile var referer: String = "https://www.bilibili.com/",
+    val isAudio: Boolean = false,
     val createdAt: Long = System.currentTimeMillis(),
     val lastAccessed: AtomicLong = AtomicLong(System.currentTimeMillis())
 )
@@ -32,15 +33,25 @@ object BtrSessionManager {
     fun register(
         primaryUrl: String,
         backupUrls: List<String> = emptyList(),
-        userAgent: String? = null
+        userAgent: String? = null,
+        isAudio: Boolean = false,
+        config: AcceleratorConfig? = null
     ): String {
         cleanupStaleSessions()
         val id = UUID.randomUUID().toString().replace("-", "").take(12)
+        val validBackups = backupUrls.filter { it.isNotBlank() && it != primaryUrl }.distinct()
+        // 若宿主未传入备用地址，自动合成兼容的官方同源 UPOS 镜像（优先支持用户自定义 CDN 白名单），确保多源 CDN 并发调度生效
+        val finalBackups = if (validBackups.isEmpty()) {
+            synthesizeCompatibleBackups(primaryUrl, config)
+        } else {
+            validBackups
+        }
         val session = BtrMediaSession(
             sessionId = id,
             primaryUrl = primaryUrl,
-            backupUrls = backupUrls.filter { it.isNotBlank() && it != primaryUrl }.distinct(),
-            userAgent = userAgent
+            backupUrls = finalBackups,
+            userAgent = userAgent,
+            isAudio = isAudio
         )
         sessions[id] = session
         latestSessionId = id
@@ -88,6 +99,45 @@ object BtrSessionManager {
 
     private fun extractComparablePath(url: String): String {
         return BiliAcceleratorCore.parseUri(url)?.path ?: ""
+    }
+
+    /**
+     * 安全合成同源通用 UPOS 备用节点：
+     * 当宿主未提供 backupUrls 时，在同组通用 UPOS 节点（cos / ali / hw / tx）之间安全互换，
+     * 排除必须使用专属鉴权的 Akamai 及海外私有 ov 节点，彻底杜绝 403 熔断并实现多 CDN 聚合并发拉取。
+     */
+    fun synthesizeCompatibleBackups(primaryUrl: String, config: AcceleratorConfig? = null): List<String> {
+        val results = mutableListOf<String>()
+        val uri = BiliAcceleratorCore.parseUri(primaryUrl) ?: return emptyList()
+        val path = uri.path
+        if (!path.contains("/upgcxcode/")) return emptyList()
+
+        val host = uri.host.lowercase()
+        if (host.endsWith(".akamaized.net") || host.contains("ov.bilivideo.com")) {
+            return emptyList()
+        }
+
+        val candidateList = if (config != null) {
+            BiliAcceleratorCore.getEffectiveCdnPool(config)
+        } else {
+            listOf(
+                "upos-sz-mirrorcos.bilivideo.com",
+                "upos-sz-mirrorali.bilivideo.com",
+                "upos-sz-mirrorhw.bilivideo.com",
+                "upos-tf-all-tx.bilivideo.com",
+                "upos-tf-all-hw.bilivideo.com"
+            )
+        }
+
+        for (m in candidateList) {
+            val cleanM = BiliAcceleratorCore.cleanHost(m).lowercase()
+            // 排除与主域名相同、Akamai 专属鉴权、以及海外带区域鉴权的 ov 节点
+            if (cleanM != host && !cleanM.endsWith(".akamaized.net") && !cleanM.contains("ov.bilivideo.com")) {
+                results.add(uri.replaceAuthority(cleanM))
+                if (results.size >= 3) break
+            }
+        }
+        return results
     }
 
     /**

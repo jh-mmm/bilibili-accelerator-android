@@ -86,12 +86,17 @@ class StatsProvider : ContentProvider() {
         const val KEY_PROXY_HOST = "cfg_proxy_host"
         const val KEY_BLOCK_PCDN = "cfg_block_pcdn"
         const val KEY_PROXY_MCDN = "cfg_proxy_mcdn"
+        const val KEY_MCDN_STRATEGY = "cfg_mcdn_strategy"
         const val KEY_FORCE_UPOS = "cfg_force_upos"
+        const val KEY_REWRITE_AKAMAI = "cfg_rewrite_akamai"
         const val KEY_PORT_HEURISTIC = "cfg_port_heuristic"
         const val KEY_ENABLE_MOSS_HOOK = "cfg_enable_moss_hook"
         const val KEY_ENABLE_BTR = "cfg_enable_btr"
+        const val KEY_BTR_AUTO_CONCURRENCY = "cfg_btr_auto_concurrency"
         const val KEY_BTR_CONCURRENCY = "cfg_btr_concurrency"
+        const val KEY_BTR_AUTO_CHUNK_SIZE = "cfg_btr_auto_chunk_size"
         const val KEY_BTR_CHUNK_SIZE_KB = "cfg_btr_chunk_size_kb"
+        const val KEY_CUSTOM_CDN_POOL = "cfg_custom_cdn_pool"
 
         private val gson = Gson()
 
@@ -127,18 +132,33 @@ class StatsProvider : ContentProvider() {
 
         fun loadConfig(context: Context): AcceleratorConfig {
             val sp = context.getSharedPreferences(PREFS_CONFIG, Context.MODE_PRIVATE)
+            val customCdnJson = sp.getString(KEY_CUSTOM_CDN_POOL, null)
+            val customPool: List<String> = if (!customCdnJson.isNullOrBlank()) {
+                runCatching {
+                    val type = object : TypeToken<List<String>>() {}.type
+                    gson.fromJson<List<String>>(customCdnJson, type)
+                }.getOrDefault(emptyList())
+            } else {
+                emptyList()
+            }
+
             return AcceleratorConfig(
                 enabled = sp.getBoolean(KEY_ENABLED, true),
                 targetHost = sp.getString(KEY_TARGET_HOST, "upos-sz-mirrorcos.bilivideo.com") ?: "upos-sz-mirrorcos.bilivideo.com",
                 proxyHost = sp.getString(KEY_PROXY_HOST, "proxy-tf-all-ws.bilivideo.com") ?: "proxy-tf-all-ws.bilivideo.com",
                 blockPcdn = sp.getBoolean(KEY_BLOCK_PCDN, true),
                 proxyMcdn = sp.getBoolean(KEY_PROXY_MCDN, true),
+                mcdnStrategy = sp.getString(KEY_MCDN_STRATEGY, "proxy-all") ?: "proxy-all",
                 forceUpos = sp.getBoolean(KEY_FORCE_UPOS, false),
+                rewriteAkamai = sp.getBoolean(KEY_REWRITE_AKAMAI, false),
                 portHeuristic = sp.getBoolean(KEY_PORT_HEURISTIC, true),
                 enableMossHook = sp.getBoolean(KEY_ENABLE_MOSS_HOOK, false),
                 enableBtr = sp.getBoolean(KEY_ENABLE_BTR, true),
+                btrAutoConcurrency = sp.getBoolean(KEY_BTR_AUTO_CONCURRENCY, true),
                 btrConcurrency = sp.getInt(KEY_BTR_CONCURRENCY, 6),
-                btrChunkSizeKb = sp.getInt(KEY_BTR_CHUNK_SIZE_KB, 512)
+                btrAutoChunkSize = sp.getBoolean(KEY_BTR_AUTO_CHUNK_SIZE, true),
+                btrChunkSizeKb = sp.getInt(KEY_BTR_CHUNK_SIZE_KB, 512),
+                customCdnPool = customPool
             )
         }
 
@@ -150,12 +170,17 @@ class StatsProvider : ContentProvider() {
                 .putString(KEY_PROXY_HOST, config.proxyHost)
                 .putBoolean(KEY_BLOCK_PCDN, config.blockPcdn)
                 .putBoolean(KEY_PROXY_MCDN, config.proxyMcdn)
+                .putString(KEY_MCDN_STRATEGY, config.mcdnStrategy)
                 .putBoolean(KEY_FORCE_UPOS, config.forceUpos)
+                .putBoolean(KEY_REWRITE_AKAMAI, config.rewriteAkamai)
                 .putBoolean(KEY_PORT_HEURISTIC, config.portHeuristic)
                 .putBoolean(KEY_ENABLE_MOSS_HOOK, config.enableMossHook)
                 .putBoolean(KEY_ENABLE_BTR, config.enableBtr)
+                .putBoolean(KEY_BTR_AUTO_CONCURRENCY, config.btrAutoConcurrency)
                 .putInt(KEY_BTR_CONCURRENCY, config.btrConcurrency)
+                .putBoolean(KEY_BTR_AUTO_CHUNK_SIZE, config.btrAutoChunkSize)
                 .putInt(KEY_BTR_CHUNK_SIZE_KB, config.btrChunkSizeKb)
+                .putString(KEY_CUSTOM_CDN_POOL, gson.toJson(config.customCdnPool))
                 .apply()
             runCatching {
                 context.contentResolver.notifyChange(CONTENT_URI, null)

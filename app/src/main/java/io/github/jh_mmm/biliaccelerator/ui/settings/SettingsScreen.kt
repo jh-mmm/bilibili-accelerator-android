@@ -93,6 +93,10 @@ fun SettingsScreen(
     var showUposDialog by rememberSaveable { mutableStateOf(false) }
     var showSpeedTestDialog by rememberSaveable { mutableStateOf(false) }
     var showProxyHostDialog by rememberSaveable { mutableStateOf(false) }
+    var showMcdnStrategyDialog by rememberSaveable { mutableStateOf(false) }
+    var showConcurrencyDialog by rememberSaveable { mutableStateOf(false) }
+    var showChunkSizeDialog by rememberSaveable { mutableStateOf(false) }
+    var showCdnPoolDialog by rememberSaveable { mutableStateOf(false) }
     var showStyleDialog by rememberSaveable { mutableStateOf(false) }
     var showThemeModeDialog by rememberSaveable { mutableStateOf(false) }
     var showConfirmClearDialog by rememberSaveable { mutableStateOf(false) }
@@ -135,6 +139,54 @@ fun SettingsScreen(
                 showProxyHostDialog = false
             },
             onDismiss = { showProxyHostDialog = false }
+        )
+    }
+
+    // Dialog 1.6: Select MCDN Strategy
+    if (showMcdnStrategyDialog) {
+        McdnStrategyDialog(
+            currentStrategy = config.mcdnStrategy,
+            onSelect = { newStrategy ->
+                onConfigChange(config.copy(mcdnStrategy = newStrategy))
+                showMcdnStrategyDialog = false
+            },
+            onDismiss = { showMcdnStrategyDialog = false }
+        )
+    }
+
+    // Dialog 1.7: Select BTR Concurrency
+    if (showConcurrencyDialog) {
+        ConcurrencyDialog(
+            currentConcurrency = config.btrConcurrency,
+            onSelect = { newConcurrency ->
+                onConfigChange(config.copy(btrConcurrency = newConcurrency))
+                showConcurrencyDialog = false
+            },
+            onDismiss = { showConcurrencyDialog = false }
+        )
+    }
+
+    // Dialog 1.8: Select BTR Chunk Size
+    if (showChunkSizeDialog) {
+        ChunkSizeDialog(
+            currentChunkSizeKb = config.btrChunkSizeKb,
+            onSelect = { newSize ->
+                onConfigChange(config.copy(btrChunkSizeKb = newSize))
+                showChunkSizeDialog = false
+            },
+            onDismiss = { showChunkSizeDialog = false }
+        )
+    }
+
+    // Dialog 1.9: Custom CDN Pool
+    if (showCdnPoolDialog) {
+        CustomCdnPoolDialog(
+            currentPool = config.customCdnPool,
+            onSavePool = { newPool ->
+                onConfigChange(config.copy(customCdnPool = newPool))
+                showCdnPoolDialog = false
+            },
+            onDismiss = { showCdnPoolDialog = false }
         )
     }
 
@@ -299,6 +351,33 @@ fun SettingsScreen(
 
                     PreferenceDivider()
 
+                    val currentMcdnStrategyLabel = when (config.mcdnStrategy.lowercase()) {
+                        "proxy-all" -> "中继全部 (proxy-all)"
+                        "proxy-v1" -> "仅中继资源 (/v1/resource/)"
+                        "replace" -> "直接替换为 UPOS (replace)"
+                        else -> config.mcdnStrategy
+                    }
+
+                    PreferenceDropdownItem(
+                        title = "MCDN 调度策略",
+                        summary = "当前策略: $currentMcdnStrategyLabel",
+                        selectedValue = currentMcdnStrategyLabel.substringBefore(" ("),
+                        onClick = { showMcdnStrategyDialog = true },
+                        enabled = config.enabled && config.proxyMcdn
+                    )
+
+                    PreferenceDivider()
+
+                    PreferenceSwitchItem(
+                        title = "改写 Akamai 官方节点",
+                        summary = "默认放行官方 Akamai 线路；开启后将其重定向至首选 UPOS 镜像（适合当地 Akamai 连接较慢的情况）",
+                        checked = config.rewriteAkamai,
+                        onCheckedChange = { onConfigChange(config.copy(rewriteAkamai = it)) },
+                        enabled = config.enabled
+                    )
+
+                    PreferenceDivider()
+
                     PreferenceSwitchItem(
                         title = stringResource(R.string.label_port_heuristic),
                         summary = stringResource(R.string.summary_port_heuristic),
@@ -321,10 +400,79 @@ fun SettingsScreen(
 
                     PreferenceSwitchItem(
                         title = "BTR 多线程并发切片加速",
-                        summary = "通过本地回环代理并发拉取 Range 分片并执行多 CDN 竞速调度 (已开启 ${config.btrConcurrency} 线程并发)",
+                        summary = "通过本地回环代理并发拉取 Range 分片并执行多源 CDN 智能调度",
                         checked = config.enableBtr,
                         onCheckedChange = { onConfigChange(config.copy(enableBtr = it)) },
                         enabled = config.enabled
+                    )
+
+                    PreferenceDivider()
+
+                    PreferenceSwitchItem(
+                        title = "BTR 自动动态线程调节",
+                        summary = "智能感知播放缓冲状态，开播与Seek时高并发冲刺充填缓冲，稳定后回落以降低功耗",
+                        checked = config.btrAutoConcurrency,
+                        onCheckedChange = { onConfigChange(config.copy(btrAutoConcurrency = it)) },
+                        enabled = config.enabled && config.enableBtr
+                    )
+
+                    PreferenceDivider()
+
+                    val concurrencySummary = if (config.btrAutoConcurrency) {
+                        "基准 / 冲刺上限: ${config.btrConcurrency} 线程 (自动动态调节中)"
+                    } else {
+                        "固定并发: ${config.btrConcurrency} 线程"
+                    }
+
+                    PreferenceDropdownItem(
+                        title = "BTR 并发线程数",
+                        summary = concurrencySummary,
+                        selectedValue = "${config.btrConcurrency} 线程",
+                        onClick = { showConcurrencyDialog = true },
+                        enabled = config.enabled && config.enableBtr
+                    )
+
+                    PreferenceDivider()
+
+                    val effectivePool = BiliAcceleratorCore.getEffectiveCdnPool(config)
+                    val poolSummary = if (config.customCdnPool.isEmpty()) {
+                        "默认官方 8 节点并发 (点击自定义配置，支持最多 32 个)"
+                    } else {
+                        "已配置 ${effectivePool.size} 个白名单并发镜像 (点击管理列表)"
+                    }
+
+                    PreferenceDropdownItem(
+                        title = "并发 CDN 节点池",
+                        summary = poolSummary,
+                        selectedValue = "${effectivePool.size} 个节点",
+                        onClick = { showCdnPoolDialog = true },
+                        enabled = config.enabled && config.enableBtr
+                    )
+
+                    PreferenceDivider()
+
+                    PreferenceSwitchItem(
+                        title = "BTR 自适应切片尺寸",
+                        summary = "根据视频体积与清晰度在 256KB~2MB 动态匹配切片大小，兼顾秒开与高码率吞吐",
+                        checked = config.btrAutoChunkSize,
+                        onCheckedChange = { onConfigChange(config.copy(btrAutoChunkSize = it)) },
+                        enabled = config.enabled && config.enableBtr
+                    )
+
+                    PreferenceDivider()
+
+                    val chunkSizeSummary = if (config.btrAutoChunkSize) {
+                        "基准: ${config.btrChunkSizeKb} KB (自适应动态调节中)"
+                    } else {
+                        "固定分片大小: ${config.btrChunkSizeKb} KB"
+                    }
+
+                    PreferenceDropdownItem(
+                        title = "基准分片大小",
+                        summary = chunkSizeSummary,
+                        selectedValue = "${config.btrChunkSizeKb} KB",
+                        onClick = { showChunkSizeDialog = true },
+                        enabled = config.enabled && config.enableBtr
                     )
                 }
             }
@@ -787,3 +935,362 @@ private fun UposSpeedTestDialog(
     )
 }
 
+@Composable
+private fun McdnStrategyDialog(
+    currentStrategy: String,
+    onSelect: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val strategies = listOf(
+        "proxy-all" to ("中继代理全部 (默认推荐)" to "通过云厂商官方 CDN 中继所有 MCDN 节点"),
+        "proxy-v1" to ("仅中继资源接口 (/v1/resource/)" to "仅对资源接口走中继代理，常规视频流直接转为主 UPOS 镜像"),
+        "replace" to ("直接替换为 UPOS 镜像" to "不经中继代理，全量重定向至首选 UPOS 镜像")
+    )
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("MCDN 调度策略") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                strategies.forEach { (key, info) ->
+                    val (label, desc) = info
+                    val isSelected = key.equals(currentStrategy, ignoreCase = true)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .selectable(
+                                selected = isSelected,
+                                onClick = { onSelect(key) }
+                            )
+                            .padding(vertical = 10.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = isSelected,
+                            onClick = { onSelect(key) }
+                        )
+                        Column(modifier = Modifier.padding(start = 8.dp)) {
+                            Text(text = label, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                text = desc,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("关闭")
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+
+@Composable
+private fun ConcurrencyDialog(
+    currentConcurrency: Int,
+    onSelect: (Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val options = listOf(2, 4, 6, 8, 10, 12, 16)
+    var selectedValue by rememberSaveable { mutableStateOf(currentConcurrency) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("BTR 并发线程数设置") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = "当前选择: $selectedValue 线程",
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(bottom = 12.dp)
+                )
+
+                options.forEach { threads ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .selectable(
+                                selected = (threads == selectedValue),
+                                onClick = { selectedValue = threads }
+                            )
+                            .padding(vertical = 8.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = (threads == selectedValue),
+                            onClick = { selectedValue = threads }
+                        )
+                        val desc = when (threads) {
+                            2 -> "2 线程 (超低功耗/弱网推荐)"
+                            4 -> "4 线程 (平稳省电)"
+                            6 -> "6 线程 (默认均衡)"
+                            8 -> "8 线程 (高速流畅)"
+                            12 -> "12 线程 (4K/高码率推荐)"
+                            16 -> "16 线程 (极限冲峰)"
+                            else -> "$threads 线程"
+                        }
+                        Text(
+                            text = desc,
+                            fontSize = 14.sp,
+                            modifier = Modifier.padding(start = 8.dp)
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                onSelect(selectedValue)
+                onDismiss()
+            }) {
+                Text("确定")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("取消")
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+
+
+@Composable
+private fun ChunkSizeDialog(
+    currentChunkSizeKb: Int,
+    onSelect: (Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val options = listOf(256, 512, 1024, 2048)
+    var selectedValue by rememberSaveable { mutableStateOf(currentChunkSizeKb) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("基准分片大小设置") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = "当前选择: $selectedValue KB",
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(bottom = 12.dp)
+                )
+
+                options.forEach { sizeKb ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .selectable(
+                                selected = (sizeKb == selectedValue),
+                                onClick = { selectedValue = sizeKb }
+                            )
+                            .padding(vertical = 8.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = (sizeKb == selectedValue),
+                            onClick = { selectedValue = sizeKb }
+                        )
+                        val desc = when (sizeKb) {
+                            256 -> "256 KB (低码率/秒开优化)"
+                            512 -> "512 KB (标准均衡推荐)"
+                            1024 -> "1024 KB (1 MB · 适合高码率)"
+                            2048 -> "2048 KB (2 MB · 适合4K长视频)"
+                            else -> "$sizeKb KB"
+                        }
+                        Text(
+                            text = desc,
+                            fontSize = 14.sp,
+                            modifier = Modifier.padding(start = 8.dp)
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                onSelect(selectedValue)
+                onDismiss()
+            }) {
+                Text("确定")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("取消")
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+
+@Composable
+private fun CustomCdnPoolDialog(
+    currentPool: List<String>,
+    onSavePool: (List<String>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var poolList by rememberSaveable {
+        mutableStateOf(
+            if (currentPool.isNotEmpty()) currentPool else BiliAcceleratorCore.DEFAULT_CDN_POOL
+        )
+    }
+    var inputHost by rememberSaveable { mutableStateOf("") }
+    var inputError by rememberSaveable { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column {
+                Text("自定义并发 CDN 节点池")
+                Text(
+                    text = "支持配置最多 32 个并发拉取镜像（已配置 ${poolList.size} 个）",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = inputHost,
+                        onValueChange = {
+                            inputHost = it
+                            inputError = null
+                        },
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("例: upos-sz-mirrorali.bilivideo.com", fontSize = 11.sp) },
+                        singleLine = true,
+                        isError = inputError != null
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    TextButton(
+                        onClick = {
+                            val clean = BiliAcceleratorCore.cleanHost(inputHost).lowercase()
+                            val hostOnly = clean.substringBefore(':')
+                            if (clean.isBlank()) {
+                                inputError = "请输入域名"
+                            } else if (!BiliAcceleratorCore.isValidHost(hostOnly)) {
+                                inputError = "域名格式不合法"
+                            } else if (BiliAcceleratorCore.isAkamaiHost(hostOnly)) {
+                                inputError = "Akamai 专属鉴权节点不可作为并发镜像"
+                            } else if (poolList.contains(hostOnly)) {
+                                inputError = "节点已存在"
+                            } else if (poolList.size >= 32) {
+                                inputError = "最多支持 32 个节点"
+                            } else {
+                                poolList = poolList + hostOnly
+                                inputHost = ""
+                                inputError = null
+                            }
+                        }
+                    ) {
+                        Text("添加")
+                    }
+                }
+
+                if (inputError != null) {
+                    Text(
+                        text = inputError!!,
+                        color = MaterialTheme.colorScheme.error,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(bottom = 8.dp, start = 4.dp)
+                    )
+                }
+
+                poolList.forEachIndexed { index, host ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 3.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = host,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Icon(
+                            imageVector = Icons.Outlined.Delete,
+                            contentDescription = "删除节点",
+                            tint = TagPcdn,
+                            modifier = Modifier
+                                .size(20.dp)
+                                .clickable {
+                                    poolList = poolList.filterIndexed { i, _ -> i != index }
+                                }
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        onClick = {
+                            poolList = BiliAcceleratorCore.DEFAULT_CDN_POOL
+                            inputError = null
+                        }
+                    ) {
+                        Text("恢复默认官方节点", fontSize = 12.sp)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    onSavePool(poolList)
+                    onDismiss()
+                }
+            ) {
+                Text("保存")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("取消")
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}

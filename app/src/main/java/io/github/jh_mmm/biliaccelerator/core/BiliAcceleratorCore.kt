@@ -30,12 +30,17 @@ data class AcceleratorConfig(
     val proxyHost: String = "proxy-tf-all-ws.bilivideo.com",
     val blockPcdn: Boolean = true,
     val proxyMcdn: Boolean = true,
+    val mcdnStrategy: String = "proxy-all", // proxy-all | proxy-v1 | replace
     val forceUpos: Boolean = false,
+    val rewriteAkamai: Boolean = false,
     val portHeuristic: Boolean = true,
     val enableMossHook: Boolean = false,
     val enableBtr: Boolean = true,
+    val btrAutoConcurrency: Boolean = true,
     val btrConcurrency: Int = 6,
-    val btrChunkSizeKb: Int = 512
+    val btrAutoChunkSize: Boolean = true,
+    val btrChunkSizeKb: Int = 512,
+    val customCdnPool: List<String> = emptyList()
 )
 
 object BiliAcceleratorCore {
@@ -75,6 +80,16 @@ object BiliAcceleratorCore {
         "upos-sz-mirroraliov.bilivideo.com",
         "upos-sz-mirrorhwov.bilivideo.com"
     )
+
+    val DEFAULT_CDN_POOL = CANDIDATE_POOL
+
+    fun getEffectiveCdnPool(config: AcceleratorConfig): List<String> {
+        val userList = config.customCdnPool
+            .map { cleanHost(it).lowercase() }
+            .filter { isValidHost(it) && !isAkamaiHost(it) }
+            .distinct()
+        return if (userList.isNotEmpty()) userList.take(32) else DEFAULT_CDN_POOL
+    }
 
     private val HOSTNAME_REGEX = Regex("""^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(:[0-9]{1,5})?$""")
     private val MEDIA_PATH_REGEX = Regex("""\.(m4s|mp4|flv|m3u8)(?:$|[?#])""", RegexOption.IGNORE_CASE)
@@ -182,6 +197,11 @@ object BiliAcceleratorCore {
         return hostname.endsWith(".mcdn.bilivideo.cn", ignoreCase = true) ||
                 hostname.endsWith(".mcdn.bilivideo.com", ignoreCase = true) ||
                 hostname.endsWith(".mcdn.bilivideo.net", ignoreCase = true)
+    }
+
+    fun isAkamaiHost(hostname: String): Boolean {
+        val h = cleanHost(hostname).lowercase().substringBefore(':')
+        return h.endsWith(".akamaized.net")
     }
 
     fun isBiliAkamaiHost(hostname: String): Boolean {
@@ -310,6 +330,44 @@ object BiliAcceleratorCore {
                 lowerUrl.contains("live_id=")
     }
 
+    private val AUDIO_REP_REGEX = Regex("""-(302\d{2}|3025\d)\.(m4s|mp4)""", RegexOption.IGNORE_CASE)
+
+    fun isAudioTrack(url: String): Boolean {
+        if (url.isBlank()) return false
+        val pathPart = url.substringBefore('?').substringBefore('#').lowercase()
+        if (pathPart.contains("audio") || pathPart.contains("sound")) return true
+        if (AUDIO_REP_REGEX.containsMatchIn(pathPart)) return true
+        val parsed = parseUri(url)
+        val idParam = parsed?.queryParam("id") ?: parsed?.queryParam("rep_id")
+        if (idParam != null && idParam.matches(Regex("""^30(2\d\d|25\d)$"""))) return true
+        return false
+    }
+
+    fun shouldProxyMcdn(isMcdn: Boolean, path: String, config: AcceleratorConfig): Boolean {
+        if (!isMcdn || !config.proxyMcdn) return false
+        return when (config.mcdnStrategy.lowercase()) {
+            "proxy-all" -> true
+            "proxy-v1" -> path.startsWith("/v1/resource/")
+            "replace" -> false
+            else -> true
+        }
+    }
+
+    fun resolveTargetHost(config: AcceleratorConfig): String {
+        val cleanedTarget = cleanHost(config.targetHost)
+        val targetHostOnly = cleanedTarget.substringBefore(':')
+        val effectivePool = getEffectiveCdnPool(config)
+        return if (isValidHost(cleanedTarget) && (isBiliCdnHost(targetHostOnly) || effectivePool.contains(targetHostOnly) || CANDIDATE_POOL.contains(targetHostOnly)) && !isAkamaiHost(targetHostOnly)) {
+            targetHostOnly
+        } else {
+            effectivePool.firstOrNull() ?: CANDIDATE_POOL[0]
+        }
+    }
+
+    fun resolveTargetHost(rawTarget: String): String {
+        return resolveTargetHost(AcceleratorConfig(targetHost = rawTarget))
+    }
+
     fun extractSegmentKey(path: String): String {
         if (path.isBlank()) return ""
         val fileName = path.substringAfterLast('/').trim()
@@ -329,10 +387,7 @@ object BiliAcceleratorCore {
             return noChange(original, "already-proxied", isMcdn = true)
         }
 
-        if (isLiveMediaUrl(parsed.path, original)) {
-            return noChange(original, "live-skip")
-        }
-
+        val isLive = isLiveMediaUrl(parsed.path, original)
         val port = parsed.port
         val isBiliFamily = isBiliFamilyHost(hostname)
         val hasBiliMediaSignature = parsed.path.contains("/upgcxcode/") ||
@@ -344,12 +399,12 @@ object BiliAcceleratorCore {
         val hasNonDefaultPort = config.portHeuristic && port != -1 && port != 80 && port != 443
         val queryMcdn = parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
         val isMcdn = isMcdnHost(hostname)
-        val isPcdn = (isIp && (hasBiliMediaSignature || isKnownP2pHost(hostname))) ||
+        val isPcdn = (isIp && (hasBiliMediaSignature || isKnownP2pHost(hostname) || isLive)) ||
                 isKnownP2pHost(hostname) ||
-                (hasNonDefaultPort && (isBiliFamily || hasBiliMediaSignature)) ||
+                (hasNonDefaultPort && (isBiliFamily || hasBiliMediaSignature || isLive)) ||
                 queryMcdn
 
-        // 1. szbdyd / mountaintoys 调度器：直接恢复 xy_usource 参数所携带的真实原生 CDN 域名
+        // 1. szbdyd / mountaintoys 调度器：直接恢复 xy_usource 参数所携带的真实原生 CDN 域名（点播与直播通用）
         val isScheduler = hostname.endsWith(".szbdyd.com", ignoreCase = true) ||
                 hostname.endsWith(".mountaintoys.cn", ignoreCase = true)
         if (isScheduler) {
@@ -358,6 +413,8 @@ object BiliAcceleratorCore {
             val hostOnly = cleanedSource.substringBefore(':')
             if (isValidHost(cleanedSource) && isBiliCdnHost(hostOnly)) {
                 val rewritten = parsed.replaceAuthority(hostOnly)
+                val baseReason = if (hostname.endsWith(".mountaintoys.cn", ignoreCase = true)) "mountaintoys-source" else "szbdyd-source"
+                val reason = if (isLive) "live-$baseReason" else baseReason
                 if (rewritten != original) {
                     return RewriteResult(
                         changed = true,
@@ -365,7 +422,7 @@ object BiliAcceleratorCore {
                         finalUrl = rewritten,
                         originalHost = hostname,
                         targetHost = hostOnly,
-                        reason = if (hostname.endsWith(".mountaintoys.cn", ignoreCase = true)) "mountaintoys-source" else "szbdyd-source",
+                        reason = reason,
                         isPcdn = true,
                         isMcdn = false,
                         segmentKey = segKey
@@ -376,51 +433,87 @@ object BiliAcceleratorCore {
             }
         }
 
-        // 2. MCDN 节点代理
-        if (isMcdn && config.proxyMcdn) {
-            val rewritten = parsed.proxyWrap(cleanProxyHost)
-            if (rewritten != original) {
-                return RewriteResult(
-                    changed = true,
-                    originalUrl = original,
-                    finalUrl = rewritten,
-                    originalHost = hostname,
-                    targetHost = cleanProxyHost,
-                    reason = "mcdn-proxy",
-                    isPcdn = false,
-                    isMcdn = true,
-                    segmentKey = segKey
-                )
+        // 直播流 PCDN/MCDN 检测：若非 szbdyd/mountaintoys 还原，标记其为直播 PCDN，绝不盲目改写至 VOD UPOS 镜像
+        if (isLive) {
+            return if (isPcdn || isMcdn) {
+                noChange(original, "live-pcdn-detected", isPcdn = true, isMcdn = isMcdn, segmentKey = segKey)
             } else {
-                return noChange(original, "ok", isMcdn = true, segmentKey = segKey)
+                noChange(original, "live-ok", isPcdn = false, isMcdn = false, segmentKey = segKey)
             }
         }
 
-        // 3. PCDN 拦截 / Force 模式统一重定向到优质 UPOS 镜像
-        val isAkamai = hostname.endsWith(".akamaized.net", ignoreCase = true)
+        // 2. MCDN 节点处理：支持 proxy-all / proxy-v1 / replace 多档策略颗粒度
+        if (isMcdn) {
+            val shouldProxy = shouldProxyMcdn(isMcdn, parsed.path, config)
+            if (shouldProxy) {
+                val rewritten = parsed.proxyWrap(cleanProxyHost)
+                if (rewritten != original) {
+                    return RewriteResult(
+                        changed = true,
+                        originalUrl = original,
+                        finalUrl = rewritten,
+                        originalHost = hostname,
+                        targetHost = cleanProxyHost,
+                        reason = "mcdn-proxy",
+                        isPcdn = false,
+                        isMcdn = true,
+                        segmentKey = segKey
+                    )
+                } else {
+                    return noChange(original, "ok", isMcdn = true, segmentKey = segKey)
+                }
+            } else if (config.mcdnStrategy.equals("replace", ignoreCase = true) || !config.proxyMcdn || config.forceUpos) {
+                val target = resolveTargetHost(config)
+                val rewritten = parsed.replaceAuthority(target)
+                if (rewritten != original) {
+                    return RewriteResult(
+                        changed = true,
+                        originalUrl = original,
+                        finalUrl = rewritten,
+                        originalHost = hostname,
+                        targetHost = target,
+                        reason = "mcdn-host",
+                        isPcdn = false,
+                        isMcdn = true,
+                        segmentKey = segKey
+                    )
+                } else {
+                    return noChange(original, "ok", isMcdn = true, segmentKey = segKey)
+                }
+            }
+        }
+
+        // 3. Akamai 节点处理：默认放行官方 Akamai 鉴权线路；仅在 rewriteAkamai 开启时重定向至首选 UPOS
+        val isAkamai = isAkamaiHost(hostname)
         val isBstar = hostname.endsWith(".bstarstatic.com", ignoreCase = true)
         val isUposAkamai = isBiliAkamaiHost(hostname)
+
+        if (isAkamai && !config.rewriteAkamai && !config.forceUpos) {
+            return noChange(original, "akamai-pass", isPcdn = false, isMcdn = false, segmentKey = segKey)
+        }
+
+        // 4. PCDN 拦截 / Force 模式 / Akamai 改写
         val shouldRewrite = (isPcdn && config.blockPcdn) ||
-                (isMcdn && !config.proxyMcdn) ||
+                (isAkamai && (config.rewriteAkamai || config.forceUpos)) ||
                 (config.forceUpos && (isBiliCdnHost(hostname) || isUposAkamai) && !isBstar)
 
         if (shouldRewrite) {
-            val cleanedTarget = cleanHost(config.targetHost)
-            val targetHostOnly = cleanedTarget.substringBefore(':')
-            val target = if (isValidHost(cleanedTarget) && (isBiliCdnHost(targetHostOnly) || CANDIDATE_POOL.contains(targetHostOnly))) {
-                targetHostOnly
-            } else {
-                CANDIDATE_POOL[0]
-            }
+            val target = resolveTargetHost(config)
             val rewritten = parsed.replaceAuthority(target)
             if (rewritten != original) {
+                val reason = when {
+                    isAkamai -> "akamai-redirect"
+                    isPcdn -> "pcdn-host"
+                    isMcdn -> "mcdn-host"
+                    else -> "force-upos"
+                }
                 return RewriteResult(
                     changed = true,
                     originalUrl = original,
                     finalUrl = rewritten,
                     originalHost = hostname,
                     targetHost = target,
-                    reason = if (isPcdn) "pcdn-host" else if (isMcdn) "mcdn-host" else "force-upos",
+                    reason = reason,
                     isPcdn = isPcdn,
                     isMcdn = isMcdn,
                     segmentKey = segKey
@@ -439,9 +532,28 @@ object BiliAcceleratorCore {
         onRewrite: ((RewriteResult) -> Unit)? = null
     ): List<String> {
         if (!config.enabled) return rawList.distinct()
+        val isLiveList = rawList.any { isLiveMediaUrl("", it) }
         val target = config.targetHost
         val filtered = mutableListOf<String>()
 
+        if (isLiveList) {
+            // 直播流候选过滤：
+            // 1. 若带 xy_usource 则恢复为官方源站
+            // 2. 剥离 PCDN / MCDN / 高位端口 / 裸 IP 节点，保留原生官方 CDN (gotcha / live-bvc 等)
+            for (url in rawList) {
+                val res = rewriteUrl(url, config)
+                if (res.changed) {
+                    onRewrite?.invoke(res)
+                    filtered.add(res.finalUrl)
+                } else if (!res.isPcdn && !res.isMcdn) {
+                    filtered.add(url)
+                }
+            }
+            // 容错兜底：若所有节点均被判定为 PCDN（极端情况），保留原列表避免直播黑屏
+            return if (filtered.isNotEmpty()) filtered.distinct() else rawList.distinct()
+        }
+
+        // VOD 点播流候选过滤与补全
         for (url in rawList) {
             val res = rewriteUrl(url, config)
             if (res.changed) {

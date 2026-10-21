@@ -87,6 +87,7 @@ dependencies {
     compileOnly("io.github.libxposed:api:101.0.0")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("com.google.code.gson:gson:2.10.1")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     val composeBom = platform("androidx.compose:compose-bom:2024.09.03")
     implementation(composeBom)

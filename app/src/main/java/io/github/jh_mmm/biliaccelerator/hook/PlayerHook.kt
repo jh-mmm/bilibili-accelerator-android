@@ -6,6 +6,8 @@ import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.libxposed.api.XposedModule
+import java.util.Collections
+import java.util.WeakHashMap
 
 object PlayerHook {
 
@@ -14,6 +16,11 @@ object PlayerHook {
     @Volatile
     var isHooked: Boolean = false
         internal set
+
+    private val builderPendingBackups = Collections.synchronizedMap(WeakHashMap<Any, List<String>>())
+    private val builderCleanLiveHost = Collections.synchronizedMap(WeakHashMap<Any, String>())
+    @Volatile
+    private var latestCleanLiveHost: String? = null
 
     // Both spellings are observed across different Bilibili versions (Assert vs Asset)
     private val SEGMENT_BUILDER_CLASSES = listOf(
@@ -115,6 +122,23 @@ object PlayerHook {
                         rawList.distinct()
                     }
 
+                    chain.thisObject?.let { builder ->
+                        builderPendingBackups[builder] = distinctFiltered
+                        val cleanLive = distinctFiltered.firstOrNull {
+                            val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(it)?.host)
+                            BiliAcceleratorCore.isLiveMediaUrl("", it) &&
+                                    !BiliAcceleratorCore.isKnownP2pHost(host) &&
+                                    !BiliAcceleratorCore.isIpAddress(host)
+                        }
+                        if (cleanLive != null) {
+                            val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cleanLive)?.host)
+                            if (host.isNotBlank()) {
+                                builderCleanLiveHost[builder] = host
+                                latestCleanLiveHost = host
+                            }
+                        }
+                    }
+
                     if (config.enableBtr && io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
                         val boundSessionId = chain.thisObject?.let {
                             io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.getSessionForBuilder(it)
@@ -162,14 +186,18 @@ object PlayerHook {
             return null
         }
         // 直播流（FLV/HLS/Live）绝对不重写至 BTR 本地代理
-        if (result.reason == "live-skip" || BiliAcceleratorCore.isLiveMediaUrl("", originalUrl)) {
+        if (result.reason.startsWith("live-") || BiliAcceleratorCore.isLiveMediaUrl("", originalUrl)) {
             return null
         }
         val targetUrl = if (result.changed) result.finalUrl else originalUrl
-        // 废除盲目生成的伪造外部镜像，初始备用列表由后续 setBackupUrls 动态注入真实且合法的官方 CDN
+        val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty()
+        val isAudio = BiliAcceleratorCore.isAudioTrack(targetUrl)
+
         val sessionId = io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.register(
             primaryUrl = targetUrl,
-            backupUrls = emptyList()
+            backupUrls = pendingBackups,
+            isAudio = isAudio,
+            config = config
         )
         if (builderInstance != null) {
             io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.bindBuilderSession(builderInstance, sessionId)
@@ -186,7 +214,42 @@ object PlayerHook {
         val config = RemoteClient.fetchConfig()
         if (!config.enabled) return null
 
+        val parsed = BiliAcceleratorCore.parseUri(originalUrl)
+        val isLive = parsed != null && BiliAcceleratorCore.isLiveMediaUrl(parsed.path, originalUrl)
         val result = BiliAcceleratorCore.rewriteUrl(originalUrl, config)
+
+        if (isLive) {
+            if (result.changed) {
+                RemoteClient.notifyRewrite(result)
+                val newArgs = args.toTypedArray()
+                newArgs[strIndex] = result.finalUrl
+                return newArgs
+            }
+            if (result.isPcdn && config.blockPcdn && parsed != null) {
+                val cleanLiveHost = builderInstance?.let { builderCleanLiveHost[it] } ?: latestCleanLiveHost
+                if (!cleanLiveHost.isNullOrBlank() && !BiliAcceleratorCore.isKnownP2pHost(cleanLiveHost) && !BiliAcceleratorCore.isIpAddress(cleanLiveHost)) {
+                    val rewritten = parsed.replaceAuthority(cleanLiveHost)
+                    val liveResult = RewriteResult(
+                        changed = true,
+                        originalUrl = originalUrl,
+                        finalUrl = rewritten,
+                        originalHost = parsed.host,
+                        targetHost = cleanLiveHost,
+                        reason = "live-pcdn-filter",
+                        isPcdn = true,
+                        isMcdn = result.isMcdn,
+                        segmentKey = result.segmentKey
+                    )
+                    RemoteClient.notifyRewrite(liveResult)
+                    val newArgs = args.toTypedArray()
+                    newArgs[strIndex] = rewritten
+                    return newArgs
+                }
+            }
+            RemoteClient.notifyRewrite(result)
+            return null
+        }
+
         val btrUrl = tryRewriteToBtr(originalUrl, result, config, builderInstance)
         if (btrUrl != null) {
             Log.i(TAG, "Rewrote media url to BTR proxy: ${result.originalHost} -> 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
@@ -224,7 +287,7 @@ object PlayerHook {
                         val config = RemoteClient.fetchConfig()
                         if (config.enabled) {
                             val result = BiliAcceleratorCore.rewriteUrl(original, config)
-                            val btrUrl = tryRewriteToBtr(original, result, config)
+                            val btrUrl = tryRewriteToBtr(original, result, config, chain.thisObject)
                             if (btrUrl != null) {
                                 Log.i(TAG, "Rewrote IjkMediaPlayer dataSource to BTR: 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
                                 val newArgs = chain.args.toTypedArray().apply { this[0] = btrUrl }
@@ -257,7 +320,7 @@ object PlayerHook {
                                 val config = RemoteClient.fetchConfig()
                                 if (config.enabled) {
                                     val result = BiliAcceleratorCore.rewriteUrl(original, config)
-                                    val btrUrl = tryRewriteToBtr(original, result, config)
+                                    val btrUrl = tryRewriteToBtr(original, result, config, chain.thisObject)
                                     if (btrUrl != null) {
                                         Log.i(TAG, "Rewrote IjkMediaPlayer Uri dataSource to BTR: 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
                                         val newArgs = chain.args.toTypedArray().apply { this[1] = Uri.parse(btrUrl) }

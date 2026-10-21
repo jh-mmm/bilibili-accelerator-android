@@ -40,3 +40,8 @@
 -keepclassmembers class io.github.jh_mmm.biliaccelerator.ui.MainActivity$Companion {
     public boolean isModuleActive();
 }
+
+# OkHttp rules
+-dontwarn okhttp3.**
+-dontwarn okio.**
+-keep class okhttp3.** { *; }

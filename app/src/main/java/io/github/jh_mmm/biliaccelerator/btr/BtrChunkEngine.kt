@@ -4,13 +4,9 @@ import android.util.Log
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.hook.RemoteClient
-import java.io.ByteArrayOutputStream
-import java.io.IOException
-import java.io.InputStream
+import okhttp3.Request
 import java.io.OutputStream
-import java.net.HttpURLConnection
 import java.net.SocketException
-import java.net.URL
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -21,18 +17,16 @@ import java.util.concurrent.atomic.AtomicLong
 object BtrChunkEngine {
 
     private const val TAG = "BiliAccelerator-BTR"
+    const val CHUNK_SIZE_AUDIO = 128 * 1024
+    const val CHUNK_SIZE_VIDEO = 512 * 1024
+    const val AUDIO_MAX_CONCURRENCY = 2
+    const val PROBE_PREFIX_BYTES = 64 * 1024
+
     private const val DEFAULT_CHUNK_SIZE = 512 * 1024L // 512 KB
     private const val MAX_PREFETCH_CHUNKS = 16          // 内存滑动窗口上限 (约 8MB~16MB，严格防 OOM)
     private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36 BiliApp/7800300"
 
     private val cdnPenalties = ConcurrentHashMap<String, Long>()
-
-    init {
-        try {
-            System.setProperty("http.keepAlive", "true")
-            System.setProperty("http.maxConnections", "32")
-        } catch (_: Throwable) {}
-    }
 
     data class ChunkTask(
         val index: Long,
@@ -68,7 +62,8 @@ object BtrChunkEngine {
             val avgLatency = totalLatency.get() / count
             val mbStr = String.format(Locale.getDefault(), "%.1f", bytes / (1024.0 * 1024.0))
 
-            val summaryReason = "BTR并发加速 · ${count}分片(${mbStr}MB) · ${hitHosts.size}个CDN · 均时${avgLatency}ms"
+            val prefix = if (sessionId.startsWith("audio_") || primaryHost.contains("audio")) "BTR音频优化" else "BTR并发加速"
+            val summaryReason = "$prefix · ${count}分片(${mbStr}MB) · ${hitHosts.size}个CDN · 均时${avgLatency}ms"
 
             val result = RewriteResult(
                 changed = true,
@@ -91,6 +86,32 @@ object BtrChunkEngine {
         }
     }
 
+    /**
+     * 自适应切片尺寸计算：
+     * 根据视频总长度（清晰度与体积表征）动态调整切片大小：
+     * - 音频流保持 128KB 极低延时
+     * - < 15MB: 256KB (小文件/低码率，保证极低首帧起播时延)
+     * - 15MB ~ 60MB: 512KB (720P/1080P 常规基准切片)
+     * - 60MB ~ 250MB: 1024KB (1MB) (1080P 60帧/高码率视频)
+     * - >= 250MB: 2048KB (2MB) (4K/8K/高码率长视频，大幅减少高吞吐下的并发 HTTP 请求与头部握手开销)
+     */
+    fun calculateDynamicChunkSize(
+        totalLength: Long,
+        baseChunkSizeKb: Int,
+        autoChunkSize: Boolean,
+        isAudio: Boolean
+    ): Long {
+        if (isAudio) return 128 * 1024L
+        if (!autoChunkSize) return (baseChunkSizeKb.coerceIn(128, 2048) * 1024).toLong()
+        return when {
+            totalLength <= 0 -> (baseChunkSizeKb.coerceIn(128, 2048) * 1024).toLong()
+            totalLength < 15 * 1024 * 1024L -> 256 * 1024L
+            totalLength < 60 * 1024 * 1024L -> 512 * 1024L
+            totalLength < 250 * 1024 * 1024L -> 1024 * 1024L
+            else -> 2048 * 1024L
+        }
+    }
+
     fun pipeStream(
         session: BtrMediaSession,
         requestedStart: Long,
@@ -99,17 +120,29 @@ object BtrChunkEngine {
         clientOut: OutputStream,
         concurrency: Int = 6,
         chunkSizeKb: Int = 512,
+        autoConcurrency: Boolean = true,
+        autoChunkSize: Boolean = true,
         proxyPort: Int = -1
     ) {
-        val chunkSize = (chunkSizeKb.coerceIn(128, 2048) * 1024).toLong()
+        val isAudio = session.isAudio || BiliAcceleratorCore.isAudioTrack(session.primaryUrl)
+        val initialProbeChunkSize = if (isAudio) {
+            128 * 1024L // 音频流采用 128KB 小切片低时延分片
+        } else {
+            512 * 1024L // 探测首片统一使用 512KB 快速拉取总长度
+        }
+
+        val baseConcurrency = if (isAudio) 2 else concurrency.coerceIn(2, 16)
+        val useAuto = !isAudio && autoConcurrency
+        val burstConcurrency = if (useAuto) maxOf(baseConcurrency, 8).coerceAtMost(16) else baseConcurrency
+
         val candidateUrls = (listOf(session.primaryUrl) + session.backupUrls).distinct()
         val primaryHost = BiliAcceleratorCore.cleanHost(extractHostname(session.primaryUrl))
 
-        val statsTracker = StreamStatsTracker(session.sessionId, primaryHost, concurrency, proxyPort)
+        val statsTracker = StreamStatsTracker(session.sessionId, primaryHost, burstConcurrency, proxyPort)
 
         try {
-            // 1. Probe 首片并获取媒体总长度 (避免多余 HEAD 请求开销)
-            val probeResult = probeMedia(candidateUrls, session, requestedStart, chunkSize)
+            // 1. Probe 首片并获取媒体总长度 (使用 OkHttp 连接池与 HTTP/2 探针)
+            val probeResult = probeMedia(candidateUrls, session, requestedStart, initialProbeChunkSize)
             if (probeResult == null) {
                 sendHttpError(clientOut, 502, "Bad Gateway - Upstream CDN Unreachable")
                 return
@@ -122,12 +155,20 @@ object BtrChunkEngine {
                 else -> -1L
             }
 
+            // 根据探针测得的媒体总长度，自适应计算后续分片拉取的最佳 ChunkSize
+            val activeChunkSize = calculateDynamicChunkSize(
+                totalLength = totalLength,
+                baseChunkSizeKb = chunkSizeKb,
+                autoChunkSize = autoChunkSize,
+                isAudio = isAudio
+            )
+
             // 2. 构造并发送 HTTP 206 Partial Content (或 200 OK) 响应头给播放器
             val isPartial = requestedStart > 0 || actualEnd > 0
             val statusLine = if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n"
             val sb = StringBuilder(statusLine)
             val contentType = probeResult.contentType
-                ?: if (session.primaryUrl.contains("audio") || session.primaryUrl.contains("sound")) {
+                ?: if (isAudio) {
                     "audio/mp4"
                 } else {
                     "video/mp4"
@@ -177,7 +218,7 @@ object BtrChunkEngine {
             var offset = currentOffset
             var taskIdx = 0L
             while (offset <= actualEnd) {
-                val end = minOf(offset + chunkSize - 1, actualEnd)
+                val end = minOf(offset + activeChunkSize - 1, actualEnd)
                 chunkTasks.add(ChunkTask(taskIdx++, offset, end))
                 offset = end + 1
             }
@@ -188,15 +229,21 @@ object BtrChunkEngine {
             val isClientAborted = AtomicBoolean(false)
             val deliveredIndex = AtomicLong(0L)
 
-            val workerPool = Executors.newFixedThreadPool(concurrency.coerceIn(2, 12))
+            val workerPool = Executors.newFixedThreadPool(burstConcurrency)
 
             try {
                 // 调度分发协作者
                 workerPool.execute {
                     var dispatchIdx = 0
                     while (dispatchIdx < totalTasks && !isClientAborted.get()) {
-                        // 背压控制：未交付分片超过最大预取窗口时挂起，防止 OOM
-                        while (dispatchIdx - deliveredIndex.get() >= MAX_PREFETCH_CHUNKS && !isClientAborted.get()) {
+                        // 动态线程调节与背压控制：冲刺期放宽，稳定期按 baseConcurrency 约束在途分片
+                        val maxPrefetch = if (useAuto && deliveredIndex.get() >= 4) {
+                            minOf(MAX_PREFETCH_CHUNKS, baseConcurrency * 2)
+                        } else {
+                            MAX_PREFETCH_CHUNKS
+                        }
+
+                        while (dispatchIdx - deliveredIndex.get() >= maxPrefetch && !isClientAborted.get()) {
                             try {
                                 Thread.sleep(15)
                             } catch (_: InterruptedException) {
@@ -282,38 +329,40 @@ object BtrChunkEngine {
         for (url in sortedUrls) {
             val host = extractHostname(url)
             val startTime = System.currentTimeMillis()
-            var conn: HttpURLConnection? = null
+            val endOffset = startOffset + chunkSize - 1
+            val request = Request.Builder()
+                .url(url)
+                .header("Range", "bytes=$startOffset-$endOffset")
+                .header("Referer", session.referer)
+                .header("User-Agent", ua)
+                .header("Connection", "keep-alive")
+                .build()
+
             try {
-                val endOffset = startOffset + chunkSize - 1
-                conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 4000
-                    readTimeout = 6000
-                    instanceFollowRedirects = true
-                    setRequestProperty("Range", "bytes=$startOffset-$endOffset")
-                    setRequestProperty("Referer", session.referer)
-                    setRequestProperty("User-Agent", ua)
-                    setRequestProperty("Connection", "keep-alive")
-                }
+                BtrHttpClient.probeClient.newCall(request).execute().use { response ->
+                    val code = response.code
+                    if (code == 200 || code == 206) {
+                        val cr = response.header("Content-Range")
+                        val total = cr?.substringAfterLast("/")?.trim()?.toLongOrNull() ?: -1L
+                        val cl = response.body?.contentLength() ?: -1L
+                        val ct = response.header("Content-Type")?.takeIf { it.isNotBlank() }
 
-                val code = conn.responseCode
-                if (code == 200 || code == 206) {
-                    val cr = conn.getHeaderField("Content-Range")
-                    val total = cr?.substringAfterLast("/")?.trim()?.toLongOrNull() ?: -1L
-                    val cl = conn.contentLengthLong
-                    val ct = conn.contentType?.takeIf { it.isNotBlank() }
-
-                    val data = readInputStream(conn.inputStream, chunkSize.toInt())
-                    val latency = System.currentTimeMillis() - startTime
-                    return ProbeResult(total, cl, ct, data, host, latency)
-                } else if (code == 403 || code >= 500) {
-                    penalizeHost(host, 20_000L)
-                    reportFailover(host, "HTTP $code 错误", session.sessionId)
+                        val data = response.body?.bytes() ?: ByteArray(0)
+                        if (data.isEmpty()) {
+                            penalizeHost(host, 30_000L)
+                            reportFailover(host, "首片探测返回 0KB 空数据熔断", session.sessionId)
+                            return@use
+                        }
+                        val latency = System.currentTimeMillis() - startTime
+                        return ProbeResult(total, cl, ct, data, host, latency)
+                    } else if (code == 403 || code >= 500) {
+                        penalizeHost(host, 20_000L)
+                        reportFailover(host, "HTTP $code 错误", session.sessionId)
+                    }
                 }
             } catch (e: Exception) {
                 penalizeHost(host, 15_000L)
                 reportFailover(host, e.message ?: "连接超时", session.sessionId)
-            } finally {
-                conn?.disconnect()
             }
         }
         return null
@@ -341,36 +390,43 @@ object BtrChunkEngine {
             if (isPenalized(host)) continue
 
             val startTime = System.currentTimeMillis()
-            var conn: HttpURLConnection? = null
-            try {
-                conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 3500
-                    readTimeout = 6000
-                    instanceFollowRedirects = true
-                    setRequestProperty("Range", "bytes=${task.startByte}-${task.endByte}")
-                    setRequestProperty("Referer", session.referer)
-                    setRequestProperty("User-Agent", ua)
-                    setRequestProperty("Connection", "keep-alive")
-                }
+            val request = Request.Builder()
+                .url(url)
+                .header("Range", "bytes=${task.startByte}-${task.endByte}")
+                .header("Referer", session.referer)
+                .header("User-Agent", ua)
+                .header("Connection", "keep-alive")
+                .build()
 
-                val code = conn.responseCode
-                if (code == 200 || code == 206) {
-                    val expectedBytes = (task.endByte - task.startByte + 1).toInt()
-                    val bytes = readInputStream(conn.inputStream, expectedBytes)
-                    val latency = System.currentTimeMillis() - startTime
-                    task.data = bytes
-                    task.isSuccess = true
-                    statsTracker.recordChunk(host, bytes.size.toLong(), latency)
-                    return
-                } else if (code == 403 || code >= 500) {
-                    penalizeHost(host, 20_000L)
-                    reportFailover(host, "HTTP $code 熔断", session.sessionId)
+            try {
+                BtrHttpClient.client.newCall(request).execute().use { response ->
+                    val code = response.code
+                    if (code == 200 || code == 206) {
+                        val expectedBytes = (task.endByte - task.startByte + 1).toInt()
+                        val bytes = response.body?.bytes() ?: ByteArray(0)
+                        if (bytes.isEmpty()) {
+                            penalizeHost(host, 30_000L)
+                            reportFailover(host, "分片拉取返回 0KB 空响应熔断", session.sessionId)
+                            return@use
+                        }
+                        if (expectedBytes > 0 && bytes.size < expectedBytes) {
+                            penalizeHost(host, 20_000L)
+                            reportFailover(host, "分片数据截断 (${bytes.size}/$expectedBytes 字节)", session.sessionId)
+                            return@use
+                        }
+                        val latency = System.currentTimeMillis() - startTime
+                        task.data = bytes
+                        task.isSuccess = true
+                        statsTracker.recordChunk(host, bytes.size.toLong(), latency)
+                        return
+                    } else if (code == 403 || code >= 500) {
+                        penalizeHost(host, 20_000L)
+                        reportFailover(host, "HTTP $code 熔断", session.sessionId)
+                    }
                 }
             } catch (e: Exception) {
                 penalizeHost(host, 15_000L)
                 reportFailover(host, "分片拉取超时/异常: ${e.message}", session.sessionId)
-            } finally {
-                conn?.disconnect()
             }
         }
 
@@ -389,40 +445,28 @@ object BtrChunkEngine {
         val host = extractHostname(url)
         val startTime = System.currentTimeMillis()
         val ua = session.userAgent ?: DEFAULT_USER_AGENT
-        var conn: HttpURLConnection? = null
+        val request = Request.Builder()
+            .url(url)
+            .header("Range", "bytes=${task.startByte}-${task.endByte}")
+            .header("Referer", session.referer)
+            .header("User-Agent", ua)
+            .header("Connection", "keep-alive")
+            .build()
+
         try {
-            conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 5000
-                readTimeout = 8000
-                instanceFollowRedirects = true
-                setRequestProperty("Range", "bytes=${task.startByte}-${task.endByte}")
-                setRequestProperty("Referer", session.referer)
-                setRequestProperty("User-Agent", ua)
-                setRequestProperty("Connection", "keep-alive")
-            }
-            if (conn.responseCode in 200..299) {
-                val expectedBytes = (task.endByte - task.startByte + 1).toInt()
-                val bytes = readInputStream(conn.inputStream, expectedBytes)
-                task.data = bytes
-                task.isSuccess = true
-                statsTracker.recordChunk(host, bytes.size.toLong(), System.currentTimeMillis() - startTime)
+            BtrHttpClient.fallbackClient.newCall(request).execute().use { response ->
+                if (response.code in 200..299) {
+                    val expectedBytes = (task.endByte - task.startByte + 1).toInt()
+                    val bytes = response.body?.bytes() ?: ByteArray(0)
+                    if (bytes.isNotEmpty() && (expectedBytes <= 0 || bytes.size >= expectedBytes)) {
+                        task.data = bytes
+                        task.isSuccess = true
+                        statsTracker.recordChunk(host, bytes.size.toLong(), System.currentTimeMillis() - startTime)
+                    }
+                }
             }
         } catch (_: Throwable) {
-        } finally {
-            conn?.disconnect()
         }
-    }
-
-    private fun readInputStream(input: InputStream, estimatedSize: Int): ByteArray {
-        val out = ByteArrayOutputStream(if (estimatedSize > 0) estimatedSize else 16384)
-        val buf = ByteArray(16384)
-        var len: Int
-        input.use { inStream ->
-            while (inStream.read(buf).also { len = it } != -1) {
-                out.write(buf, 0, len)
-            }
-        }
-        return out.toByteArray()
     }
 
     private fun sortUrlsByHealth(urls: List<String>): List<String> {
