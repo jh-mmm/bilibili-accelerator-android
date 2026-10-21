@@ -103,6 +103,21 @@ class HookEntry : XposedModule() {
             // 尽早捕获 Application 实例，供统计上报（跨进程 ContentProvider 调用）使用
             captureApplicationContext(packageName, classLoader)
 
+            // 放行 Android 9+ 本地回环 127.0.0.1 明文 HTTP 流量限制
+            NetworkSecurityHook.init(this, classLoader)
+
+            // 在媒体播放进程中启动轻量级 BTR 本地回环代理服务
+            val config = RemoteClient.fetchConfig()
+            if (config.enabled && config.enableBtr) {
+                io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.start(
+                    concurrency = config.btrConcurrency,
+                    chunkSizeKb = config.btrChunkSizeKb
+                )
+                if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+                    HookStatusTracker.recordStatus("btr_proxy", "127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
+                }
+            }
+
             // 同步初始化业务 Hook（1.0.5 经典逻辑，杜绝异步线程导致播放器早期实例漏 Hook）
             PlayerHook.init(this, classLoader)
             MossGrpcHook.init(this, classLoader)

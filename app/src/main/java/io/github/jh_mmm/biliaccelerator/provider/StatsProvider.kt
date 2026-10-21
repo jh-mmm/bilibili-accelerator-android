@@ -27,7 +27,13 @@ data class RewriteResultDto(
     val reason: String? = null,
     val isPcdn: Boolean? = false,
     val isMcdn: Boolean? = false,
-    val segmentKey: String? = null
+    val segmentKey: String? = null,
+    val isBtr: Boolean? = false,
+    val btrChunks: Int? = 0,
+    val btrBytes: Long? = 0L,
+    val btrConcurrency: Int? = 0,
+    val btrCdnCount: Int? = 0,
+    val btrAvgLatencyMs: Long? = 0L
 ) {
     fun toDomain(): RewriteResult {
         val origHost = originalHost?.trim()?.take(256) ?: ""
@@ -39,10 +45,16 @@ data class RewriteResultDto(
             finalUrl = "",
             originalHost = origHost,
             targetHost = tgtHost,
-            reason = reason?.trim()?.take(64) ?: "unknown",
+            reason = reason?.trim()?.take(128) ?: "unknown",
             isPcdn = isPcdn ?: false,
             isMcdn = isMcdn ?: false,
-            segmentKey = safeSegKey
+            segmentKey = safeSegKey,
+            isBtr = isBtr ?: false,
+            btrChunks = btrChunks ?: 0,
+            btrBytes = btrBytes ?: 0L,
+            btrConcurrency = btrConcurrency ?: 0,
+            btrCdnCount = btrCdnCount ?: 0,
+            btrAvgLatencyMs = btrAvgLatencyMs ?: 0L
         )
     }
 }
@@ -77,6 +89,9 @@ class StatsProvider : ContentProvider() {
         const val KEY_FORCE_UPOS = "cfg_force_upos"
         const val KEY_PORT_HEURISTIC = "cfg_port_heuristic"
         const val KEY_ENABLE_MOSS_HOOK = "cfg_enable_moss_hook"
+        const val KEY_ENABLE_BTR = "cfg_enable_btr"
+        const val KEY_BTR_CONCURRENCY = "cfg_btr_concurrency"
+        const val KEY_BTR_CHUNK_SIZE_KB = "cfg_btr_chunk_size_kb"
 
         private val gson = Gson()
 
@@ -120,7 +135,10 @@ class StatsProvider : ContentProvider() {
                 proxyMcdn = sp.getBoolean(KEY_PROXY_MCDN, true),
                 forceUpos = sp.getBoolean(KEY_FORCE_UPOS, false),
                 portHeuristic = sp.getBoolean(KEY_PORT_HEURISTIC, true),
-                enableMossHook = sp.getBoolean(KEY_ENABLE_MOSS_HOOK, false)
+                enableMossHook = sp.getBoolean(KEY_ENABLE_MOSS_HOOK, false),
+                enableBtr = sp.getBoolean(KEY_ENABLE_BTR, true),
+                btrConcurrency = sp.getInt(KEY_BTR_CONCURRENCY, 6),
+                btrChunkSizeKb = sp.getInt(KEY_BTR_CHUNK_SIZE_KB, 512)
             )
         }
 
@@ -135,6 +153,9 @@ class StatsProvider : ContentProvider() {
                 .putBoolean(KEY_FORCE_UPOS, config.forceUpos)
                 .putBoolean(KEY_PORT_HEURISTIC, config.portHeuristic)
                 .putBoolean(KEY_ENABLE_MOSS_HOOK, config.enableMossHook)
+                .putBoolean(KEY_ENABLE_BTR, config.enableBtr)
+                .putInt(KEY_BTR_CONCURRENCY, config.btrConcurrency)
+                .putInt(KEY_BTR_CHUNK_SIZE_KB, config.btrChunkSizeKb)
                 .apply()
             runCatching {
                 context.contentResolver.notifyChange(CONTENT_URI, null)

@@ -62,12 +62,25 @@ import io.github.jh_mmm.biliaccelerator.ui.theme.TagPcdn
 import io.github.jh_mmm.biliaccelerator.ui.theme.TagMoss
 import io.github.jh_mmm.biliaccelerator.ui.theme.TagSched
 import io.github.jh_mmm.biliaccelerator.ui.theme.TagUpos
+import io.github.jh_mmm.biliaccelerator.ui.theme.TagBtr
+import io.github.jh_mmm.biliaccelerator.ui.theme.TagBtrFailover
 import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
 import io.github.jh_mmm.biliaccelerator.ui.theme.isAcceleratorDarkTheme
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Locale
+
+internal fun formatBytes(bytes: Long): String {
+    if (bytes <= 0) return "0 MB"
+    val mb = bytes / (1024.0 * 1024.0)
+    return if (mb >= 1024.0) {
+        String.format(Locale.getDefault(), "%.2f GB", mb / 1024.0)
+    } else {
+        String.format(Locale.getDefault(), "%.1f MB", mb)
+    }
+}
 
 /**
  * 生成稳定且不依赖列表下标的 LazyColumn 条目 key，避免新日志插入头部时导致全部条目 key 变化与列表抖动。
@@ -379,6 +392,23 @@ private fun RuntimeStatsGrid(snapshot: StatsSnapshot) {
                 modifier = Modifier.weight(1f)
             )
         }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            StatCard(
+                value = snapshot.btrTotalChunks.toString(),
+                label = "BTR 并发分片",
+                valueColor = TagBtr,
+                modifier = Modifier.weight(1f)
+            )
+            StatCard(
+                value = formatBytes(snapshot.btrTotalBytes),
+                label = "BTR 并发流量",
+                valueColor = BiliBlue,
+                modifier = Modifier.weight(1f)
+            )
+        }
     }
 }
 
@@ -554,6 +584,8 @@ private fun RewriteLogCard(
     val cornerRadius = if (uiStyle == UiStyle.MIUIX) 14.dp else 10.dp
 
     val (tagLabel, tagColor) = when {
+        log.reason.contains("熔断") || log.reason.contains("failover") -> "BTR 熔断" to TagBtrFailover
+        log.isBtr || log.reason.contains("BTR") -> "BTR 并发" to TagBtr
         log.reason.contains("moss") -> "Moss 优化" to TagMoss
         log.reason.contains("source") -> "线路调度" to TagSched
         log.isPcdn -> "PCDN 阻断" to TagPcdn

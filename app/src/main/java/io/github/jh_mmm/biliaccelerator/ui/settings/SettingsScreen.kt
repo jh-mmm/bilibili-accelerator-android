@@ -316,6 +316,16 @@ fun SettingsScreen(
                         onCheckedChange = { onConfigChange(config.copy(enableMossHook = it)) },
                         enabled = config.enabled && config.blockPcdn
                     )
+
+                    PreferenceDivider()
+
+                    PreferenceSwitchItem(
+                        title = "BTR 多线程并发切片加速",
+                        summary = "通过本地回环代理并发拉取 Range 分片并执行多 CDN 竞速调度 (已开启 ${config.btrConcurrency} 线程并发)",
+                        checked = config.enableBtr,
+                        onCheckedChange = { onConfigChange(config.copy(enableBtr = it)) },
+                        enabled = config.enabled
+                    )
                 }
             }
 

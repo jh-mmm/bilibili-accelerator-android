@@ -285,7 +285,13 @@ object RemoteClient {
             reason = result.reason,
             isPcdn = result.isPcdn,
             isMcdn = result.isMcdn,
-            segmentKey = segKey
+            segmentKey = segKey,
+            isBtr = result.isBtr,
+            btrChunks = result.btrChunks,
+            btrBytes = result.btrBytes,
+            btrConcurrency = result.btrConcurrency,
+            btrCdnCount = result.btrCdnCount,
+            btrAvgLatencyMs = result.btrAvgLatencyMs
         )
     }
 

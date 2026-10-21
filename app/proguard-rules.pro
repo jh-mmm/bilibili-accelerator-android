@@ -20,6 +20,7 @@
 -keep class io.github.jh_mmm.biliaccelerator.core.RewriteLogEntry { *; }
 -keep class io.github.jh_mmm.biliaccelerator.core.StatsSnapshot { *; }
 -keep class io.github.jh_mmm.biliaccelerator.provider.RewriteResultDto { *; }
+-keep class io.github.jh_mmm.biliaccelerator.btr.** { *; }
 
 # Keep LibXposed API 101 entry point and module rules
 -keep public class * extends io.github.libxposed.api.XposedModule {

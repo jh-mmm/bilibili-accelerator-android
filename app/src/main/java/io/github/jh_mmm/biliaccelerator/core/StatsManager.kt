@@ -26,7 +26,13 @@ data class RewriteLogEntry(
     val targetHost: String,
     val reason: String,
     val isPcdn: Boolean,
-    val isMcdn: Boolean
+    val isMcdn: Boolean,
+    val isBtr: Boolean = false,
+    val btrChunks: Int = 0,
+    val btrBytes: Long = 0L,
+    val btrConcurrency: Int = 0,
+    val btrCdnCount: Int = 0,
+    val btrAvgLatencyMs: Long = 0L
 )
 
 data class StatsSnapshot(
@@ -34,6 +40,9 @@ data class StatsSnapshot(
     val totalRewrites: Long = 0,
     val pcdnBlocked: Long = 0,
     val mcdnProxied: Long = 0,
+    val btrTotalChunks: Long = 0L,
+    val btrTotalBytes: Long = 0L,
+    val btrFailoverCount: Long = 0L,
     val avoidedHosts: List<String> = emptyList(),
     val recentLogs: List<RewriteLogEntry> = emptyList(),
     val installedAt: String = "",
@@ -55,6 +64,9 @@ object StatsManager {
     private const val KEY_TOTAL_REWRITES = "stat_total_rewrites"
     private const val KEY_PCDN_BLOCKED = "stat_pcdn_blocked"
     private const val KEY_MCDN_PROXIED = "stat_mcdn_proxied"
+    private const val KEY_BTR_TOTAL_CHUNKS = "stat_btr_total_chunks"
+    private const val KEY_BTR_TOTAL_BYTES = "stat_btr_total_bytes"
+    private const val KEY_BTR_FAILOVER_COUNT = "stat_btr_failover_count"
     private const val KEY_AVOIDED_HOSTS = "stat_avoided_hosts"
     private const val KEY_RECENT_LOGS = "stat_recent_logs"
     private const val KEY_INSTALLED_AT = "stat_installed_at"
@@ -77,6 +89,9 @@ object StatsManager {
     private val totalRewrites = AtomicLong(0)
     private val pcdnBlocked = AtomicLong(0)
     private val mcdnProxied = AtomicLong(0)
+    private val btrTotalChunks = AtomicLong(0L)
+    private val btrTotalBytes = AtomicLong(0L)
+    private val btrFailoverCount = AtomicLong(0L)
     private val lastHeartbeat = AtomicLong(0L)
     private val frameworkInjected = AtomicBoolean(false)
     private val frameworkScope = java.util.concurrent.CopyOnWriteArrayList<String>()
@@ -126,6 +141,9 @@ object StatsManager {
             totalRewrites.set(sp.getLong(KEY_TOTAL_REWRITES, 0))
             pcdnBlocked.set(sp.getLong(KEY_PCDN_BLOCKED, 0))
             mcdnProxied.set(sp.getLong(KEY_MCDN_PROXIED, 0))
+            btrTotalChunks.set(sp.getLong(KEY_BTR_TOTAL_CHUNKS, 0L))
+            btrTotalBytes.set(sp.getLong(KEY_BTR_TOTAL_BYTES, 0L))
+            btrFailoverCount.set(sp.getLong(KEY_BTR_FAILOVER_COUNT, 0L))
             lastHeartbeat.set(sp.getLong(KEY_LAST_HEARTBEAT, 0L))
             // 清理旧版本遗留的历史激活持久化，杜绝在 LSPosed 中禁用模块后出现假阳性未激活回落失败
             if (sp.contains(KEY_FRAMEWORK_ACTIVATED)) {
@@ -328,7 +346,7 @@ object StatsManager {
             totalRewrites.incrementAndGet()
             val rawOriginalHost = (result.originalHost ?: "").trim().take(128)
             val rawTargetHost = (result.targetHost ?: "").trim().take(128)
-            val rawReason = (result.reason ?: "").trim().take(64)
+            val rawReason = (result.reason ?: "").trim().take(128)
 
             if (result.isPcdn) {
                 pcdnBlocked.incrementAndGet()
@@ -340,6 +358,13 @@ object StatsManager {
             }
             if (result.isMcdn) {
                 mcdnProxied.incrementAndGet()
+            }
+            if (result.isBtr) {
+                btrTotalChunks.addAndGet(result.btrChunks.toLong())
+                btrTotalBytes.addAndGet(result.btrBytes)
+                if (result.reason.contains("熔断") || result.reason.contains("failover")) {
+                    btrFailoverCount.incrementAndGet()
+                }
             }
 
             val formattedTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(now), ZoneId.systemDefault())
@@ -353,7 +378,13 @@ object StatsManager {
                 targetHost = rawTargetHost,
                 reason = rawReason,
                 isPcdn = result.isPcdn,
-                isMcdn = result.isMcdn
+                isMcdn = result.isMcdn,
+                isBtr = result.isBtr,
+                btrChunks = result.btrChunks,
+                btrBytes = result.btrBytes,
+                btrConcurrency = result.btrConcurrency,
+                btrCdnCount = result.btrCdnCount,
+                btrAvgLatencyMs = result.btrAvgLatencyMs
             )
 
             synchronized(logsLock) {
@@ -385,6 +416,9 @@ object StatsManager {
                     .putLong(KEY_TOTAL_REWRITES, totalRewrites.get())
                     .putLong(KEY_PCDN_BLOCKED, pcdnBlocked.get())
                     .putLong(KEY_MCDN_PROXIED, mcdnProxied.get())
+                    .putLong(KEY_BTR_TOTAL_CHUNKS, btrTotalChunks.get())
+                    .putLong(KEY_BTR_TOTAL_BYTES, btrTotalBytes.get())
+                    .putLong(KEY_BTR_FAILOVER_COUNT, btrFailoverCount.get())
                     .putLong(KEY_LAST_HEARTBEAT, lastHeartbeat.get())
                     .remove(KEY_FRAMEWORK_ACTIVATED)
                     .putString(KEY_AVOIDED_HOSTS, gson.toJson(avoidedHosts.toList()))
@@ -409,6 +443,9 @@ object StatsManager {
             totalRewrites.set(0)
             pcdnBlocked.set(0)
             mcdnProxied.set(0)
+            btrTotalChunks.set(0L)
+            btrTotalBytes.set(0L)
+            btrFailoverCount.set(0L)
             // 注意：不重置 lastHeartbeat 与 hookStatus，避免指标清零连带将模块健康与激活状态误打回“未激活”
             avoidedHosts.clear()
             synchronized(logsLock) {
@@ -424,6 +461,9 @@ object StatsManager {
                     .putLong(KEY_TOTAL_REWRITES, 0L)
                     .putLong(KEY_PCDN_BLOCKED, 0L)
                     .putLong(KEY_MCDN_PROXIED, 0L)
+                    .putLong(KEY_BTR_TOTAL_CHUNKS, 0L)
+                    .putLong(KEY_BTR_TOTAL_BYTES, 0L)
+                    .putLong(KEY_BTR_FAILOVER_COUNT, 0L)
                     .putString(KEY_AVOIDED_HOSTS, gson.toJson(emptyList<String>()))
                     .putString(KEY_RECENT_LOGS, gson.toJson(emptyList<RewriteLogEntry>()))
                     .apply()
@@ -439,6 +479,9 @@ object StatsManager {
             totalRewrites = totalRewrites.get(),
             pcdnBlocked = pcdnBlocked.get(),
             mcdnProxied = mcdnProxied.get(),
+            btrTotalChunks = btrTotalChunks.get(),
+            btrTotalBytes = btrTotalBytes.get(),
+            btrFailoverCount = btrFailoverCount.get(),
             avoidedHosts = avoidedHosts.toList().sorted(),
             recentLogs = synchronized(logsLock) { recentLogs.toList() },
             installedAt = installedAt,
@@ -503,6 +546,9 @@ object StatsManager {
         sb.appendLine("累计优化/重定向数: ${snapshot.totalRewrites}")
         sb.appendLine("拦截 PCDN 节点数: ${snapshot.pcdnBlocked}")
         sb.appendLine("MCDN 代理中继数: ${snapshot.mcdnProxied}")
+        sb.appendLine("BTR 并发拉取分片数: ${snapshot.btrTotalChunks}")
+        sb.appendLine("BTR 累计并发流量: ${snapshot.btrTotalBytes / (1024 * 1024)} MB")
+        sb.appendLine("BTR 节点熔断转移数: ${snapshot.btrFailoverCount}")
         sb.appendLine("已规避的慢速节点数量: ${snapshot.avoidedHosts.size}")
         if (snapshot.avoidedHosts.isNotEmpty()) {
             sb.appendLine("规避域名列表: ")

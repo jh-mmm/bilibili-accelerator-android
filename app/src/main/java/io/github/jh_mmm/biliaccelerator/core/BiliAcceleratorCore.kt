@@ -15,7 +15,13 @@ data class RewriteResult(
     val reason: String,
     val isPcdn: Boolean,
     val isMcdn: Boolean,
-    val segmentKey: String = ""
+    val segmentKey: String = "",
+    val isBtr: Boolean = false,
+    val btrChunks: Int = 0,
+    val btrBytes: Long = 0L,
+    val btrConcurrency: Int = 0,
+    val btrCdnCount: Int = 0,
+    val btrAvgLatencyMs: Long = 0L
 )
 
 data class AcceleratorConfig(
@@ -26,7 +32,10 @@ data class AcceleratorConfig(
     val proxyMcdn: Boolean = true,
     val forceUpos: Boolean = false,
     val portHeuristic: Boolean = true,
-    val enableMossHook: Boolean = false
+    val enableMossHook: Boolean = false,
+    val enableBtr: Boolean = true,
+    val btrConcurrency: Int = 6,
+    val btrChunkSizeKb: Int = 512
 )
 
 object BiliAcceleratorCore {

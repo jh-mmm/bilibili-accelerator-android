@@ -111,6 +111,10 @@ object PlayerHook {
                         RemoteClient.notifyRewrite(res)
                     }
 
+                    if (config.enableBtr && io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+                        io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.updateBackupsForLatest(distinctFiltered)
+                    }
+
                     if (distinctFiltered.isNotEmpty()) {
                         val paramType = method.parameterTypes[0]
                         val convertedArg: Any = when {
@@ -137,6 +141,20 @@ object PlayerHook {
         return BiliAcceleratorCore.filterAndFillBackupUrls(rawList, config, onRewrite)
     }
 
+    private fun tryRewriteToBtr(originalUrl: String, result: RewriteResult, config: AcceleratorConfig): String? {
+        if (!config.enabled || !config.enableBtr || !io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+            return null
+        }
+        val targetUrl = if (result.changed) result.finalUrl else originalUrl
+        val backups = io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.synthesizeBackups(targetUrl, config)
+        val sessionId = io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.register(
+            primaryUrl = targetUrl,
+            backupUrls = backups
+        )
+        val proxyPort = io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port
+        return "http://127.0.0.1:$proxyPort/stream/$sessionId.m4s"
+    }
+
     private fun rewriteArgIfMedia(args: List<Any?>): Array<Any?>? {
         val strIndex = args.indexOfFirst { it is String && BiliAcceleratorCore.hasMediaSignal(it) }
         if (strIndex == -1) return null
@@ -146,6 +164,14 @@ object PlayerHook {
         if (!config.enabled) return null
 
         val result = BiliAcceleratorCore.rewriteUrl(originalUrl, config)
+        val btrUrl = tryRewriteToBtr(originalUrl, result, config)
+        if (btrUrl != null) {
+            Log.i(TAG, "Rewrote media url to BTR proxy: ${result.originalHost} -> 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
+            val newArgs = args.toTypedArray()
+            newArgs[strIndex] = btrUrl
+            return newArgs
+        }
+
         RemoteClient.notifyRewrite(result)
         if (result.changed) {
             Log.i(TAG, "Rewrote media url: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
@@ -175,6 +201,12 @@ object PlayerHook {
                         val config = RemoteClient.fetchConfig()
                         if (config.enabled) {
                             val result = BiliAcceleratorCore.rewriteUrl(original, config)
+                            val btrUrl = tryRewriteToBtr(original, result, config)
+                            if (btrUrl != null) {
+                                Log.i(TAG, "Rewrote IjkMediaPlayer dataSource to BTR: 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
+                                val newArgs = chain.args.toTypedArray().apply { this[0] = btrUrl }
+                                return@intercept chain.proceed(newArgs)
+                            }
                             RemoteClient.notifyRewrite(result)
                             if (result.changed) {
                                 Log.i(TAG, "Rewrote IjkMediaPlayer dataSource: ${result.originalHost} -> ${result.targetHost}")
@@ -202,6 +234,12 @@ object PlayerHook {
                                 val config = RemoteClient.fetchConfig()
                                 if (config.enabled) {
                                     val result = BiliAcceleratorCore.rewriteUrl(original, config)
+                                    val btrUrl = tryRewriteToBtr(original, result, config)
+                                    if (btrUrl != null) {
+                                        Log.i(TAG, "Rewrote IjkMediaPlayer Uri dataSource to BTR: 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
+                                        val newArgs = chain.args.toTypedArray().apply { this[1] = Uri.parse(btrUrl) }
+                                        return@intercept chain.proceed(newArgs)
+                                    }
                                     RemoteClient.notifyRewrite(result)
                                     if (result.changed) {
                                         Log.i(TAG, "Rewrote IjkMediaPlayer Uri dataSource: ${result.originalHost} -> ${result.targetHost}")
