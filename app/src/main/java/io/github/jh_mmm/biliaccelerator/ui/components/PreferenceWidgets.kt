@@ -2,6 +2,7 @@ package io.github.jh_mmm.biliaccelerator.ui.components
 
 import android.os.Build
 import android.view.HapticFeedbackConstants
+import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
@@ -313,11 +314,11 @@ fun MiuixSlider(
     val coercedValue = value.coerceIn(valueRange.start, valueRange.endInclusive)
 
     // Spring physics: dampening 0.90f / stiffness 1755f during drag for 120Hz tracking, dampening 0.96f / stiffness 322f on release
-    val progressSpring = remember(isDragging) {
+    val progressSpring: AnimationSpec<Float> = remember(isDragging) {
         if (isDragging) {
-            spring(dampingRatio = 0.90f, stiffness = 1755f)
+            spring<Float>(dampingRatio = 0.90f, stiffness = 1755f)
         } else {
-            spring(dampingRatio = 0.96f, stiffness = 322f)
+            spring<Float>(dampingRatio = 0.96f, stiffness = 322f)
         }
     }
     val animatedProgressValue by animateFloatAsState(
@@ -330,7 +331,7 @@ fun MiuixSlider(
     val isActive = isPressed || isDragging
     val thumbScale by animateFloatAsState(
         targetValue = if (isActive) 1.15f else 1.0f,
-        animationSpec = spring(dampingRatio = 0.6f, stiffness = 987f),
+        animationSpec = spring<Float>(dampingRatio = 0.6f, stiffness = 987f),
         label = "MiuixSliderThumbScale"
     )
 
@@ -342,11 +343,11 @@ fun MiuixSlider(
     )
 
     // Discrete step points and custom key points
-    val stepFractions = remember(steps) {
+    val stepFractions: FloatArray = remember(steps) {
         if (steps == 0) floatArrayOf() else FloatArray(steps + 2) { it.toFloat() / (steps + 1) }
     }
 
-    val keyPointFractions = remember(keyPoints, stepFractions, valueRange, showKeyPoints) {
+    val keyPointFractions: FloatArray = remember(keyPoints, stepFractions, valueRange, showKeyPoints) {
         when {
             keyPoints != null -> keyPoints.map {
                 ((it - valueRange.start) / (valueRange.endInclusive - valueRange.start)).coerceIn(0f, 1f)
