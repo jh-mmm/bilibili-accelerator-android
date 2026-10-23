@@ -593,9 +593,16 @@ fun SettingsScreen(
                                     title = "BTR 并发线程数",
                                     summary = concurrencySummary,
                                     value = config.btrConcurrency.coerceIn(2, 16).toFloat(),
-                                    onValueChange = { onConfigChange(config.copy(btrConcurrency = it.roundToInt())) },
+                                    onValueChange = { newVal ->
+                                        val rounded = newVal.roundToInt()
+                                        if (rounded != config.btrConcurrency) {
+                                            onConfigChange(config.copy(btrConcurrency = rounded))
+                                        }
+                                    },
                                     valueRange = 2f..16f,
                                     steps = 13,
+                                    showKeyPoints = true,
+                                    keyPoints = listOf(2f, 4f, 6f, 8f, 12f, 16f),
                                     valueLabel = "${config.btrConcurrency} 线程",
                                     enabled = config.enabled && config.enableBtr
                                 )
@@ -616,9 +623,16 @@ fun SettingsScreen(
                                     title = "并发 CDN 节点池",
                                     summary = poolSummary,
                                     value = config.btrCdnPoolSize.coerceIn(1, 12).toFloat(),
-                                    onValueChange = { onConfigChange(config.copy(btrCdnPoolSize = it.roundToInt())) },
+                                    onValueChange = { newVal ->
+                                        val rounded = newVal.roundToInt()
+                                        if (rounded != config.btrCdnPoolSize) {
+                                            onConfigChange(config.copy(btrCdnPoolSize = rounded))
+                                        }
+                                    },
                                     valueRange = 1f..12f,
                                     steps = 10,
+                                    showKeyPoints = true,
+                                    keyPoints = listOf(1f, 2f, 4f, 6f, 8f, 12f),
                                     valueLabel = "${config.btrCdnPoolSize} 个节点",
                                     enabled = config.enabled && config.enableBtr
                                 )
@@ -657,10 +671,15 @@ fun SettingsScreen(
                                     value = currentChunkIndex.toFloat(),
                                     onValueChange = { newIdx ->
                                         val idx = newIdx.roundToInt().coerceIn(0, chunkOptions.lastIndex)
-                                        onConfigChange(config.copy(btrChunkSizeKb = chunkOptions[idx]))
+                                        val newChunkSize = chunkOptions[idx]
+                                        if (newChunkSize != config.btrChunkSizeKb) {
+                                            onConfigChange(config.copy(btrChunkSizeKb = newChunkSize))
+                                        }
                                     },
                                     valueRange = 0f..3f,
                                     steps = 2,
+                                    showKeyPoints = true,
+                                    keyPoints = listOf(0f, 1f, 2f, 3f),
                                     valueLabel = "${config.btrChunkSizeKb} KB",
                                     enabled = config.enabled && config.enableBtr
                                 )
