@@ -189,6 +189,11 @@ object PlayerHook {
         if (result.reason.startsWith("live-") || BiliAcceleratorCore.isLiveMediaUrl("", originalUrl)) {
             return null
         }
+        // 版权保护/DRM 加密流（Widevine/ChinaDRM/PSSH）绝对不重写至 BTR 本地代理，交由原生直连放行
+        if (BiliAcceleratorCore.hasDrmSignal(originalUrl) || (result.changed && BiliAcceleratorCore.hasDrmSignal(result.finalUrl))) {
+            Log.i(TAG, "DRM protected stream detected, bypassing BTR proxy")
+            return null
+        }
         val targetUrl = if (result.changed) result.finalUrl else originalUrl
         val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty()
         val isAudio = BiliAcceleratorCore.isAudioTrack(targetUrl)

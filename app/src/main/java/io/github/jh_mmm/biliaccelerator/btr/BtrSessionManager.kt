@@ -16,7 +16,9 @@ data class BtrMediaSession(
     @Volatile var referer: String = "https://www.bilibili.com/",
     val isAudio: Boolean = false,
     val createdAt: Long = System.currentTimeMillis(),
-    val lastAccessed: AtomicLong = AtomicLong(System.currentTimeMillis())
+    val lastAccessed: AtomicLong = AtomicLong(System.currentTimeMillis()),
+    @Volatile var totalLength: Long = -1L,
+    @Volatile var contentType: String? = null
 )
 
 object BtrSessionManager {
@@ -40,11 +42,19 @@ object BtrSessionManager {
         cleanupStaleSessions()
         val id = UUID.randomUUID().toString().replace("-", "").take(12)
         val validBackups = backupUrls.filter { it.isNotBlank() && it != primaryUrl }.distinct()
+        val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(primaryUrl)
         // 若宿主未传入备用地址，自动合成兼容的官方同源 UPOS 镜像（优先支持用户自定义 CDN 白名单），确保多源 CDN 并发调度生效
         val finalBackups = if (validBackups.isEmpty()) {
             synthesizeCompatibleBackups(primaryUrl, config)
         } else {
-            validBackups
+            // 隔离检查（对齐 BTR 规范）：
+            // 若当前主地址是中继流，严禁混入普通 UPOS 镜像；
+            // 若当前主地址是普通 UPOS 流，严禁混入中继地址（避免触发普通节点 403）
+            if (isPrimaryRelay) {
+                validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
+            } else {
+                validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
+            }
         }
         val session = BtrMediaSession(
             sessionId = id,
@@ -75,7 +85,13 @@ object BtrSessionManager {
     fun updateBackups(sessionId: String, backups: List<String>) {
         val current = sessions[sessionId] ?: return
         val validBackups = backups.filter { it.isNotBlank() && it != current.primaryUrl }.distinct()
-        current.backupUrls = validBackups
+        val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(current.primaryUrl)
+        val isolatedBackups = if (isPrimaryRelay) {
+            validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
+        } else {
+            validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
+        }
+        current.backupUrls = isolatedBackups
     }
 
     fun updateBackupsForLatest(backups: List<String>) {
@@ -103,8 +119,8 @@ object BtrSessionManager {
 
     /**
      * 安全合成同源通用 UPOS 备用节点：
-     * 当宿主未提供 backupUrls 时，在同组通用 UPOS 节点（cos / ali / hw / tx）之间安全互换，
-     * 排除必须使用专属鉴权的 Akamai 及海外私有 ov 节点，彻底杜绝 403 熔断并实现多 CDN 聚合并发拉取。
+     * 当宿主未提供 backupUrls 时，在同组通用 UPOS 节点之间安全互换，
+     * 解决海外/大陆多源并发拉取，彻底杜绝 403 熔断。
      */
     fun synthesizeCompatibleBackups(primaryUrl: String, config: AcceleratorConfig? = null): List<String> {
         val results = mutableListOf<String>()
@@ -112,13 +128,24 @@ object BtrSessionManager {
         val path = uri.path
         if (!path.contains("/upgcxcode/")) return emptyList()
 
-        val host = uri.host.lowercase()
-        if (host.endsWith(".akamaized.net") || host.contains("ov.bilivideo.com")) {
+        // 对齐 BTR Issue #47：中继地址（Relay/MCDN）与 DRM 版权流严禁作为 Donor 母本合成普通镜像
+        if (BiliAcceleratorCore.isRelayUrl(primaryUrl) || path.startsWith("/v1/resource/") || BiliAcceleratorCore.hasDrmSignal(primaryUrl)) {
             return emptyList()
         }
 
+        val host = uri.host.lowercase()
+        val isAkamai = host.endsWith(".akamaized.net")
+        // 对齐 BTR：当海外账号仅分发 akamaized.net 节点时，支持提取其签名合成海外专属 ov 镜像，恢复多源并发能力
+        val isOverseasStream = host.contains("ov.bilivideo.com") || isAkamai || BiliAcceleratorCore.isOverseasEnvironment()
+
         val candidateList = if (config != null) {
             BiliAcceleratorCore.getEffectiveCdnPool(config)
+        } else if (isOverseasStream) {
+            listOf(
+                "upos-sz-mirrorcosov.bilivideo.com",
+                "upos-sz-mirroraliov.bilivideo.com",
+                "upos-sz-mirrorhwov.bilivideo.com"
+            )
         } else {
             listOf(
                 "upos-sz-mirrorcos.bilivideo.com",
@@ -131,41 +158,15 @@ object BtrSessionManager {
 
         for (m in candidateList) {
             val cleanM = BiliAcceleratorCore.cleanHost(m).lowercase()
-            // 排除与主域名相同、Akamai 专属鉴权、以及海外带区域鉴权的 ov 节点
-            if (cleanM != host && !cleanM.endsWith(".akamaized.net") && !cleanM.contains("ov.bilivideo.com")) {
-                results.add(uri.replaceAuthority(cleanM))
-                if (results.size >= 3) break
-            }
+            if (cleanM == host || cleanM.endsWith(".akamaized.net")) continue
+            // 严格隔离：海外 ov 节点仅在海外主地址时合成，大陆节点仅在大陆主地址时合成，防止区域鉴权 403
+            val candidateIsOv = cleanM.contains("ov.bilivideo.com")
+            if (isOverseasStream != candidateIsOv) continue
+
+            results.add(uri.replaceAuthority(cleanM))
+            if (results.size >= 3) break
         }
         return results
-    }
-
-    /**
-     * 合成备用地址逻辑：
-     * 为彻底根治 BTR 节点 403 熔断问题，默认不再随意向候选池硬塞未签名的外部 UPOS 镜像，
-     * 而是优先依赖官方原生 setBackupUrls 提供的合法已签名地址。
-     * 若在测试环境或强制配置时需要模拟，仅保留同源且带必要参数的候选。
-     */
-    fun synthesizeBackups(primaryUrl: String, config: AcceleratorConfig): List<String> {
-        val results = mutableListOf<String>()
-        val uri = BiliAcceleratorCore.parseUri(primaryUrl) ?: return emptyList()
-        val path = uri.path
-        if (!path.contains("/upgcxcode/")) return emptyList()
-
-        // 仅在明确开启强行 UPOS 重定向且不是海外私有鉴权时提供同组镜像作为回退
-        if (config.forceUpos) {
-            for (host in BiliAcceleratorCore.CANDIDATE_POOL) {
-                // 排除海外带区域鉴权的 ov 节点，防止国内 IP 产生 403 熔断
-                if (host.contains("ov.bilivideo.com")) continue
-                if (host != uri.host && host != config.targetHost) {
-                    val candidate = BiliAcceleratorCore.rewriteUrl(primaryUrl, config.copy(targetHost = host))
-                    if (candidate.changed && candidate.finalUrl.isNotBlank()) {
-                        results.add(candidate.finalUrl)
-                    }
-                }
-            }
-        }
-        return results.distinct()
     }
 
     private fun cleanupStaleSessions() {

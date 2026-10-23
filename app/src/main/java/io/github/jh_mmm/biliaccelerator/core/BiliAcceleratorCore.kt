@@ -70,10 +70,14 @@ object BiliAcceleratorCore {
                 p.startsWith("com.bstar.")
     }
 
-    val CANDIDATE_POOL = listOf(
+    val MAINLAND_CANDIDATE_POOL = listOf(
         "upos-sz-mirrorcos.bilivideo.com",
+        "upos-sz-mirrorcoso1.bilivideo.com",
         "upos-sz-mirrorali.bilivideo.com",
         "upos-sz-mirrorhw.bilivideo.com",
+        "upos-sz-mirrorbos.bilivideo.com",
+        "upos-sz-mirror08c.bilivideo.com",
+        "upos-sz-mirrorbd.bilivideo.com",
         "upos-tf-all-hw.bilivideo.com",
         "upos-tf-all-tx.bilivideo.com",
         "upos-sz-mirrorcosov.bilivideo.com",
@@ -81,14 +85,46 @@ object BiliAcceleratorCore {
         "upos-sz-mirrorhwov.bilivideo.com"
     )
 
+    val OVERSEAS_CANDIDATE_POOL = listOf(
+        "upos-sz-mirrorcosov.bilivideo.com",
+        "upos-sz-mirroraliov.bilivideo.com",
+        "upos-sz-mirrorhwov.bilivideo.com",
+        "cn-hk-eq-01-01.bilivideo.com",
+        "cn-hk-eq-01-03.bilivideo.com",
+        "upos-sz-mirrorcos.bilivideo.com",
+        "upos-sz-mirrorali.bilivideo.com",
+        "upos-sz-mirrorhw.bilivideo.com",
+        "upos-tf-all-hw.bilivideo.com",
+        "upos-tf-all-tx.bilivideo.com"
+    )
+
+    val CANDIDATE_POOL = MAINLAND_CANDIDATE_POOL
     val DEFAULT_CDN_POOL = CANDIDATE_POOL
+
+    /**
+     * 判断当前系统是否处于海外环境（根据时区与语言环境自适应加权）
+     */
+    fun isOverseasEnvironment(): Boolean {
+        return try {
+            val tzId = java.util.TimeZone.getDefault().id.lowercase()
+            val country = java.util.Locale.getDefault().country.uppercase()
+            val isMainlandTz = tzId.contains("shanghai") || tzId.contains("chongqing") ||
+                    tzId.contains("harbin") || tzId.contains("urumqi") || tzId == "prc" || tzId == "cst"
+            val isMainlandLocale = country == "CN"
+            !isMainlandTz || (!isMainlandLocale && !isMainlandTz)
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     fun getEffectiveCdnPool(config: AcceleratorConfig): List<String> {
         val userList = config.customCdnPool
             .map { cleanHost(it).lowercase() }
             .filter { isValidHost(it) && !isAkamaiHost(it) }
             .distinct()
-        return if (userList.isNotEmpty()) userList.take(32) else DEFAULT_CDN_POOL
+        if (userList.isNotEmpty()) return userList.take(32)
+
+        return if (isOverseasEnvironment()) OVERSEAS_CANDIDATE_POOL else MAINLAND_CANDIDATE_POOL
     }
 
     private val HOSTNAME_REGEX = Regex("""^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(:[0-9]{1,5})?$""")
@@ -157,12 +193,29 @@ object BiliAcceleratorCore {
         ".szbdyd.com",
         ".mountaintoys.cn",
         ".nexusedgeio.com",
-        ".ahdohpiechei.com"
+        ".ahdohpiechei.com",
+        ".xycdn.com"
     )
 
     private val KNOWN_P2P_HOSTS = setOf(
         "upos-sz-mirror14b.bilivideo.com"
     )
+
+    /**
+     * 识别版权保护/DRM 加密流（Widevine/ChinaDRM/PSSH/UGC付费等）：
+     * 这类流需要客户端底层硬件解密管线直接处理，BTR 本地代理无法解密，必须原生直连放行。
+     */
+    fun hasDrmSignal(url: String): Boolean {
+        if (url.isBlank()) return false
+        val lower = url.lowercase()
+        return lower.contains("drm_tech_type") ||
+                (lower.contains("drm_type=") && !lower.contains("drm_type=0")) ||
+                lower.contains("bvc-drm") ||
+                lower.contains("pssh") ||
+                lower.contains("widevine") ||
+                lower.contains("/drm/") ||
+                lower.contains("has_drm=1")
+    }
 
     fun hasMediaSignal(url: String): Boolean {
         val pathPart = url.substringBefore('?').substringBefore('#')
@@ -174,6 +227,8 @@ object BiliAcceleratorCore {
                 url.contains("mountaintoys") ||
                 url.contains("nexusedgeio") ||
                 url.contains("ahdohpiechei") ||
+                url.contains("xycdn.com") ||
+                url.contains("hdslb.com") ||
                 url.contains("mcdn.bili") ||
                 url.contains("os=mcdn") ||
                 pathPart.contains("/upgcxcode/") ||
@@ -197,6 +252,22 @@ object BiliAcceleratorCore {
         return hostname.endsWith(".mcdn.bilivideo.cn", ignoreCase = true) ||
                 hostname.endsWith(".mcdn.bilivideo.com", ignoreCase = true) ||
                 hostname.endsWith(".mcdn.bilivideo.net", ignoreCase = true)
+    }
+
+    /**
+     * 识别中继/MCDN/P2P资源流（对齐 BTR Issue #47）：
+     * 这类流的路径和鉴权签名由边缘中继专享，普通 UPOS 镜像无法解析，换 Host 必报 403。
+     */
+    fun isRelayUrl(url: String): Boolean {
+        if (url.isBlank()) return false
+        val parsed = parseUri(url) ?: return false
+        val host = cleanHost(parsed.host).lowercase().substringBefore(':')
+        val path = parsed.path.lowercase()
+        return isMcdnHost(host) ||
+                host == "proxy-tf-all-ws.bilivideo.com" ||
+                host.startsWith("proxy-tf-all-") ||
+                path.startsWith("/v1/resource/") ||
+                parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
     }
 
     fun isAkamaiHost(hostname: String): Boolean {
@@ -334,12 +405,15 @@ object BiliAcceleratorCore {
 
     fun isAudioTrack(url: String): Boolean {
         if (url.isBlank()) return false
-        val pathPart = url.substringBefore('?').substringBefore('#').lowercase()
-        if (pathPart.contains("audio") || pathPart.contains("sound")) return true
+        val lowerUrl = url.lowercase()
+        val pathPart = lowerUrl.substringBefore('?').substringBefore('#')
+        if (pathPart.contains("audio") || pathPart.contains("sound") || pathPart.contains("dolby") || pathPart.contains("flac") || pathPart.contains("hires")) return true
         if (AUDIO_REP_REGEX.containsMatchIn(pathPart)) return true
         val parsed = parseUri(url)
         val idParam = parsed?.queryParam("id") ?: parsed?.queryParam("rep_id")
-        if (idParam != null && idParam.matches(Regex("""^30(2\d\d|25\d)$"""))) return true
+        if (idParam != null && (idParam.matches(Regex("""^30(2\d\d|25\d)$""")) || idParam.contains("audio") || idParam.contains("flac"))) return true
+        val codecs = parsed?.queryParam("codecs")?.lowercase()
+        if (codecs != null && (codecs.startsWith("mp4a") || codecs.startsWith("flac") || codecs.startsWith("ec-3") || codecs.startsWith("ac-4"))) return true
         return false
     }
 
@@ -398,11 +472,10 @@ object BiliAcceleratorCore {
         val isIp = isIpAddress(hostname)
         val hasNonDefaultPort = config.portHeuristic && port != -1 && port != 80 && port != 443
         val queryMcdn = parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
-        val isMcdn = isMcdnHost(hostname)
+        val isMcdn = isMcdnHost(hostname) || queryMcdn
         val isPcdn = (isIp && (hasBiliMediaSignature || isKnownP2pHost(hostname) || isLive)) ||
                 isKnownP2pHost(hostname) ||
-                (hasNonDefaultPort && (isBiliFamily || hasBiliMediaSignature || isLive)) ||
-                queryMcdn
+                (hasNonDefaultPort && (isBiliFamily || hasBiliMediaSignature || isLive))
 
         // 1. szbdyd / mountaintoys 调度器：直接恢复 xy_usource 参数所携带的真实原生 CDN 域名（点播与直播通用）
         val isScheduler = hostname.endsWith(".szbdyd.com", ignoreCase = true) ||
@@ -442,8 +515,13 @@ object BiliAcceleratorCore {
             }
         }
 
+        // 关键防护：版权保护/DRM 加密流（Widevine/ChinaDRM/PSSH/UGC付费等）必须原生直连放行，严禁改写域名
+        if (hasDrmSignal(original)) {
+            return noChange(original, "drm-protected", isPcdn = false, isMcdn = false, segmentKey = segKey)
+        }
+
         // 2. MCDN 节点处理：支持 proxy-all / proxy-v1 / replace 多档策略颗粒度
-        if (isMcdn) {
+        if (isMcdn && config.proxyMcdn) {
             val shouldProxy = shouldProxyMcdn(isMcdn, parsed.path, config)
             if (shouldProxy) {
                 val rewritten = parsed.proxyWrap(cleanProxyHost)
@@ -462,7 +540,24 @@ object BiliAcceleratorCore {
                 } else {
                     return noChange(original, "ok", isMcdn = true, segmentKey = segKey)
                 }
-            } else if (config.mcdnStrategy.equals("replace", ignoreCase = true) || !config.proxyMcdn || config.forceUpos) {
+            } else if (config.mcdnStrategy.equals("replace", ignoreCase = true) || config.forceUpos) {
+                // 关键防护（对齐 BTR Issue #47）：
+                // 若 MCDN 路径以 /v1/resource/ 开头，普通 UPOS 节点没有中继资源，直接换 Host 必报 HTTP 403！
+                // 遇到此类地址必须强制降级走官方 CDN 中继代理 (proxyWrap)，杜绝 403 熔断。
+                if (parsed.path.startsWith("/v1/resource/")) {
+                    val rewritten = parsed.proxyWrap(cleanProxyHost)
+                    return RewriteResult(
+                        changed = true,
+                        originalUrl = original,
+                        finalUrl = rewritten,
+                        originalHost = hostname,
+                        targetHost = cleanProxyHost,
+                        reason = "mcdn-proxy",
+                        isPcdn = false,
+                        isMcdn = true,
+                        segmentKey = segKey
+                    )
+                }
                 val target = resolveTargetHost(config)
                 val rewritten = parsed.replaceAuthority(target)
                 if (rewritten != original) {
@@ -566,14 +661,17 @@ object BiliAcceleratorCore {
 
         val sampleUrl = rawList.firstOrNull()
         if (filtered.isEmpty() && sampleUrl != null) {
-            val candidates = CANDIDATE_POOL.filter { it != target }
-            for (candidate in candidates.take(3)) {
-                val backupRes = rewriteUrl(
-                    sampleUrl,
-                    config.copy(targetHost = candidate, forceUpos = true)
-                )
-                if (backupRes.changed) {
-                    filtered.add(backupRes.finalUrl)
+            // 对齐 BTR Issue #47：中继/MCDN 地址、DRM 加密地址与 Akamai 地址严禁作为 Donor 生成普通 UPOS 镜像
+            if (!isRelayUrl(sampleUrl) && !isAkamaiHost(sampleUrl) && !hasDrmSignal(sampleUrl)) {
+                val candidates = CANDIDATE_POOL.filter { it != target }
+                for (candidate in candidates.take(3)) {
+                    val backupRes = rewriteUrl(
+                        sampleUrl,
+                        config.copy(targetHost = candidate, forceUpos = true)
+                    )
+                    if (backupRes.changed) {
+                        filtered.add(backupRes.finalUrl)
+                    }
                 }
             }
         }
