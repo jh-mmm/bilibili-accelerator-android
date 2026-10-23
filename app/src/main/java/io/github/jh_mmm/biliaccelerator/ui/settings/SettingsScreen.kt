@@ -1,5 +1,8 @@
 package io.github.jh_mmm.biliaccelerator.ui.settings
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.Crossfade
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -10,15 +13,17 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.outlined.AltRoute
+import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Palette
@@ -29,6 +34,7 @@ import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
@@ -43,11 +49,30 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import io.github.jh_mmm.biliaccelerator.R
+import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
+import io.github.jh_mmm.biliaccelerator.ui.components.AcceleratorPage
+import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceActionItem
+import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceDivider
+import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceDropdownItem
+import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceGroupCard
+import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceGroupTitle
+import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceSliderItem
+import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceSwitchItem
+import io.github.jh_mmm.biliaccelerator.ui.theme.TagPcdn
+import io.github.jh_mmm.biliaccelerator.ui.theme.UiPreferences
+import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
+import io.github.jh_mmm.biliaccelerator.ui.theme.UiThemeMode
 import io.github.jh_mmm.biliaccelerator.ui.theme.isAcceleratorDarkTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -58,24 +83,13 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.net.URL
 import javax.net.ssl.HttpsURLConnection
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
-import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
-import io.github.jh_mmm.biliaccelerator.ui.components.AcceleratorPage
-import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceActionItem
-import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceDivider
-import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceDropdownItem
-import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceGroupCard
-import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceGroupTitle
-import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceSwitchItem
-import io.github.jh_mmm.biliaccelerator.ui.theme.TagPcdn
-import io.github.jh_mmm.biliaccelerator.ui.theme.UiPreferences
-import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
-import io.github.jh_mmm.biliaccelerator.ui.theme.UiThemeMode
+import kotlin.math.roundToInt
+
+enum class SettingsSubPage {
+    MAIN,
+    MCDN,
+    BTR
+}
 
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
@@ -90,16 +104,19 @@ fun SettingsScreen(
     uposValues: List<String>,
     bottomContentPadding: Dp = 80.dp
 ) {
+    var currentSubPage by rememberSaveable { mutableStateOf(SettingsSubPage.MAIN) }
+
     var showUposDialog by rememberSaveable { mutableStateOf(false) }
     var showSpeedTestDialog by rememberSaveable { mutableStateOf(false) }
     var showProxyHostDialog by rememberSaveable { mutableStateOf(false) }
     var showMcdnStrategyDialog by rememberSaveable { mutableStateOf(false) }
-    var showConcurrencyDialog by rememberSaveable { mutableStateOf(false) }
-    var showChunkSizeDialog by rememberSaveable { mutableStateOf(false) }
-    var showCdnPoolDialog by rememberSaveable { mutableStateOf(false) }
     var showStyleDialog by rememberSaveable { mutableStateOf(false) }
     var showThemeModeDialog by rememberSaveable { mutableStateOf(false) }
     var showConfirmClearDialog by rememberSaveable { mutableStateOf(false) }
+
+    BackHandler(enabled = currentSubPage != SettingsSubPage.MAIN) {
+        currentSubPage = SettingsSubPage.MAIN
+    }
 
     // Dialog 1: Select UPOS
     if (showUposDialog) {
@@ -151,42 +168,6 @@ fun SettingsScreen(
                 showMcdnStrategyDialog = false
             },
             onDismiss = { showMcdnStrategyDialog = false }
-        )
-    }
-
-    // Dialog 1.7: Select BTR Concurrency
-    if (showConcurrencyDialog) {
-        ConcurrencyDialog(
-            currentConcurrency = config.btrConcurrency,
-            onSelect = { newConcurrency ->
-                onConfigChange(config.copy(btrConcurrency = newConcurrency))
-                showConcurrencyDialog = false
-            },
-            onDismiss = { showConcurrencyDialog = false }
-        )
-    }
-
-    // Dialog 1.8: Select BTR Chunk Size
-    if (showChunkSizeDialog) {
-        ChunkSizeDialog(
-            currentChunkSizeKb = config.btrChunkSizeKb,
-            onSelect = { newSize ->
-                onConfigChange(config.copy(btrChunkSizeKb = newSize))
-                showChunkSizeDialog = false
-            },
-            onDismiss = { showChunkSizeDialog = false }
-        )
-    }
-
-    // Dialog 1.9: Custom CDN Pool
-    if (showCdnPoolDialog) {
-        CustomCdnPoolDialog(
-            currentPool = config.customCdnPool,
-            onSavePool = { newPool ->
-                onConfigChange(config.copy(customCdnPool = newPool))
-                showCdnPoolDialog = false
-            },
-            onDismiss = { showCdnPoolDialog = false }
         )
     }
 
@@ -243,287 +224,449 @@ fun SettingsScreen(
         )
     }
 
-    AcceleratorPage(title = stringResource(R.string.title_settings)) { pagePadding, scrollBehavior ->
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(pagePadding)
-                .nestedScroll(scrollBehavior.nestedScrollConnection),
-            contentPadding = PaddingValues(
-                start = 14.dp,
-                end = 14.dp,
-                top = 8.dp,
-                bottom = bottomContentPadding
-            ),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            // Group 1: 核心路由与拦截策略
-            item(key = "header-core") {
-                PreferenceGroupTitle(stringResource(R.string.group_core_routing))
-            }
-            item(key = "card-core") {
-                PreferenceGroupCard {
-                    PreferenceSwitchItem(
-                        title = stringResource(R.string.label_module_enabled),
-                        summary = stringResource(R.string.summary_module_enabled),
-                        checked = config.enabled,
-                        onCheckedChange = { onConfigChange(config.copy(enabled = it)) },
-                        icon = Icons.Outlined.Route
-                    )
+    Crossfade(
+        targetState = currentSubPage,
+        label = "settings_subpage_crossfade"
+    ) { subPage ->
+        when (subPage) {
+            SettingsSubPage.MAIN -> {
+                AcceleratorPage(title = stringResource(R.string.title_settings)) { pagePadding, scrollBehavior ->
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(pagePadding)
+                            .nestedScroll(scrollBehavior.nestedScrollConnection),
+                        contentPadding = PaddingValues(
+                            start = 14.dp,
+                            end = 14.dp,
+                            top = 8.dp,
+                            bottom = bottomContentPadding
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        // Group 1: 核心路由与拦截策略
+                        item(key = "header-core") {
+                            PreferenceGroupTitle(stringResource(R.string.group_core_routing))
+                        }
+                        item(key = "card-core") {
+                            PreferenceGroupCard {
+                                PreferenceSwitchItem(
+                                    title = stringResource(R.string.label_module_enabled),
+                                    summary = stringResource(R.string.summary_module_enabled),
+                                    checked = config.enabled,
+                                    onCheckedChange = { onConfigChange(config.copy(enabled = it)) },
+                                    icon = Icons.Outlined.Route
+                                )
 
-                    PreferenceDivider()
+                                PreferenceDivider()
 
-                    val currentUposLabel = io.github.jh_mmm.biliaccelerator.ui.dashboard.resolveUposDisplayName(
-                        targetHost = config.targetHost,
-                        uposEntries = uposEntries,
-                        uposValues = uposValues
-                    )
+                                val currentUposLabel = io.github.jh_mmm.biliaccelerator.ui.dashboard.resolveUposDisplayName(
+                                    targetHost = config.targetHost,
+                                    uposEntries = uposEntries,
+                                    uposValues = uposValues
+                                )
 
-                    PreferenceDropdownItem(
-                        title = stringResource(R.string.label_target_host),
-                        summary = config.targetHost,
-                        selectedValue = currentUposLabel,
-                        onClick = { showUposDialog = true }
-                    )
+                                PreferenceDropdownItem(
+                                    title = stringResource(R.string.label_target_host),
+                                    summary = config.targetHost,
+                                    selectedValue = currentUposLabel,
+                                    onClick = { showUposDialog = true }
+                                )
 
-                    PreferenceDivider()
+                                PreferenceDivider()
 
-                    PreferenceActionItem(
-                        title = stringResource(R.string.label_speed_test),
-                        summary = stringResource(R.string.summary_speed_test),
-                        icon = Icons.Outlined.Speed,
-                        onClick = { showSpeedTestDialog = true }
-                    )
+                                PreferenceActionItem(
+                                    title = stringResource(R.string.label_speed_test),
+                                    summary = stringResource(R.string.summary_speed_test),
+                                    icon = Icons.Outlined.Speed,
+                                    onClick = { showSpeedTestDialog = true }
+                                )
 
-                    PreferenceDivider()
+                                PreferenceDivider()
 
-                    PreferenceSwitchItem(
-                        title = stringResource(R.string.label_force_upos),
-                        summary = stringResource(R.string.summary_force_upos),
-                        checked = config.forceUpos,
-                        onCheckedChange = { onConfigChange(config.copy(forceUpos = it)) },
-                        enabled = config.enabled
-                    )
+                                PreferenceSwitchItem(
+                                    title = stringResource(R.string.label_force_upos),
+                                    summary = stringResource(R.string.summary_force_upos),
+                                    checked = config.forceUpos,
+                                    onCheckedChange = { onConfigChange(config.copy(forceUpos = it)) },
+                                    enabled = config.enabled
+                                )
+                            }
+                        }
+
+                        // Group 2: PCDN 与流媒体优化
+                        item(key = "header-network") {
+                            PreferenceGroupTitle(stringResource(R.string.group_pcdn_network))
+                        }
+                        item(key = "card-network") {
+                            PreferenceGroupCard {
+                                PreferenceSwitchItem(
+                                    title = stringResource(R.string.label_enable_pcdn_block),
+                                    summary = stringResource(R.string.summary_enable_pcdn_block),
+                                    checked = config.blockPcdn,
+                                    onCheckedChange = { onConfigChange(config.copy(blockPcdn = it)) },
+                                    icon = Icons.Outlined.Security,
+                                    enabled = config.enabled
+                                )
+
+                                PreferenceDivider()
+
+                                // 1. MCDN 合并选项 -> 二级页面
+                                val currentProxyLabel = when (config.proxyHost) {
+                                    "proxy-tf-all-ws.bilivideo.com" -> "网宿"
+                                    "proxy-tf-all-tx.bilivideo.com" -> "腾讯云"
+                                    "proxy-tf-all-hw.bilivideo.com" -> "华为云"
+                                    else -> config.proxyHost.substringBefore('.').removePrefix("proxy-")
+                                }
+                                val currentMcdnStrategyLabel = when (config.mcdnStrategy.lowercase()) {
+                                    "proxy-all" -> "中继全部"
+                                    "proxy-v1" -> "仅中继资源"
+                                    "replace" -> "替换为UPOS"
+                                    else -> config.mcdnStrategy
+                                }
+                                val mcdnSummary = if (!config.proxyMcdn) {
+                                    "已停用 MCDN 中继代理 (点击进入策略配置)"
+                                } else {
+                                    "已启用 · $currentProxyLabel · $currentMcdnStrategyLabel (点击进入策略配置)"
+                                }
+
+                                PreferenceDropdownItem(
+                                    title = "MCDN 策略配置",
+                                    summary = mcdnSummary,
+                                    selectedValue = if (config.proxyMcdn) "已开启" else "已停用",
+                                    icon = Icons.Outlined.AltRoute,
+                                    onClick = { currentSubPage = SettingsSubPage.MCDN },
+                                    enabled = config.enabled
+                                )
+
+                                PreferenceDivider()
+
+                                // 2. BTR 合并选项 -> 二级页面
+                                val btrThreadDesc = if (config.btrAutoConcurrency) "自适应 ${config.btrConcurrency} 线程" else "${config.btrConcurrency} 线程"
+                                val btrChunkDesc = if (config.btrAutoChunkSize) "自适应 ${config.btrChunkSizeKb} KB" else "${config.btrChunkSizeKb} KB"
+                                val btrSummary = if (!config.enableBtr) {
+                                    "已停用多线程切片加速 (点击进入高级配置)"
+                                } else {
+                                    "已启用 · $btrThreadDesc · $btrChunkDesc · ${config.btrCdnPoolSize} 节点"
+                                }
+
+                                PreferenceDropdownItem(
+                                    title = "BTR 并发切片加速",
+                                    summary = btrSummary,
+                                    selectedValue = if (config.enableBtr) "已开启" else "已停用",
+                                    icon = Icons.Outlined.Bolt,
+                                    onClick = { currentSubPage = SettingsSubPage.BTR },
+                                    enabled = config.enabled
+                                )
+
+                                PreferenceDivider()
+
+                                PreferenceSwitchItem(
+                                    title = "改写 Akamai 官方节点",
+                                    summary = "默认放行官方 Akamai 线路；开启后将其重定向至首选 UPOS 镜像（适合当地 Akamai 连接较慢的情况）",
+                                    checked = config.rewriteAkamai,
+                                    onCheckedChange = { onConfigChange(config.copy(rewriteAkamai = it)) },
+                                    enabled = config.enabled
+                                )
+
+                                PreferenceDivider()
+
+                                PreferenceSwitchItem(
+                                    title = stringResource(R.string.label_port_heuristic),
+                                    summary = stringResource(R.string.summary_port_heuristic),
+                                    checked = config.portHeuristic,
+                                    onCheckedChange = { onConfigChange(config.copy(portHeuristic = it)) },
+                                    enabled = config.enabled
+                                )
+
+                                PreferenceDivider()
+
+                                PreferenceSwitchItem(
+                                    title = stringResource(R.string.label_enable_moss),
+                                    summary = stringResource(R.string.summary_enable_moss),
+                                    checked = config.enableMossHook,
+                                    onCheckedChange = { onConfigChange(config.copy(enableMossHook = it)) },
+                                    enabled = config.enabled && config.blockPcdn
+                                )
+                            }
+                        }
+
+                        // Group 3: 数据统计与诊断
+                        item(key = "header-diag") {
+                            PreferenceGroupTitle(stringResource(R.string.group_data_diag))
+                        }
+                        item(key = "card-diag") {
+                            PreferenceGroupCard {
+                                PreferenceActionItem(
+                                    title = stringResource(R.string.btn_export_diag),
+                                    summary = stringResource(R.string.summary_export_diag),
+                                    icon = Icons.Outlined.ContentCopy,
+                                    onClick = onExportDiagnostic
+                                )
+
+                                PreferenceDivider()
+
+                                PreferenceActionItem(
+                                    title = stringResource(R.string.btn_clear_stats),
+                                    summary = stringResource(R.string.summary_clear_stats),
+                                    icon = Icons.Outlined.Delete,
+                                    tintColor = TagPcdn,
+                                    onClick = { showConfirmClearDialog = true }
+                                )
+                            }
+                        }
+
+                        // Group 4: 界面风格与外观
+                        item(key = "header-ui") {
+                            PreferenceGroupTitle(stringResource(R.string.group_ui_appearance))
+                        }
+                        item(key = "card-ui") {
+                            PreferenceGroupCard {
+                                PreferenceDropdownItem(
+                                    title = stringResource(R.string.label_ui_style),
+                                    summary = stringResource(R.string.summary_ui_style),
+                                    selectedValue = uiPreferences.style.label,
+                                    icon = Icons.Outlined.Palette,
+                                    onClick = { showStyleDialog = true }
+                                )
+
+                                PreferenceDivider()
+
+                                PreferenceDropdownItem(
+                                    title = stringResource(R.string.label_theme_mode),
+                                    summary = stringResource(R.string.summary_theme_mode),
+                                    selectedValue = uiPreferences.themeMode.label,
+                                    onClick = { showThemeModeDialog = true }
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
-            // Group 2: PCDN 与网络过滤
-            item(key = "header-network") {
-                PreferenceGroupTitle(stringResource(R.string.group_pcdn_network))
-            }
-            item(key = "card-network") {
-                PreferenceGroupCard {
-                    PreferenceSwitchItem(
-                        title = stringResource(R.string.label_enable_pcdn_block),
-                        summary = stringResource(R.string.summary_enable_pcdn_block),
-                        checked = config.blockPcdn,
-                        onCheckedChange = { onConfigChange(config.copy(blockPcdn = it)) },
-                        icon = Icons.Outlined.Security,
-                        enabled = config.enabled
-                    )
-
-                    PreferenceDivider()
-
-                    PreferenceSwitchItem(
-                        title = stringResource(R.string.label_enable_mcdn_proxy),
-                        summary = stringResource(R.string.summary_enable_mcdn_proxy),
-                        checked = config.proxyMcdn,
-                        onCheckedChange = { onConfigChange(config.copy(proxyMcdn = it)) },
-                        enabled = config.enabled
-                    )
-
-                    PreferenceDivider()
-
-                    val currentProxyLabel = when (config.proxyHost) {
-                        "proxy-tf-all-ws.bilivideo.com" -> "网宿"
-                        "proxy-tf-all-tx.bilivideo.com" -> "腾讯云"
-                        "proxy-tf-all-hw.bilivideo.com" -> "华为云"
-                        else -> config.proxyHost.substringBefore('.').removePrefix("proxy-")
+            SettingsSubPage.MCDN -> {
+                AcceleratorPage(
+                    title = "MCDN 策略配置",
+                    navigationIcon = {
+                        IconButton(onClick = { currentSubPage = SettingsSubPage.MAIN }) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "返回设置"
+                            )
+                        }
                     }
+                ) { pagePadding, scrollBehavior ->
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(pagePadding)
+                            .nestedScroll(scrollBehavior.nestedScrollConnection),
+                        contentPadding = PaddingValues(
+                            start = 14.dp,
+                            end = 14.dp,
+                            top = 8.dp,
+                            bottom = bottomContentPadding
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        item(key = "header-mcdn-relay") {
+                            PreferenceGroupTitle("MCDN 边缘节点中继与调度")
+                        }
+                        item(key = "card-mcdn-relay") {
+                            PreferenceGroupCard {
+                                PreferenceSwitchItem(
+                                    title = stringResource(R.string.label_enable_mcdn_proxy),
+                                    summary = stringResource(R.string.summary_enable_mcdn_proxy),
+                                    checked = config.proxyMcdn,
+                                    onCheckedChange = { onConfigChange(config.copy(proxyMcdn = it)) },
+                                    icon = Icons.Outlined.AltRoute,
+                                    enabled = config.enabled
+                                )
 
-                    PreferenceDropdownItem(
-                        title = stringResource(R.string.label_proxy_host),
-                        summary = "当前中继: ${config.proxyHost}",
-                        selectedValue = currentProxyLabel,
-                        onClick = { showProxyHostDialog = true },
-                        enabled = config.enabled && config.proxyMcdn
-                    )
+                                PreferenceDivider()
 
-                    PreferenceDivider()
+                                val currentProxyLabel = when (config.proxyHost) {
+                                    "proxy-tf-all-ws.bilivideo.com" -> "网宿"
+                                    "proxy-tf-all-tx.bilivideo.com" -> "腾讯云"
+                                    "proxy-tf-all-hw.bilivideo.com" -> "华为云"
+                                    else -> config.proxyHost.substringBefore('.').removePrefix("proxy-")
+                                }
 
-                    val currentMcdnStrategyLabel = when (config.mcdnStrategy.lowercase()) {
-                        "proxy-all" -> "中继全部 (proxy-all)"
-                        "proxy-v1" -> "仅中继资源 (/v1/resource/)"
-                        "replace" -> "直接替换为 UPOS (replace)"
-                        else -> config.mcdnStrategy
+                                PreferenceDropdownItem(
+                                    title = stringResource(R.string.label_proxy_host),
+                                    summary = "当前中继: ${config.proxyHost}",
+                                    selectedValue = currentProxyLabel,
+                                    onClick = { showProxyHostDialog = true },
+                                    enabled = config.enabled && config.proxyMcdn
+                                )
+
+                                PreferenceDivider()
+
+                                val currentMcdnStrategyLabel = when (config.mcdnStrategy.lowercase()) {
+                                    "proxy-all" -> "中继全部 (proxy-all)"
+                                    "proxy-v1" -> "仅中继资源 (/v1/resource/)"
+                                    "replace" -> "直接替换为 UPOS (replace)"
+                                    else -> config.mcdnStrategy
+                                }
+
+                                PreferenceDropdownItem(
+                                    title = "MCDN 调度策略",
+                                    summary = "当前策略: $currentMcdnStrategyLabel",
+                                    selectedValue = currentMcdnStrategyLabel.substringBefore(" ("),
+                                    onClick = { showMcdnStrategyDialog = true },
+                                    enabled = config.enabled && config.proxyMcdn
+                                )
+                            }
+                        }
                     }
-
-                    PreferenceDropdownItem(
-                        title = "MCDN 调度策略",
-                        summary = "当前策略: $currentMcdnStrategyLabel",
-                        selectedValue = currentMcdnStrategyLabel.substringBefore(" ("),
-                        onClick = { showMcdnStrategyDialog = true },
-                        enabled = config.enabled && config.proxyMcdn
-                    )
-
-                    PreferenceDivider()
-
-                    PreferenceSwitchItem(
-                        title = "改写 Akamai 官方节点",
-                        summary = "默认放行官方 Akamai 线路；开启后将其重定向至首选 UPOS 镜像（适合当地 Akamai 连接较慢的情况）",
-                        checked = config.rewriteAkamai,
-                        onCheckedChange = { onConfigChange(config.copy(rewriteAkamai = it)) },
-                        enabled = config.enabled
-                    )
-
-                    PreferenceDivider()
-
-                    PreferenceSwitchItem(
-                        title = stringResource(R.string.label_port_heuristic),
-                        summary = stringResource(R.string.summary_port_heuristic),
-                        checked = config.portHeuristic,
-                        onCheckedChange = { onConfigChange(config.copy(portHeuristic = it)) },
-                        enabled = config.enabled
-                    )
-
-                    PreferenceDivider()
-
-                    PreferenceSwitchItem(
-                        title = stringResource(R.string.label_enable_moss),
-                        summary = stringResource(R.string.summary_enable_moss),
-                        checked = config.enableMossHook,
-                        onCheckedChange = { onConfigChange(config.copy(enableMossHook = it)) },
-                        enabled = config.enabled && config.blockPcdn
-                    )
-
-                    PreferenceDivider()
-
-                    PreferenceSwitchItem(
-                        title = "BTR 多线程并发切片加速",
-                        summary = "通过本地回环代理并发拉取 Range 分片并执行多源 CDN 智能调度",
-                        checked = config.enableBtr,
-                        onCheckedChange = { onConfigChange(config.copy(enableBtr = it)) },
-                        enabled = config.enabled
-                    )
-
-                    PreferenceDivider()
-
-                    PreferenceSwitchItem(
-                        title = "BTR 自动动态线程调节",
-                        summary = "智能感知播放缓冲状态，开播与Seek时高并发冲刺充填缓冲，稳定后回落以降低功耗",
-                        checked = config.btrAutoConcurrency,
-                        onCheckedChange = { onConfigChange(config.copy(btrAutoConcurrency = it)) },
-                        enabled = config.enabled && config.enableBtr
-                    )
-
-                    PreferenceDivider()
-
-                    val concurrencySummary = if (config.btrAutoConcurrency) {
-                        "基准 / 冲刺上限: ${config.btrConcurrency} 线程 (自动动态调节中)"
-                    } else {
-                        "固定并发: ${config.btrConcurrency} 线程"
-                    }
-
-                    PreferenceDropdownItem(
-                        title = "BTR 并发线程数",
-                        summary = concurrencySummary,
-                        selectedValue = "${config.btrConcurrency} 线程",
-                        onClick = { showConcurrencyDialog = true },
-                        enabled = config.enabled && config.enableBtr
-                    )
-
-                    PreferenceDivider()
-
-                    val effectivePool = BiliAcceleratorCore.getEffectiveCdnPool(config)
-                    val poolSummary = if (config.customCdnPool.isEmpty()) {
-                        "默认官方 8 节点并发 (点击自定义配置，支持最多 32 个)"
-                    } else {
-                        "已配置 ${effectivePool.size} 个白名单并发镜像 (点击管理列表)"
-                    }
-
-                    PreferenceDropdownItem(
-                        title = "并发 CDN 节点池",
-                        summary = poolSummary,
-                        selectedValue = "${effectivePool.size} 个节点",
-                        onClick = { showCdnPoolDialog = true },
-                        enabled = config.enabled && config.enableBtr
-                    )
-
-                    PreferenceDivider()
-
-                    PreferenceSwitchItem(
-                        title = "BTR 自适应切片尺寸",
-                        summary = "根据视频体积与清晰度在 256KB~2MB 动态匹配切片大小，兼顾秒开与高码率吞吐",
-                        checked = config.btrAutoChunkSize,
-                        onCheckedChange = { onConfigChange(config.copy(btrAutoChunkSize = it)) },
-                        enabled = config.enabled && config.enableBtr
-                    )
-
-                    PreferenceDivider()
-
-                    val chunkSizeSummary = if (config.btrAutoChunkSize) {
-                        "基准: ${config.btrChunkSizeKb} KB (自适应动态调节中)"
-                    } else {
-                        "固定分片大小: ${config.btrChunkSizeKb} KB"
-                    }
-
-                    PreferenceDropdownItem(
-                        title = "基准分片大小",
-                        summary = chunkSizeSummary,
-                        selectedValue = "${config.btrChunkSizeKb} KB",
-                        onClick = { showChunkSizeDialog = true },
-                        enabled = config.enabled && config.enableBtr
-                    )
                 }
             }
 
-            // Group 3: 数据统计与诊断
-            item(key = "header-diag") {
-                PreferenceGroupTitle(stringResource(R.string.group_data_diag))
-            }
-            item(key = "card-diag") {
-                PreferenceGroupCard {
-                    PreferenceActionItem(
-                        title = stringResource(R.string.btn_export_diag),
-                        summary = stringResource(R.string.summary_export_diag),
-                        icon = Icons.Outlined.ContentCopy,
-                        onClick = onExportDiagnostic
-                    )
+            SettingsSubPage.BTR -> {
+                AcceleratorPage(
+                    title = "BTR 并发切片加速",
+                    navigationIcon = {
+                        IconButton(onClick = { currentSubPage = SettingsSubPage.MAIN }) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "返回设置"
+                            )
+                        }
+                    }
+                ) { pagePadding, scrollBehavior ->
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(pagePadding)
+                            .nestedScroll(scrollBehavior.nestedScrollConnection),
+                        contentPadding = PaddingValues(
+                            start = 14.dp,
+                            end = 14.dp,
+                            top = 8.dp,
+                            bottom = bottomContentPadding
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        item(key = "header-btr-main") {
+                            PreferenceGroupTitle("BTR 多线程并发调度核心")
+                        }
+                        item(key = "card-btr-main") {
+                            PreferenceGroupCard {
+                                PreferenceSwitchItem(
+                                    title = "BTR 多线程并发切片加速",
+                                    summary = "通过本地回环代理并发拉取 Range 分片并执行多源 CDN 智能调度",
+                                    checked = config.enableBtr,
+                                    onCheckedChange = { onConfigChange(config.copy(enableBtr = it)) },
+                                    icon = Icons.Outlined.Bolt,
+                                    enabled = config.enabled
+                                )
 
-                    PreferenceDivider()
+                                PreferenceDivider()
 
-                    PreferenceActionItem(
-                        title = stringResource(R.string.btn_clear_stats),
-                        summary = stringResource(R.string.summary_clear_stats),
-                        icon = Icons.Outlined.Delete,
-                        tintColor = TagPcdn,
-                        onClick = { showConfirmClearDialog = true }
-                    )
-                }
-            }
+                                PreferenceSwitchItem(
+                                    title = "BTR 自动动态线程调节",
+                                    summary = "智能感知播放缓冲状态，开播与Seek时高并发冲刺充填缓冲，稳定后回落以降低功耗",
+                                    checked = config.btrAutoConcurrency,
+                                    onCheckedChange = { onConfigChange(config.copy(btrAutoConcurrency = it)) },
+                                    enabled = config.enabled && config.enableBtr
+                                )
 
-            // Group 4: 界面风格与外观
-            item(key = "header-ui") {
-                PreferenceGroupTitle(stringResource(R.string.group_ui_appearance))
-            }
-            item(key = "card-ui") {
-                PreferenceGroupCard {
-                    PreferenceDropdownItem(
-                        title = stringResource(R.string.label_ui_style),
-                        summary = stringResource(R.string.summary_ui_style),
-                        selectedValue = uiPreferences.style.label,
-                        icon = Icons.Outlined.Palette,
-                        onClick = { showStyleDialog = true }
-                    )
+                                PreferenceDivider()
 
-                    PreferenceDivider()
+                                // 1. BTR 并发线程数 - 滑块调节
+                                val concurrencyDesc = when (config.btrConcurrency) {
+                                    2 -> "2 线程 (超低功耗/弱网推荐)"
+                                    4 -> "4 线程 (平稳省电)"
+                                    6 -> "6 线程 (推荐均衡)"
+                                    8 -> "8 线程 (高速流畅)"
+                                    12 -> "12 线程 (4K/高码率推荐)"
+                                    16 -> "16 线程 (极限冲峰)"
+                                    else -> "${config.btrConcurrency} 线程"
+                                }
+                                val concurrencySummary = if (config.btrAutoConcurrency) {
+                                    "基准 / 冲刺上限: $concurrencyDesc (自动动态调节中)"
+                                } else {
+                                    "固定并发: $concurrencyDesc"
+                                }
 
-                    PreferenceDropdownItem(
-                        title = stringResource(R.string.label_theme_mode),
-                        summary = stringResource(R.string.summary_theme_mode),
-                        selectedValue = uiPreferences.themeMode.label,
-                        onClick = { showThemeModeDialog = true }
-                    )
+                                PreferenceSliderItem(
+                                    title = "BTR 并发线程数",
+                                    summary = concurrencySummary,
+                                    value = config.btrConcurrency.coerceIn(2, 16).toFloat(),
+                                    onValueChange = { onConfigChange(config.copy(btrConcurrency = it.roundToInt())) },
+                                    valueRange = 2f..16f,
+                                    steps = 13,
+                                    valueLabel = "${config.btrConcurrency} 线程",
+                                    enabled = config.enabled && config.enableBtr
+                                )
+
+                                PreferenceDivider()
+
+                                // 2. 并发 CDN 节点池 - 滑块调节
+                                val poolSummary = when (config.btrCdnPoolSize) {
+                                    1 -> "1 个节点 · 仅单源拉取，不进行多源并发调度"
+                                    in 2..3 -> "${config.btrCdnPoolSize} 个节点 · 基础多源互备，低握手开销"
+                                    in 4..6 -> "${config.btrCdnPoolSize} 个节点 · 骨干云厂商节点均衡并发"
+                                    8 -> "8 个节点 · 推荐配置，官方多源全量并发拉取"
+                                    in 9..11 -> "${config.btrCdnPoolSize} 个节点 · 深度竞速，含全国混流节点"
+                                    else -> "12 个节点 · 全量白名单池跨源分片抢占"
+                                }
+
+                                PreferenceSliderItem(
+                                    title = "并发 CDN 节点池",
+                                    summary = poolSummary,
+                                    value = config.btrCdnPoolSize.coerceIn(1, 12).toFloat(),
+                                    onValueChange = { onConfigChange(config.copy(btrCdnPoolSize = it.roundToInt())) },
+                                    valueRange = 1f..12f,
+                                    steps = 10,
+                                    valueLabel = "${config.btrCdnPoolSize} 个节点",
+                                    enabled = config.enabled && config.enableBtr
+                                )
+
+                                PreferenceDivider()
+
+                                PreferenceSwitchItem(
+                                    title = "BTR 自适应切片尺寸",
+                                    summary = "根据视频体积与清晰度在 256KB~2MB 动态匹配切片大小，兼顾秒开与高码率吞吐",
+                                    checked = config.btrAutoChunkSize,
+                                    onCheckedChange = { onConfigChange(config.copy(btrAutoChunkSize = it)) },
+                                    enabled = config.enabled && config.enableBtr
+                                )
+
+                                PreferenceDivider()
+
+                                // 3. 基准分片大小 - 滑块调节
+                                val chunkOptions = listOf(256, 512, 1024, 2048)
+                                val currentChunkIndex = chunkOptions.indexOf(config.btrChunkSizeKb).let { if (it >= 0) it else 1 }
+                                val chunkSizeDesc = when (config.btrChunkSizeKb) {
+                                    256 -> "256 KB (低码率 / 秒开优化)"
+                                    512 -> "512 KB (标准均衡推荐)"
+                                    1024 -> "1024 KB (1 MB · 适合高码率)"
+                                    2048 -> "2048 KB (2 MB · 适合4K长视频)"
+                                    else -> "${config.btrChunkSizeKb} KB"
+                                }
+                                val chunkSizeSummary = if (config.btrAutoChunkSize) {
+                                    "基准: $chunkSizeDesc (自适应动态调节中)"
+                                } else {
+                                    "固定分片大小: $chunkSizeDesc"
+                                }
+
+                                PreferenceSliderItem(
+                                    title = "基准分片大小",
+                                    summary = chunkSizeSummary,
+                                    value = currentChunkIndex.toFloat(),
+                                    onValueChange = { newIdx ->
+                                        val idx = newIdx.roundToInt().coerceIn(0, chunkOptions.lastIndex)
+                                        onConfigChange(config.copy(btrChunkSizeKb = chunkOptions[idx]))
+                                    },
+                                    valueRange = 0f..3f,
+                                    steps = 2,
+                                    valueLabel = "${config.btrChunkSizeKb} KB",
+                                    enabled = config.enabled && config.enableBtr
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -748,23 +891,22 @@ private fun UposSpeedTestDialog(
         }
         testJob = coroutineScope.launch {
             try {
-                withContext(Dispatchers.IO) {
+                val results = withContext(Dispatchers.IO) {
                     uposValues.map { host ->
                         async {
-                            val result = runCatching {
-                                withTimeout(4500L) {
-                                    val cost = probeUposHostLatencyMs(host)
-                                    UposTestState(host = host, latencyMs = cost, isTesting = false)
+                            try {
+                                val lat = withTimeout(3000L) {
+                                    probeUposHostLatencyMs(host)
                                 }
-                            }.getOrElse {
-                                UposTestState(host = host, latencyMs = null, isTesting = false, error = "超时/失败")
-                            }
-                            withContext(Dispatchers.Main) {
-                                testStates = testStates + (host to result)
+                                host to UposTestState(host = host, latencyMs = lat, isTesting = false)
+                            } catch (e: Exception) {
+                                val err = if (e is kotlinx.coroutines.TimeoutCancellationException) "超时" else (e.message ?: "失败")
+                                host to UposTestState(host = host, latencyMs = null, isTesting = false, error = err)
                             }
                         }
                     }.awaitAll()
                 }
+                testStates = results.toMap()
             } finally {
                 isTestingAll = false
             }
@@ -775,27 +917,33 @@ private fun UposSpeedTestDialog(
         startSpeedTest()
     }
 
-    val dark = isAcceleratorDarkTheme()
-
-    val sortedHosts = remember(testStates, isTestingAll) {
-        if (isTestingAll) {
-            uposValues
-        } else {
-            uposValues.sortedWith { a, b ->
-                val latA = testStates[a]?.latencyMs ?: Long.MAX_VALUE
-                val latB = testStates[b]?.latencyMs ?: Long.MAX_VALUE
-                latA.compareTo(latB)
+    val sortedHosts = remember(testStates, uposValues) {
+        uposValues.sortedWith(
+            compareBy<String> { host ->
+                val state = testStates[host]
+                when {
+                    state?.isTesting == true -> 1
+                    state?.latencyMs != null -> 0
+                    else -> 2
+                }
+            }.thenBy { host ->
+                testStates[host]?.latencyMs ?: Long.MAX_VALUE
             }
-        }
+        )
     }
 
+    val dark = isAcceleratorDarkTheme()
+
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            testJob?.cancel()
+            onDismiss()
+        },
         title = {
             Row(
-                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                modifier = Modifier.fillMaxWidth()
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(text = stringResource(R.string.speed_test_dialog_title), fontWeight = FontWeight.Bold, fontSize = 18.sp)
                 if (isTestingAll) {
@@ -988,307 +1136,6 @@ private fun McdnStrategyDialog(
         confirmButton = {
             TextButton(onClick = onDismiss) {
                 Text("关闭")
-            }
-        },
-        shape = RoundedCornerShape(20.dp)
-    )
-}
-
-@Composable
-private fun ConcurrencyDialog(
-    currentConcurrency: Int,
-    onSelect: (Int) -> Unit,
-    onDismiss: () -> Unit
-) {
-    val options = listOf(2, 4, 6, 8, 10, 12, 16)
-    var selectedValue by rememberSaveable { mutableStateOf(currentConcurrency) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("BTR 并发线程数设置") },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-            ) {
-                Text(
-                    text = "当前选择: $selectedValue 线程",
-                    fontSize = 14.sp,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(bottom = 12.dp)
-                )
-
-                options.forEach { threads ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .selectable(
-                                selected = (threads == selectedValue),
-                                onClick = { selectedValue = threads }
-                            )
-                            .padding(vertical = 8.dp, horizontal = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(
-                            selected = (threads == selectedValue),
-                            onClick = { selectedValue = threads }
-                        )
-                        val desc = when (threads) {
-                            2 -> "2 线程 (超低功耗/弱网推荐)"
-                            4 -> "4 线程 (平稳省电)"
-                            6 -> "6 线程 (默认均衡)"
-                            8 -> "8 线程 (高速流畅)"
-                            12 -> "12 线程 (4K/高码率推荐)"
-                            16 -> "16 线程 (极限冲峰)"
-                            else -> "$threads 线程"
-                        }
-                        Text(
-                            text = desc,
-                            fontSize = 14.sp,
-                            modifier = Modifier.padding(start = 8.dp)
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                onSelect(selectedValue)
-                onDismiss()
-            }) {
-                Text("确定")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("取消")
-            }
-        },
-        shape = RoundedCornerShape(20.dp)
-    )
-}
-
-
-@Composable
-private fun ChunkSizeDialog(
-    currentChunkSizeKb: Int,
-    onSelect: (Int) -> Unit,
-    onDismiss: () -> Unit
-) {
-    val options = listOf(256, 512, 1024, 2048)
-    var selectedValue by rememberSaveable { mutableStateOf(currentChunkSizeKb) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("基准分片大小设置") },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-            ) {
-                Text(
-                    text = "当前选择: $selectedValue KB",
-                    fontSize = 14.sp,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(bottom = 12.dp)
-                )
-
-                options.forEach { sizeKb ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .selectable(
-                                selected = (sizeKb == selectedValue),
-                                onClick = { selectedValue = sizeKb }
-                            )
-                            .padding(vertical = 8.dp, horizontal = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(
-                            selected = (sizeKb == selectedValue),
-                            onClick = { selectedValue = sizeKb }
-                        )
-                        val desc = when (sizeKb) {
-                            256 -> "256 KB (低码率/秒开优化)"
-                            512 -> "512 KB (标准均衡推荐)"
-                            1024 -> "1024 KB (1 MB · 适合高码率)"
-                            2048 -> "2048 KB (2 MB · 适合4K长视频)"
-                            else -> "$sizeKb KB"
-                        }
-                        Text(
-                            text = desc,
-                            fontSize = 14.sp,
-                            modifier = Modifier.padding(start = 8.dp)
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                onSelect(selectedValue)
-                onDismiss()
-            }) {
-                Text("确定")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("取消")
-            }
-        },
-        shape = RoundedCornerShape(20.dp)
-    )
-}
-
-@Composable
-private fun CustomCdnPoolDialog(
-    currentPool: List<String>,
-    onSavePool: (List<String>) -> Unit,
-    onDismiss: () -> Unit
-) {
-    var poolList by rememberSaveable {
-        mutableStateOf(
-            if (currentPool.isNotEmpty()) currentPool else BiliAcceleratorCore.DEFAULT_CDN_POOL
-        )
-    }
-    var inputHost by rememberSaveable { mutableStateOf("") }
-    var inputError by rememberSaveable { mutableStateOf<String?>(null) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Column {
-                Text("自定义并发 CDN 节点池")
-                Text(
-                    text = "支持配置最多 32 个并发拉取镜像（已配置 ${poolList.size} 个）",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OutlinedTextField(
-                        value = inputHost,
-                        onValueChange = {
-                            inputHost = it
-                            inputError = null
-                        },
-                        modifier = Modifier.weight(1f),
-                        placeholder = { Text("例: upos-sz-mirrorali.bilivideo.com", fontSize = 11.sp) },
-                        singleLine = true,
-                        isError = inputError != null
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    TextButton(
-                        onClick = {
-                            val clean = BiliAcceleratorCore.cleanHost(inputHost).lowercase()
-                            val hostOnly = clean.substringBefore(':')
-                            if (clean.isBlank()) {
-                                inputError = "请输入域名"
-                            } else if (!BiliAcceleratorCore.isValidHost(hostOnly)) {
-                                inputError = "域名格式不合法"
-                            } else if (BiliAcceleratorCore.isAkamaiHost(hostOnly)) {
-                                inputError = "Akamai 专属鉴权节点不可作为并发镜像"
-                            } else if (poolList.contains(hostOnly)) {
-                                inputError = "节点已存在"
-                            } else if (poolList.size >= 32) {
-                                inputError = "最多支持 32 个节点"
-                            } else {
-                                poolList = poolList + hostOnly
-                                inputHost = ""
-                                inputError = null
-                            }
-                        }
-                    ) {
-                        Text("添加")
-                    }
-                }
-
-                if (inputError != null) {
-                    Text(
-                        text = inputError!!,
-                        color = MaterialTheme.colorScheme.error,
-                        fontSize = 12.sp,
-                        modifier = Modifier.padding(bottom = 8.dp, start = 4.dp)
-                    )
-                }
-
-                poolList.forEachIndexed { index, host ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 3.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = host,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Icon(
-                            imageVector = Icons.Outlined.Delete,
-                            contentDescription = "删除节点",
-                            tint = TagPcdn,
-                            modifier = Modifier
-                                .size(20.dp)
-                                .clickable {
-                                    poolList = poolList.filterIndexed { i, _ -> i != index }
-                                }
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
-                ) {
-                    TextButton(
-                        onClick = {
-                            poolList = BiliAcceleratorCore.DEFAULT_CDN_POOL
-                            inputError = null
-                        }
-                    ) {
-                        Text("恢复默认官方节点", fontSize = 12.sp)
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    onSavePool(poolList)
-                    onDismiss()
-                }
-            ) {
-                Text("保存")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("取消")
             }
         },
         shape = RoundedCornerShape(20.dp)

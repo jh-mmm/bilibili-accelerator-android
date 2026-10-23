@@ -22,6 +22,7 @@ import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
 fun AcceleratorPage(
     title: String,
     modifier: Modifier = Modifier,
+    navigationIcon: @Composable () -> Unit = {},
     actions: @Composable RowScope.() -> Unit = {},
     content: @Composable (PaddingValues, TopAppBarScrollBehavior) -> Unit
 ) {
@@ -40,6 +41,7 @@ fun AcceleratorPage(
                         letterSpacing = if (uiStyle == UiStyle.MIUIX) 0.5.sp else 0.sp
                     )
                 },
+                navigationIcon = navigationIcon,
                 actions = actions,
                 scrollBehavior = scrollBehavior,
                 colors = TopAppBarDefaults.largeTopAppBarColors(

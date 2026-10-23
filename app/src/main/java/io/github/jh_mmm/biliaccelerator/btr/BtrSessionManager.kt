@@ -156,6 +156,8 @@ object BtrSessionManager {
             )
         }
 
+        val maxBackups = if (config != null) config.btrCdnPoolSize.coerceIn(1, candidateList.size) else 3
+
         for (m in candidateList) {
             val cleanM = BiliAcceleratorCore.cleanHost(m).lowercase()
             if (cleanM == host || cleanM.endsWith(".akamaized.net")) continue
@@ -164,7 +166,7 @@ object BtrSessionManager {
             if (isOverseasStream != candidateIsOv) continue
 
             results.add(uri.replaceAuthority(cleanM))
-            if (results.size >= 3) break
+            if (results.size >= maxBackups) break
         }
         return results
     }

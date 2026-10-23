@@ -40,7 +40,8 @@ data class AcceleratorConfig(
     val btrConcurrency: Int = 6,
     val btrAutoChunkSize: Boolean = true,
     val btrChunkSizeKb: Int = 512,
-    val customCdnPool: List<String> = emptyList()
+    val customCdnPool: List<String> = emptyList(),
+    val btrCdnPoolSize: Int = 8
 )
 
 object BiliAcceleratorCore {
@@ -122,9 +123,11 @@ object BiliAcceleratorCore {
             .map { cleanHost(it).lowercase() }
             .filter { isValidHost(it) && !isAkamaiHost(it) }
             .distinct()
-        if (userList.isNotEmpty()) return userList.take(32)
-
-        return if (isOverseasEnvironment()) OVERSEAS_CANDIDATE_POOL else MAINLAND_CANDIDATE_POOL
+        val basePool = if (userList.isNotEmpty()) userList else {
+            if (isOverseasEnvironment()) OVERSEAS_CANDIDATE_POOL else MAINLAND_CANDIDATE_POOL
+        }
+        val poolSize = config.btrCdnPoolSize.coerceIn(1, 32)
+        return basePool.take(poolSize)
     }
 
     private val HOSTNAME_REGEX = Regex("""^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(:[0-9]{1,5})?$""")

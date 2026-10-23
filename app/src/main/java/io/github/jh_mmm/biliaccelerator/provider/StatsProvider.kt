@@ -97,6 +97,7 @@ class StatsProvider : ContentProvider() {
         const val KEY_BTR_AUTO_CHUNK_SIZE = "cfg_btr_auto_chunk_size"
         const val KEY_BTR_CHUNK_SIZE_KB = "cfg_btr_chunk_size_kb"
         const val KEY_CUSTOM_CDN_POOL = "cfg_custom_cdn_pool"
+        const val KEY_BTR_CDN_POOL_SIZE = "cfg_btr_cdn_pool_size"
 
         private val gson = Gson()
 
@@ -158,7 +159,8 @@ class StatsProvider : ContentProvider() {
                 btrConcurrency = sp.getInt(KEY_BTR_CONCURRENCY, 6),
                 btrAutoChunkSize = sp.getBoolean(KEY_BTR_AUTO_CHUNK_SIZE, true),
                 btrChunkSizeKb = sp.getInt(KEY_BTR_CHUNK_SIZE_KB, 512),
-                customCdnPool = customPool
+                customCdnPool = customPool,
+                btrCdnPoolSize = sp.getInt(KEY_BTR_CDN_POOL_SIZE, 8)
             )
         }
 
@@ -181,6 +183,7 @@ class StatsProvider : ContentProvider() {
                 .putBoolean(KEY_BTR_AUTO_CHUNK_SIZE, config.btrAutoChunkSize)
                 .putInt(KEY_BTR_CHUNK_SIZE_KB, config.btrChunkSizeKb)
                 .putString(KEY_CUSTOM_CDN_POOL, gson.toJson(config.customCdnPool))
+                .putInt(KEY_BTR_CDN_POOL_SIZE, config.btrCdnPoolSize)
                 .apply()
             runCatching {
                 context.contentResolver.notifyChange(CONTENT_URI, null)
