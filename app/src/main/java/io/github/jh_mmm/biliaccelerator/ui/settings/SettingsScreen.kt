@@ -575,12 +575,12 @@ fun SettingsScreen(
 
                                 // 1. BTR 并发线程数 - 滑块调节
                                 val concurrencyDesc = when (config.btrConcurrency) {
-                                    2 -> "2 线程 (超低功耗/弱网推荐)"
-                                    4 -> "4 线程 (平稳省电)"
-                                    6 -> "6 线程 (推荐均衡)"
-                                    8 -> "8 线程 (高速流畅)"
-                                    12 -> "12 线程 (4K/高码率推荐)"
-                                    16 -> "16 线程 (极限冲峰)"
+                                    2 -> "2 线程"
+                                    4 -> "4 线程"
+                                    6 -> "6 线程"
+                                    8 -> "8 线程"
+                                    12 -> "12 线程"
+                                    16 -> "16 线程"
                                     else -> "${config.btrConcurrency} 线程"
                                 }
                                 val concurrencySummary = if (config.btrAutoConcurrency) {
@@ -653,10 +653,10 @@ fun SettingsScreen(
                                 val chunkOptions = listOf(256, 512, 1024, 2048)
                                 val currentChunkIndex = chunkOptions.indexOf(config.btrChunkSizeKb).let { if (it >= 0) it else 1 }
                                 val chunkSizeDesc = when (config.btrChunkSizeKb) {
-                                    256 -> "256 KB (低码率 / 秒开优化)"
+                                    256 -> "256 KB"
                                     512 -> "512 KB (标准均衡推荐)"
-                                    1024 -> "1024 KB (1 MB · 适合高码率)"
-                                    2048 -> "2048 KB (2 MB · 适合4K长视频)"
+                                    1024 -> "1024 KB"
+                                    2048 -> "2048 KB"
                                     else -> "${config.btrChunkSizeKb} KB"
                                 }
                                 val chunkSizeSummary = if (config.btrAutoChunkSize) {
