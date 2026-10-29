@@ -22,7 +22,6 @@ object BtrChunkEngine {
     const val AUDIO_MAX_CONCURRENCY = 2
     const val PROBE_PREFIX_BYTES = 64 * 1024
 
-    private const val DEFAULT_CHUNK_SIZE = 512 * 1024L // 512 KB
     private const val MAX_PREFETCH_CHUNKS = 8           // 移动端自适应内存滑动窗口上限 (限制在 4MB~8MB，严格防 OOM)
     private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36 BiliApp/7800300"
 
@@ -127,12 +126,12 @@ object BtrChunkEngine {
     ) {
         val isAudio = session.isAudio || BiliAcceleratorCore.isAudioTrack(session.primaryUrl)
         val initialProbeChunkSize = if (isAudio) {
-            128 * 1024L // 音频流采用 128KB 小切片低时延分片
+            CHUNK_SIZE_AUDIO.toLong() // 音频流采用 128KB 小切片低时延分片
         } else {
-            512 * 1024L // 探测首片统一使用 512KB 快速拉取总长度
+            CHUNK_SIZE_VIDEO.toLong() // 探测首片统一使用 512KB 快速拉取总长度
         }
 
-        val baseConcurrency = if (isAudio) 2 else concurrency.coerceIn(2, 16)
+        val baseConcurrency = if (isAudio) AUDIO_MAX_CONCURRENCY else concurrency.coerceIn(2, 16)
         val useAuto = !isAudio && autoConcurrency
         val burstConcurrency = if (useAuto) maxOf(baseConcurrency, 8).coerceAtMost(16) else baseConcurrency
 
@@ -395,7 +394,7 @@ object BtrChunkEngine {
 
                 var totalBytes = 0L
                 response.body?.byteStream()?.use { input ->
-                    val buffer = ByteArray(64 * 1024)
+                    val buffer = ByteArray(PROBE_PREFIX_BYTES)
                     var read: Int
                     while (input.read(buffer).also { read = it } != -1) {
                         clientOut.write(buffer, 0, read)

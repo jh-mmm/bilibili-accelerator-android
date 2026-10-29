@@ -15,7 +15,6 @@ data class BtrMediaSession(
     @Volatile var userAgent: String?,
     @Volatile var referer: String = "https://www.bilibili.com/",
     val isAudio: Boolean = false,
-    val createdAt: Long = System.currentTimeMillis(),
     val lastAccessed: AtomicLong = AtomicLong(System.currentTimeMillis()),
     @Volatile var totalLength: Long = -1L,
     @Volatile var contentType: String? = null
