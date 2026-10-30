@@ -127,8 +127,7 @@ object PlayerHook {
                         val cleanLive = distinctFiltered.firstOrNull {
                             val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(it)?.host)
                             BiliAcceleratorCore.isLiveMediaUrl("", it) &&
-                                    !BiliAcceleratorCore.isKnownP2pHost(host) &&
-                                    !BiliAcceleratorCore.isIpAddress(host)
+                                    !BiliAcceleratorCore.isSlowLiveHost(host, it, config.portHeuristic)
                         }
                         if (cleanLive != null) {
                             val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cleanLive)?.host)
@@ -232,7 +231,7 @@ object PlayerHook {
             }
             if (result.isPcdn && config.blockPcdn && parsed != null) {
                 val cleanLiveHost = builderInstance?.let { builderCleanLiveHost[it] } ?: latestCleanLiveHost
-                if (!cleanLiveHost.isNullOrBlank() && !BiliAcceleratorCore.isKnownP2pHost(cleanLiveHost) && !BiliAcceleratorCore.isIpAddress(cleanLiveHost)) {
+                if (!cleanLiveHost.isNullOrBlank() && !BiliAcceleratorCore.isSlowLiveHost(cleanLiveHost, portHeuristic = config.portHeuristic)) {
                     val rewritten = parsed.replaceAuthority(cleanLiveHost)
                     val liveResult = RewriteResult(
                         changed = true,

@@ -3,7 +3,10 @@ package io.github.jh_mmm.biliaccelerator.hook
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.database.ContentObserver
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import com.google.gson.Gson
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
@@ -48,6 +51,7 @@ object RemoteClient {
 
     @Volatile
     private var appContext: Context? = null
+    private val isObserverRegistered = AtomicBoolean(false)
 
     fun setAppContext(context: Context) {
         val app = try {
@@ -60,11 +64,41 @@ object RemoteClient {
         // 从目标 App 私有目录载入历史持久化配置（1.0.5 逻辑，避免冷启动使用硬编码默认镜像）
         loadConfigFromLocalCache(app)
 
+        // 注册 ContentObserver 监听配置变更（实现毫秒级实时同步，彻底消除 30 秒延迟）
+        registerConfigObserver(app)
+
         // 发送启动握手（同步包名、版本，更新看板“等待拦截”活跃状态）
         sendHandshakeAsync(app)
 
         // 异步拉取最新配置
         fetchConfigAsync(app)
+    }
+
+    private fun registerConfigObserver(context: Context) {
+        if (isObserverRegistered.compareAndSet(false, true)) {
+            try {
+                val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+                    override fun onChange(selfChange: Boolean) {
+                        Log.i(TAG, "Configuration change detected via ContentObserver, reloading immediately...")
+                        lastConfigFetchTime.set(0L)
+                        fetchConfigAsync(context) { newConfig ->
+                            if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+                                io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.updateParameters(
+                                    concurrency = newConfig.btrConcurrency,
+                                    chunkSizeKb = newConfig.btrChunkSizeKb,
+                                    autoConcurrency = newConfig.btrAutoConcurrency,
+                                    autoChunkSize = newConfig.btrAutoChunkSize
+                                )
+                            }
+                        }
+                    }
+                }
+                context.contentResolver.registerContentObserver(StatsProvider.CONTENT_URI, true, observer)
+                Log.i(TAG, "Successfully registered ContentObserver for real-time config sync")
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to register ContentObserver: ${t.message}")
+            }
+        }
     }
 
     fun getContext(): Context? {
@@ -149,7 +183,7 @@ object RemoteClient {
         }
     }
 
-    private fun fetchConfigAsync(context: Context) {
+    private fun fetchConfigAsync(context: Context, onLoaded: ((AcceleratorConfig) -> Unit)? = null) {
         if (isFetching.compareAndSet(false, true)) {
             configExecutor.execute {
                 try {
@@ -158,6 +192,7 @@ object RemoteClient {
                         cachedConfig = config
                         lastConfigFetchTime.set(System.currentTimeMillis())
                         saveConfigToLocalCache(context, config)
+                        onLoaded?.invoke(config)
                     } else {
                         lastConfigFetchTime.set(System.currentTimeMillis() - CONFIG_CACHE_TTL + 5_000L)
                     }

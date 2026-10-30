@@ -1,13 +1,16 @@
 package io.github.jh_mmm.biliaccelerator.btr
 
 import android.util.Log
+import java.io.BufferedOutputStream
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 object BtrLocalProxyServer {
 
@@ -23,16 +26,37 @@ object BtrLocalProxyServer {
     @Volatile
     private var isRunning = false
     private var serverSocket: ServerSocket? = null
-    private val clientThreadPool = Executors.newCachedThreadPool { r ->
+    @Volatile
+    private var currentConcurrency: Int = 6
+    @Volatile
+    private var currentChunkSizeKb: Int = 512
+    @Volatile
+    private var currentAutoConcurrency: Boolean = true
+    @Volatile
+    private var currentAutoChunkSize: Boolean = true
+
+    // 有界弹性线程池，core=4, max=64, 保持 60 秒存活，杜绝线程无节制创建
+    private val clientThreadPool = ThreadPoolExecutor(
+        4,
+        64,
+        60L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue(128)
+    ) { r ->
         Thread(r, "BTR-ProxyWorker").apply { isDaemon = true }
     }
 
     @Synchronized
     fun start(concurrency: Int = 6, chunkSizeKb: Int = 512, autoConcurrency: Boolean = true, autoChunkSize: Boolean = true) {
+        currentConcurrency = concurrency
+        currentChunkSizeKb = chunkSizeKb
+        currentAutoConcurrency = autoConcurrency
+        currentAutoChunkSize = autoChunkSize
+
         if (isRunning && port > 0) return
         try {
-            // 绑定 127.0.0.1 回环地址，端口 0 由系统随机分配可用高位端口
-            val ss = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+            // 绑定 127.0.0.1 回环地址，调大 backlog 到 128 提升突发连接承载能力
+            val ss = ServerSocket(0, 128, InetAddress.getByName("127.0.0.1"))
             serverSocket = ss
             port = ss.localPort
             isRunning = true
@@ -43,7 +67,7 @@ object BtrLocalProxyServer {
                     try {
                         val client = ss.accept() ?: break
                         clientThreadPool.execute {
-                            handleClientSocket(client, concurrency, chunkSizeKb, autoConcurrency, autoChunkSize)
+                            handleClientSocket(client, currentConcurrency, currentChunkSizeKb, currentAutoConcurrency, currentAutoChunkSize)
                         }
                     } catch (e: Exception) {
                         if (!isRunning) break
@@ -59,6 +83,13 @@ object BtrLocalProxyServer {
         }
     }
 
+    fun updateParameters(concurrency: Int, chunkSizeKb: Int, autoConcurrency: Boolean, autoChunkSize: Boolean) {
+        currentConcurrency = concurrency
+        currentChunkSizeKb = chunkSizeKb
+        currentAutoConcurrency = autoConcurrency
+        currentAutoChunkSize = autoChunkSize
+    }
+
     @Synchronized
     fun stop() {
         isRunning = false
@@ -72,7 +103,12 @@ object BtrLocalProxyServer {
     private fun handleClientSocket(socket: Socket, concurrency: Int, chunkSizeKb: Int, autoConcurrency: Boolean, autoChunkSize: Boolean) {
         socket.use { s ->
             try {
+                // 网络协议栈调优：开启 tcpNoDelay 消除 Nagle 算法 40ms 延迟，调大发送缓冲区
+                s.tcpNoDelay = true
                 s.soTimeout = 30_000
+                s.sendBufferSize = 256 * 1024
+                s.receiveBufferSize = 64 * 1024
+
                 val reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.US_ASCII))
                 val requestLine = reader.readLine() ?: return
                 val parts = requestLine.split(" ")
@@ -96,7 +132,8 @@ object BtrLocalProxyServer {
                 // 路径格式: /stream/{sessionId}.m4s
                 val sessionId = path.substringAfter("/stream/").substringBefore(".m4s").substringBefore("?")
                 val session = BtrSessionManager.get(sessionId)
-                val out = s.getOutputStream()
+                val rawOut = s.getOutputStream()
+                val out = BufferedOutputStream(rawOut, 64 * 1024)
 
                 if (session == null) {
                     sendError(out, 404, "Not Found")

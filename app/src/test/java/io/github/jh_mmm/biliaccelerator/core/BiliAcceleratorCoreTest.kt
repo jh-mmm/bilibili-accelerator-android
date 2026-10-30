@@ -61,6 +61,23 @@ class BiliAcceleratorCoreTest {
     }
 
     @Test
+    fun testXyMcdnRecognition() {
+        assertTrue("Xy MCDN domain regex should match", BiliAcceleratorCore.isMcdnHost("xy123x456x789xy.mcdn.bilivideo.cn"))
+        assertTrue("Xy MCDN with port should match", BiliAcceleratorCore.isMcdnHost("xy123x456x789xy.mcdn.bilivideo.cn:4483"))
+        assertTrue("Generic MCDN should match", BiliAcceleratorCore.isMcdnHost("edge.mcdn.bilivideo.com"))
+        assertFalse("Official mirror should not match MCDN", BiliAcceleratorCore.isMcdnHost("upos-sz-mirrorcos.bilivideo.com"))
+    }
+
+    @Test
+    fun testIsSlowLiveHost() {
+        assertTrue("MCDN live host is slow", BiliAcceleratorCore.isSlowLiveHost("xy123x456x789xy.mcdn.bilivideo.cn:4483"))
+        assertTrue("IP live host is slow", BiliAcceleratorCore.isSlowLiveHost("192.168.1.1:8080"))
+        assertTrue("Non-standard port live host is slow", BiliAcceleratorCore.isSlowLiveHost("live.bilivideo.com:8443"))
+        assertTrue("Known P2P live host is slow", BiliAcceleratorCore.isSlowLiveHost("upos-sz-mirror14b.bilivideo.com"))
+        assertFalse("Official live CDN is not slow", BiliAcceleratorCore.isSlowLiveHost("d1--cn-gotcha208.bilivideo.com"))
+    }
+
+    @Test
     fun testMcdnV1ResourceProtectedFromOrdinaryHostSwap() {
         // 关键防护测试（对齐 BTR Issue #47）：
         // 即使配置了 replace 策略或 forceUpos=true，若资源路径为 /v1/resource/，绝不直接替换为普通 UPOS 域名，强制走 proxy-tf-all-ws 代理

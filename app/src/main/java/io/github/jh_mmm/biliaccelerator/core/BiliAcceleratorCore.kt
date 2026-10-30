@@ -133,6 +133,7 @@ object BiliAcceleratorCore {
     private val HOSTNAME_REGEX = Regex("""^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(:[0-9]{1,5})?$""")
     private val MEDIA_PATH_REGEX = Regex("""\.(m4s|mp4|flv|m3u8)(?:$|[?#])""", RegexOption.IGNORE_CASE)
     private val IPV6_GROUP_REGEX = Regex("""^[0-9a-fA-F]{1,4}$""")
+    private val XY_MCDN_REGEX = Regex("""^xy(?:\d+x){3}\d+xy\.mcdn\.bilivideo\.(?:cn|com|net)$""", RegexOption.IGNORE_CASE)
 
     fun isIpAddress(rawHost: String): Boolean {
         var h = cleanHost(rawHost).lowercase()
@@ -252,9 +253,45 @@ object BiliAcceleratorCore {
     }
 
     internal fun isMcdnHost(hostname: String): Boolean {
-        return hostname.endsWith(".mcdn.bilivideo.cn", ignoreCase = true) ||
-                hostname.endsWith(".mcdn.bilivideo.com", ignoreCase = true) ||
-                hostname.endsWith(".mcdn.bilivideo.net", ignoreCase = true)
+        val clean = cleanHost(hostname).lowercase().substringBefore(':')
+        return XY_MCDN_REGEX.matches(clean) ||
+                clean.endsWith(".mcdn.bilivideo.cn") ||
+                clean.endsWith(".mcdn.bilivideo.com") ||
+                clean.endsWith(".mcdn.bilivideo.net")
+    }
+
+    /**
+     * 判断直播主机是否为慢速/劣质节点（对齐 realzza isSlowLiveHost）
+     */
+    fun isSlowLiveHost(hostValue: String, extra: String? = null, portHeuristic: Boolean = true): Boolean {
+        if (hostValue.isBlank()) return false
+        val clean = cleanHost(hostValue)
+        val hostOnly = clean.substringBefore(':').lowercase()
+        val port = clean.substringAfter(':', "").toIntOrNull() ?: -1
+        if (isIpAddress(hostOnly) || isMcdnHost(hostOnly) || isKnownP2pHost(hostOnly)) {
+            return true
+        }
+        if (portHeuristic && port != -1 && port != 80 && port != 443) {
+            return true
+        }
+        if (!extra.isNullOrBlank() && (extra.contains("os=mcdn", ignoreCase = true) || extra.contains("pcdn", ignoreCase = true))) {
+            return true
+        }
+        return false
+    }
+
+    /**
+     * 清洗直播候选节点列表（对齐 realzza filterLiveUrlInfo）
+     * 剥离住宅 PCDN、MCDN 和非标端口，保留原生官方 CDN
+     */
+    fun filterLiveCandidates(rawList: List<String>, portHeuristic: Boolean = true): List<String> {
+        if (rawList.isEmpty()) return rawList
+        val kept = rawList.filter { candidate ->
+            val parsed = parseUri(candidate)
+            val host = parsed?.host ?: cleanHost(candidate)
+            !isSlowLiveHost(host, parsed?.queryParam?.invoke("extra") ?: candidate, portHeuristic)
+        }
+        return if (kept.isNotEmpty()) kept.distinct() else rawList.distinct()
     }
 
     /**
@@ -648,7 +685,8 @@ object BiliAcceleratorCore {
                 }
             }
             // 容错兜底：若所有节点均被判定为 PCDN（极端情况），保留原列表避免直播黑屏
-            return if (filtered.isNotEmpty()) filtered.distinct() else rawList.distinct()
+            val cleaned = filterLiveCandidates(filtered, config.portHeuristic)
+            return if (cleaned.isNotEmpty()) cleaned else (if (filtered.isNotEmpty()) filtered.distinct() else rawList.distinct())
         }
 
         // VOD 点播流候选过滤与补全

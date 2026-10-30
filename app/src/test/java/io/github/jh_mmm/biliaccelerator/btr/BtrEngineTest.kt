@@ -243,4 +243,75 @@ class BtrEngineTest {
             assertTrue("Synthesized backup must belong to custom pool", hasCustomHost)
         }
     }
+
+    @Test
+    fun testCdnSpeedTrackingAndEWMA() {
+        val host = "upos-sz-mirrorcos.bilivideo.com"
+        // 初始记录：1MB 数据，耗时 50ms -> 20MB/s (20,000,000 Bps)
+        BtrChunkEngine.recordHostSpeed(host, 1024 * 1024L, 50L)
+        val initialSpeed = BtrChunkEngine.getHostSpeed(host)
+        assertTrue("Initial speed should be recorded", initialSpeed > 0)
+
+        // 再次记录：1MB 数据，耗时 100ms -> 10MB/s
+        BtrChunkEngine.recordHostSpeed(host, 1024 * 1024L, 100L)
+        val ewmaSpeed = BtrChunkEngine.getHostSpeed(host)
+        // EWMA: 20M * 0.7 + 10M * 0.3 = 17M
+        assertTrue("Speed should be smoothed by EWMA", ewmaSpeed in 15_000_000.0..19_000_000.0)
+    }
+
+    @Test
+    fun testChunkTaskProgressResumeSplicing() {
+        val totalBytes = 512 * 1024
+        val prefixBytes = 200 * 1024
+        val prefix = ByteArray(prefixBytes) { 1.toByte() }
+        val tail = ByteArray(totalBytes - prefixBytes) { 2.toByte() }
+
+        val task = BtrChunkEngine.ChunkTask(
+            index = 0,
+            startByte = 0,
+            endByte = totalBytes.toLong() - 1,
+            receivedBytes = prefixBytes,
+            prefixData = prefix
+        )
+
+        assertEquals(prefixBytes, task.receivedBytes)
+        assertNotNull(task.prefixData)
+
+        // 模拟拼接
+        val combined = ByteArray(totalBytes)
+        System.arraycopy(task.prefixData!!, 0, combined, 0, task.receivedBytes)
+        System.arraycopy(tail, 0, combined, task.receivedBytes, tail.size)
+
+        task.data = combined
+        task.isSuccess = true
+
+        assertEquals(totalBytes, task.data?.size)
+        assertEquals(1.toByte(), task.data?.get(0))
+        assertEquals(1.toByte(), task.data?.get(prefixBytes - 1))
+        assertEquals(2.toByte(), task.data?.get(prefixBytes))
+        assertEquals(2.toByte(), task.data?.get(totalBytes - 1))
+    }
+
+    @Test
+    fun testLocalProxyParametersUpdate() {
+        BtrLocalProxyServer.updateParameters(
+            concurrency = 12,
+            chunkSizeKb = 1024,
+            autoConcurrency = false,
+            autoChunkSize = false
+        )
+    }
+
+    @Test
+    fun testLiveCandidatePcdnFiltering() {
+        val candidates = listOf(
+            "https://xy123x456x789xy.mcdn.bilivideo.cn:4483/live-bvc/123.flv",
+            "https://114.114.114.114:8080/live-bvc/123.flv",
+            "https://upos-sz-mirror14b.bilivideo.com/live-bvc/123.flv",
+            "https://d1--cn-gotcha208.bilivideo.com/live-bvc/123.flv"
+        )
+        val cleaned = io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.filterLiveCandidates(candidates)
+        assertEquals(1, cleaned.size)
+        assertTrue("Only official live CDN should be retained", cleaned[0].contains("cn-gotcha208.bilivideo.com"))
+    }
 }
