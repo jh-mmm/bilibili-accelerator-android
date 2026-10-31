@@ -344,10 +344,10 @@ fun SettingsScreen(
                                 // 2. BTR 合并选项 -> 二级页面
                                 val btrThreadDesc = if (config.btrAutoConcurrency) "自适应 ${config.btrConcurrency} 线程" else "${config.btrConcurrency} 线程"
                                 val btrChunkDesc = if (config.btrAutoChunkSize) "自适应 ${config.btrChunkSizeKb} KB" else "${config.btrChunkSizeKb} KB"
+                                val scenarioTags = (if (config.enableEpisodeAcceleration) " · 剧集" else "") + (if (config.enableLiveAcceleration) " · 直播" else "")
                                 val btrSummary = if (!config.enableBtr) {
                                     "已停用多线程切片加速 (点击进入高级配置)"
                                 } else {
-                                    val scenarioTags = (if (config.enableEpisodeAcceleration) " · 剧集" else "") + (if (config.enableLiveAcceleration) " · 直播" else "")
                                     "已启用 · $btrThreadDesc · $btrChunkDesc · ${config.btrCdnPoolSize} 节点$scenarioTags"
                                 }
 
@@ -686,31 +686,31 @@ fun SettingsScreen(
                                 )
                             }
                         }
-                    }
 
-                    item(key = "header-btr-scenarios") {
-                        PreferenceGroupTitle("专项场景加速与调度")
-                    }
+                        item(key = "header-btr-scenarios") {
+                            PreferenceGroupTitle("专项场景加速与调度")
+                        }
 
-                    item(key = "card-btr-scenarios") {
-                        PreferenceGroupCard {
-                            PreferenceSwitchItem(
-                                title = "剧集加速专属模式",
-                                summary = "针对番剧、电影、纪录片等 PGC 内容启用专属多源并发与兼容模式调度",
-                                checked = config.enableEpisodeAcceleration,
-                                onCheckedChange = { onConfigChange(config.copy(enableEpisodeAcceleration = it)) },
-                                enabled = config.enabled && config.enableBtr
-                            )
+                        item(key = "card-btr-scenarios") {
+                            PreferenceGroupCard {
+                                PreferenceSwitchItem(
+                                    title = "剧集加速专属模式",
+                                    summary = "针对番剧、电影、纪录片等 PGC 内容启用专属多源并发与兼容模式调度",
+                                    checked = config.enableEpisodeAcceleration,
+                                    onCheckedChange = { onConfigChange(config.copy(enableEpisodeAcceleration = it)) },
+                                    enabled = config.enabled && config.enableBtr
+                                )
 
-                            PreferenceDivider()
+                                PreferenceDivider()
 
-                            PreferenceSwitchItem(
-                                title = "直播流多源并发拉取 (实验性)",
-                                summary = "基于 BTR 直播内核 (live-core)，对直播分片与流地址执行多源并发拉取与竞速优选",
-                                checked = config.enableLiveAcceleration,
-                                onCheckedChange = { onConfigChange(config.copy(enableLiveAcceleration = it)) },
-                                enabled = config.enabled && config.enableBtr
-                            )
+                                PreferenceSwitchItem(
+                                    title = "直播流多源并发拉取 (实验性)",
+                                    summary = "基于 BTR 直播内核 (live-core)，对直播分片与流地址执行多源并发拉取与竞速优选",
+                                    checked = config.enableLiveAcceleration,
+                                    onCheckedChange = { onConfigChange(config.copy(enableLiveAcceleration = it)) },
+                                    enabled = config.enabled && config.enableBtr
+                                )
+                            }
                         }
                     }
                 }
