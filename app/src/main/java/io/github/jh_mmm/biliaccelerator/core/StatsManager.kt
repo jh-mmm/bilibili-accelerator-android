@@ -530,6 +530,8 @@ object StatsManager {
         sb.appendLine("强制统一线路: ${if (config.forceUpos) "开启" else "关闭"}")
         sb.appendLine("端口启发式: ${if (config.portHeuristic) "开启" else "关闭"}")
         sb.appendLine("Moss gRPC 注入: ${if (config.enableMossHook) "开启 (实验性)" else "关闭 (默认)"}")
+        sb.appendLine("剧集加速专属模式: ${if (config.enableEpisodeAcceleration) "开启 (专属调度)" else "关闭"}")
+        sb.appendLine("直播多源并发加速: ${if (config.enableLiveAcceleration) "开启 (实验性对冲)" else "关闭"}")
         sb.appendLine("-----------------------------------------")
         sb.appendLine("【Hook 挂载状态】")
         try {

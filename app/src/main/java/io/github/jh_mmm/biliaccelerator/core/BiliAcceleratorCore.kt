@@ -41,7 +41,9 @@ data class AcceleratorConfig(
     val btrAutoChunkSize: Boolean = true,
     val btrChunkSizeKb: Int = 512,
     val customCdnPool: List<String> = emptyList(),
-    val btrCdnPoolSize: Int = 8
+    val btrCdnPoolSize: Int = 8,
+    val enableEpisodeAcceleration: Boolean = true,
+    val enableLiveAcceleration: Boolean = false
 )
 
 object BiliAcceleratorCore {
@@ -218,7 +220,41 @@ object BiliAcceleratorCore {
                 lower.contains("pssh") ||
                 lower.contains("widevine") ||
                 lower.contains("/drm/") ||
-                lower.contains("has_drm=1")
+                lower.contains("has_drm=1") ||
+                lower.contains("is_drm=1") ||
+                lower.contains("drm=1")
+    }
+
+    /**
+     * 识别番剧、电影、纪录片等剧集（PGC / OGV）媒体流
+     */
+    fun isEpisodeMediaUrl(url: String, path: String = ""): Boolean {
+        if (url.isBlank() && path.isBlank()) return false
+        val lowerUrl = url.lowercase()
+        val lowerPath = (if (path.isNotBlank()) path else parseUri(url)?.path ?: "").lowercase()
+        return lowerPath.contains("/bangumi/") ||
+                lowerPath.contains("/ogv/") ||
+                lowerPath.contains("/pgc/") ||
+                lowerUrl.contains("ep_id=") ||
+                lowerUrl.contains("epid=") ||
+                lowerUrl.contains("season_id=") ||
+                lowerUrl.contains("season_type=") ||
+                lowerUrl.contains("scene=ogv") ||
+                lowerUrl.contains("scene=pgc") ||
+                lowerUrl.contains("business=pgc") ||
+                lowerUrl.contains("biz=pgc") ||
+                lowerUrl.contains("is_pgc=1")
+    }
+
+    /**
+     * 识别剧集试看片段（对齐 BTR 原版 unsupportedEpisode: is_preview=1，交给 B 站原生播放器处理）
+     */
+    fun isEpisodePreview(url: String): Boolean {
+        if (url.isBlank()) return false
+        val lower = url.lowercase()
+        return lower.contains("is_preview=1") ||
+                lower.contains("preview=1") ||
+                lower.contains("trial=1")
     }
 
     fun hasMediaSignal(url: String): Boolean {
@@ -618,19 +654,21 @@ object BiliAcceleratorCore {
             }
         }
 
-        // 3. Akamai 节点处理：默认放行官方 Akamai 鉴权线路；仅在 rewriteAkamai 开启时重定向至首选 UPOS
+        // 3. Akamai 节点处理：默认放行官方 Akamai 鉴权线路；杜绝非 BTR 模式下直接改写 Host 导致 403 播放失败
         val isAkamai = isAkamaiHost(hostname)
         val isBstar = hostname.endsWith(".bstarstatic.com", ignoreCase = true)
         val isUposAkamai = isBiliAkamaiHost(hostname)
 
-        if (isAkamai && !config.rewriteAkamai && !config.forceUpos) {
+        // 关键防护（对齐 realzza 与 BTR）：Akamai HMAC 鉴权签名与 UPOS 完全不兼容。
+        // 在非 BTR 模式下（无法通过 BTR 多源对冲兜底），严禁直接替换 Host 为 UPOS，强制放行以杜绝 HTTP 403 播放失败。
+        if (isAkamai && (!config.enableBtr || !config.rewriteAkamai)) {
             return noChange(original, "akamai-pass", isPcdn = false, isMcdn = false, segmentKey = segKey)
         }
 
         // 4. PCDN 拦截 / Force 模式 / Akamai 改写
         val shouldRewrite = (isPcdn && config.blockPcdn) ||
-                (isAkamai && (config.rewriteAkamai || config.forceUpos)) ||
-                (config.forceUpos && (isBiliCdnHost(hostname) || isUposAkamai) && !isBstar)
+                (isAkamai && config.rewriteAkamai && config.enableBtr) ||
+                (config.forceUpos && (isBiliCdnHost(hostname) || isUposAkamai) && !isAkamai && !isBstar)
 
         if (shouldRewrite) {
             val target = resolveTargetHost(config)

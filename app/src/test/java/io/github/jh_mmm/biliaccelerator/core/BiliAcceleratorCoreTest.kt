@@ -388,11 +388,21 @@ class BiliAcceleratorCoreTest {
         assertFalse("Akamai should pass through by default", resPass.changed)
         assertEquals("akamai-pass", resPass.reason)
 
-        // rewriteAkamai = true 允许改写为 targetHost
-        val resRewrite = BiliAcceleratorCore.rewriteUrl(akamaiUrl, defaultConfig.copy(rewriteAkamai = true, targetHost = "upos-sz-mirrorcos.bilivideo.com"))
-        assertTrue("Akamai should be rewritten when enabled", resRewrite.changed)
+        // rewriteAkamai = true 允许改写为 targetHost（仅在 enableBtr = true 时允许）
+        val resRewrite = BiliAcceleratorCore.rewriteUrl(akamaiUrl, defaultConfig.copy(rewriteAkamai = true, enableBtr = true, targetHost = "upos-sz-mirrorcos.bilivideo.com"))
+        assertTrue("Akamai should be rewritten when enabled and in BTR mode", resRewrite.changed)
         assertEquals("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s?token=xyz", resRewrite.finalUrl)
         assertEquals("akamai-redirect", resRewrite.reason)
+
+        // 非 BTR 模式安全防护：即使 rewriteAkamai = true，非 BTR 模式下也必须安全放行，杜绝直接替换 Host 报 403
+        val resNonBtr = BiliAcceleratorCore.rewriteUrl(akamaiUrl, defaultConfig.copy(rewriteAkamai = true, enableBtr = false, targetHost = "upos-sz-mirrorcos.bilivideo.com"))
+        assertFalse("Akamai must pass through in non-BTR mode to avoid 403", resNonBtr.changed)
+        assertEquals("akamai-pass", resNonBtr.reason)
+
+        // forceUpos = true 但 rewriteAkamai = false 时，Akamai 也必须安全放行
+        val resForceUpos = BiliAcceleratorCore.rewriteUrl(akamaiUrl, defaultConfig.copy(rewriteAkamai = false, forceUpos = true))
+        assertFalse("Akamai must pass through when rewriteAkamai is false even if forceUpos is true", resForceUpos.changed)
+        assertEquals("akamai-pass", resForceUpos.reason)
     }
 
     @Test

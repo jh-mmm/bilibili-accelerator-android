@@ -314,4 +314,188 @@ class BtrEngineTest {
         assertEquals(1, cleaned.size)
         assertTrue("Only official live CDN should be retained", cleaned[0].contains("cn-gotcha208.bilivideo.com"))
     }
+
+    @Test
+    fun testParseRangeHeaderStandard() {
+        val range = BtrLocalProxyServer.parseRangeHeader("bytes=0-1024")
+        assertTrue(range.hasRange)
+        assertFalse(range.isSuffix)
+        assertEquals(0L, range.start)
+        assertEquals(1024L, range.end)
+    }
+
+    @Test
+    fun testParseRangeHeaderOpenEnded() {
+        val range = BtrLocalProxyServer.parseRangeHeader("bytes=524288-")
+        assertTrue(range.hasRange)
+        assertFalse(range.isSuffix)
+        assertEquals(524288L, range.start)
+        assertEquals(null, range.end)
+    }
+
+    @Test
+    fun testParseRangeHeaderSingleByteProbe() {
+        // 关键探针请求 bytes=0-0
+        val range = BtrLocalProxyServer.parseRangeHeader("bytes=0-0")
+        assertTrue(range.hasRange)
+        assertFalse(range.isSuffix)
+        assertEquals(0L, range.start)
+        assertEquals(0L, range.end)
+    }
+
+    @Test
+    fun testParseRangeHeaderSuffixRange() {
+        // Suffix Range: bytes=-500 与 bytes=-1024
+        val range500 = BtrLocalProxyServer.parseRangeHeader("bytes=-500")
+        assertTrue("Must be identified as valid range", range500.hasRange)
+        assertTrue("Must be marked as suffix range", range500.isSuffix)
+        assertEquals(500L, range500.suffixLength)
+
+        val range1024 = BtrLocalProxyServer.parseRangeHeader("bytes=-1024")
+        assertTrue(range1024.hasRange)
+        assertTrue(range1024.isSuffix)
+        assertEquals(1024L, range1024.suffixLength)
+    }
+
+    @Test
+    fun testParseRangeHeaderEmptyOrInvalid() {
+        val rangeNull = BtrLocalProxyServer.parseRangeHeader(null)
+        assertFalse(rangeNull.hasRange)
+        assertEquals(0L, rangeNull.start)
+        assertEquals(null, rangeNull.end)
+
+        val rangeInvalid = BtrLocalProxyServer.parseRangeHeader("invalid_header")
+        assertFalse(rangeInvalid.hasRange)
+    }
+
+    @Test
+    fun testEpisodeMediaUrlRecognition() {
+        val ep1 = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/12345.m4s?ep_id=987654"
+        val ep2 = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/12345.m4s?season_id=123"
+        val ep3 = "https://upos-sz-mirrorali.bilivideo.com/bangumi/play/ep12345.m4s"
+        val ep4 = "https://upos-sz-mirrorali.bilivideo.com/ogv/playview/12345.m4s"
+        val ep5 = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/123.m4s?business=pgc"
+        val ugc = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/12345.m4s?deadline=1700000000"
+
+        assertTrue("ep_id URL should be recognized as episode", io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isEpisodeMediaUrl(ep1))
+        assertTrue("season_id URL should be recognized as episode", io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isEpisodeMediaUrl(ep2))
+        assertTrue("bangumi path should be recognized as episode", io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isEpisodeMediaUrl(ep3))
+        assertTrue("ogv path should be recognized as episode", io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isEpisodeMediaUrl(ep4))
+        assertTrue("business=pgc should be recognized as episode", io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isEpisodeMediaUrl(ep5))
+        assertFalse("Standard UGC stream should not be marked as episode", io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isEpisodeMediaUrl(ugc))
+    }
+
+    @Test
+    fun testEpisodePreviewDetection() {
+        val preview1 = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/12345.m4s?is_preview=1"
+        val preview2 = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/12345.m4s?preview=1"
+        val preview3 = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/12345.m4s?trial=1"
+        val normal = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/12345.m4s?is_preview=0"
+
+        assertTrue("is_preview=1 must be recognized as preview", io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isEpisodePreview(preview1))
+        assertTrue("preview=1 must be recognized as preview", io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isEpisodePreview(preview2))
+        assertTrue("trial=1 must be recognized as preview", io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isEpisodePreview(preview3))
+        assertFalse("is_preview=0 must not be recognized as preview", io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isEpisodePreview(normal))
+    }
+
+    @Test
+    fun testEpisodeSessionRegistrationAndRegionalIsolation() {
+        val regionalEpisodeUrl = "https://bstarstatic.com/upgcxcode/12/34/12345.m4s?ep_id=12345"
+        val sessionId = BtrSessionManager.register(
+            primaryUrl = regionalEpisodeUrl,
+            isEpisode = true
+        )
+        val session = BtrSessionManager.get(sessionId)
+        assertNotNull(session)
+        assertTrue("Session must be marked as episode", session?.isEpisode == true)
+        assertEquals("https://www.bilibili.com/bangumi/play/", session?.referer)
+
+        val backups = session?.backupUrls.orEmpty()
+        assertTrue("Regional PGC must synthesize backups", backups.isNotEmpty())
+        for (backup in backups) {
+            assertTrue("Regional PGC must strictly use overseas/ov mirrors, never mainland UPOS", backup.contains("ov.bilivideo.com"))
+        }
+    }
+
+    @Test
+    fun testLiveCoreUrlDetectionAndProxyUnwrap() {
+        val segUrl = "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123456/live_123456_100.m4s"
+        val playlistUrl = "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123456/live_123456.m3u8"
+        val nonLiveUrl = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s"
+
+        assertTrue("Valid live segment URL must be detected", BtrLiveCore.isLiveSegmentUrl(segUrl))
+        assertTrue("Valid live playlist URL must be detected", BtrLiveCore.isLivePlaylistUrl(playlistUrl))
+        assertFalse("VOD URL must not be detected as live segment", BtrLiveCore.isLiveSegmentUrl(nonLiveUrl))
+
+        val wrappedUrl = "https://d1.smtcdns.net/d1--cn-gotcha204.bilivideo.com/live-bvc/123.m4s"
+        val unwrapped = BtrLiveCore.unwrapProxyUrl(wrappedUrl)
+        assertEquals("https://d1--cn-gotcha204.bilivideo.com/live-bvc/123.m4s", unwrapped)
+    }
+
+    @Test
+    fun testLiveCoreParseM3u8() {
+        val sampleM3u8 = """
+            #EXTM3U
+            #EXT-X-VERSION:7
+            #EXT-X-TARGETDURATION:2
+            #EXT-X-MAP:URI="init.m4s"
+            #EXTINF:1.000,
+            live_101.m4s
+            #EXTINF:1.000,
+            live_102.m4s
+        """.trimIndent()
+
+        val parsed = BtrLiveCore.parseM3u8(sampleM3u8, "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123/live.m3u8")
+        assertEquals("https://d1--cn-gotcha204.bilivideo.com/live-bvc/123/init.m4s", parsed.mapUrl)
+        assertEquals(2, parsed.segments.size)
+        assertEquals(101L, parsed.segments[0].num)
+        assertEquals("https://d1--cn-gotcha204.bilivideo.com/live-bvc/123/live_101.m4s", parsed.segments[0].url)
+        assertEquals(102L, parsed.segments[1].num)
+        assertEquals(102L, parsed.lastNum)
+    }
+
+    @Test
+    fun testLiveHostPoolRankingAndBanning() {
+        var bannedHost = ""
+        val pool = BtrLiveHostPool(onBan = { bannedHost = it })
+
+        val host1 = "d1--cn-gotcha204.bilivideo.com"
+        val host2 = "d1--cn-gotcha208.bilivideo.com"
+
+        pool.add(host1, proven = false)
+        pool.add(host2, proven = false)
+
+        // host1 探测成功
+        pool.success(host1, fbMs = 45.0, bps = 2_000_000.0)
+
+        val topHosts = pool.pick(1)
+        assertEquals(1, topHosts.size)
+        assertEquals(host1, topHosts[0])
+
+        // host2 两次空包失败 -> 自动熔断禁令 (banned)
+        pool.failure(host2, receivedBytes = 0L)
+        pool.failure(host2, receivedBytes = 0L)
+
+        assertEquals(host2, bannedHost)
+        val pickedAfterBan = pool.pick(2)
+        assertFalse("Banned host must not be picked", pickedAfterBan.contains(host2))
+        assertTrue("Healthy host must still be picked", pickedAfterBan.contains(host1))
+    }
+
+    @Test
+    fun testLiveSessionRegistration() {
+        val liveUrl = "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123/live.m3u8"
+        val sessionId = BtrSessionManager.register(
+            primaryUrl = liveUrl,
+            isLive = true
+        )
+        val session = BtrSessionManager.get(sessionId)
+        assertNotNull(session)
+        assertTrue("Session must be flagged as live", session?.isLive == true)
+        assertEquals("https://live.bilibili.com/", session?.referer)
+        assertNotNull("Live host pool must be initialized", session?.liveHostPool)
+
+        val picked = session?.liveHostPool?.pick(3).orEmpty()
+        assertTrue("Live host pool must contain primary host", picked.contains("d1--cn-gotcha204.bilivideo.com"))
+    }
 }

@@ -15,6 +15,9 @@ data class BtrMediaSession(
     @Volatile var userAgent: String?,
     @Volatile var referer: String = "https://www.bilibili.com/",
     val isAudio: Boolean = false,
+    val isEpisode: Boolean = false,
+    val isLive: Boolean = false,
+    @Volatile var liveHostPool: BtrLiveHostPool? = null,
     val lastAccessed: AtomicLong = AtomicLong(System.currentTimeMillis()),
     @Volatile var totalLength: Long = -1L,
     @Volatile var contentType: String? = null
@@ -36,15 +39,61 @@ object BtrSessionManager {
         backupUrls: List<String> = emptyList(),
         userAgent: String? = null,
         isAudio: Boolean = false,
+        isEpisode: Boolean = false,
+        isLive: Boolean = false,
         config: AcceleratorConfig? = null
     ): String {
         cleanupStaleSessions()
         val id = UUID.randomUUID().toString().replace("-", "").take(12)
         val validBackups = backupUrls.filter { it.isNotBlank() && it != primaryUrl }.distinct()
         val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(primaryUrl)
+
+        val referer = if (isEpisode) {
+            "https://www.bilibili.com/bangumi/play/"
+        } else if (isLive) {
+            "https://live.bilibili.com/"
+        } else {
+            "https://www.bilibili.com/"
+        }
+
+        val pool: BtrLiveHostPool? = if (isLive) {
+            val livePool = BtrLiveHostPool()
+            val primaryHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(primaryUrl)?.host).lowercase()
+            if (primaryHost.isNotBlank() && !BtrLiveCore.isP2pUrl(primaryUrl)) {
+                livePool.add(primaryHost, proven = true)
+            }
+            // 注入已知官方 fMP4 集群
+            for (knownHost in BtrLiveCore.KNOWN_FMP4_HOSTS) {
+                if (knownHost != primaryHost) {
+                    livePool.add(knownHost, proven = false)
+                }
+            }
+            // 注入备用节点中包含的候选官方直播域名
+            for (backup in validBackups) {
+                val bHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(backup)?.host).lowercase()
+                if (bHost.isNotBlank() && !BtrLiveCore.isP2pUrl(backup)) {
+                    livePool.add(bHost, proven = false)
+                }
+            }
+            // 注入用户自定义 CDN 池
+            if (config != null) {
+                for (custom in config.customCdnPool) {
+                    val cHost = BiliAcceleratorCore.cleanHost(custom).lowercase()
+                    if (cHost.isNotBlank() && !BtrLiveCore.isP2pUrl(cHost)) {
+                        livePool.add(cHost, proven = false)
+                    }
+                }
+            }
+            livePool
+        } else {
+            null
+        }
+
         // 若宿主未传入备用地址，自动合成兼容的官方同源 UPOS 镜像（优先支持用户自定义 CDN 白名单），确保多源 CDN 并发调度生效
-        val finalBackups = if (validBackups.isEmpty()) {
-            synthesizeCompatibleBackups(primaryUrl, config)
+        val finalBackups = if (isLive) {
+            validBackups
+        } else if (validBackups.isEmpty()) {
+            synthesizeCompatibleBackups(primaryUrl, config, isEpisode = isEpisode)
         } else {
             // 隔离检查（对齐 BTR 规范）：
             // 若当前主地址是中继流，严禁混入普通 UPOS 镜像；
@@ -55,12 +104,17 @@ object BtrSessionManager {
                 validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
             }
         }
+
         val session = BtrMediaSession(
             sessionId = id,
             primaryUrl = primaryUrl,
             backupUrls = finalBackups,
             userAgent = userAgent,
-            isAudio = isAudio
+            referer = referer,
+            isAudio = isAudio,
+            isEpisode = isEpisode,
+            isLive = isLive,
+            liveHostPool = pool
         )
         sessions[id] = session
         latestSessionId = id
@@ -91,6 +145,16 @@ object BtrSessionManager {
             validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
         }
         current.backupUrls = isolatedBackups
+
+        // 若为直播会话，同时同步至直播节点池
+        current.liveHostPool?.let { pool ->
+            for (b in isolatedBackups) {
+                val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(b)?.host).lowercase()
+                if (host.isNotBlank() && !BtrLiveCore.isP2pUrl(b)) {
+                    pool.add(host, proven = false)
+                }
+            }
+        }
     }
 
     fun updateBackupsForLatest(backups: List<String>) {
@@ -120,8 +184,16 @@ object BtrSessionManager {
      * 安全合成同源通用 UPOS 备用节点：
      * 当宿主未提供 backupUrls 时，在同组通用 UPOS 节点之间安全互换，
      * 解决海外/大陆多源并发拉取，彻底杜绝 403 熔断。
+     *
+     * 针对剧集（isEpisode）：
+     * 严格执行区域版权限流保护，若是港澳台或海外限定剧集（bstarstatic, cn-hk-eq, ov.bilivideo.com 等），
+     * 严禁混入大陆普通 UPOS 节点，避免触发版权鉴权 403。
      */
-    fun synthesizeCompatibleBackups(primaryUrl: String, config: AcceleratorConfig? = null): List<String> {
+    fun synthesizeCompatibleBackups(
+        primaryUrl: String,
+        config: AcceleratorConfig? = null,
+        isEpisode: Boolean = false
+    ): List<String> {
         val results = mutableListOf<String>()
         val uri = BiliAcceleratorCore.parseUri(primaryUrl) ?: return emptyList()
         val path = uri.path
@@ -134,10 +206,18 @@ object BtrSessionManager {
 
         val host = uri.host.lowercase()
         val isAkamai = host.endsWith(".akamaized.net")
-        // 对齐 BTR：当海外账号仅分发 akamaized.net 节点时，支持提取其签名合成海外专属 ov 镜像，恢复多源并发能力
-        val isOverseasStream = host.contains("ov.bilivideo.com") || isAkamai || BiliAcceleratorCore.isOverseasEnvironment()
+        val isRegionalPgcHost = host.contains("bstar") ||
+                host.contains("cn-hk-eq") ||
+                host.contains("ov.bilivideo.com") ||
+                isAkamai
 
-        val candidateList = if (config != null) {
+        // 对齐 BTR：当海外账号仅分发 akamaized.net 节点或播放港澳台/海外专属剧集时，提取签名合成海外专属 ov 镜像
+        val isOverseasStream = host.contains("ov.bilivideo.com") ||
+                isAkamai ||
+                (isEpisode && isRegionalPgcHost) ||
+                BiliAcceleratorCore.isOverseasEnvironment()
+
+        val candidateList = if (config != null && config.customCdnPool.isNotEmpty()) {
             BiliAcceleratorCore.getEffectiveCdnPool(config)
         } else if (isOverseasStream) {
             listOf(

@@ -184,30 +184,72 @@ object PlayerHook {
         if (!config.enabled || !config.enableBtr || !io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
             return null
         }
-        // 直播流（FLV/HLS/Live）绝对不重写至 BTR 本地代理
-        if (result.reason.startsWith("live-") || BiliAcceleratorCore.isLiveMediaUrl("", originalUrl)) {
+        val isLive = result.reason.startsWith("live-") ||
+                BiliAcceleratorCore.isLiveMediaUrl("", originalUrl) ||
+                (result.changed && BiliAcceleratorCore.isLiveMediaUrl("", result.finalUrl))
+
+        // 直播流多源并发加速控制：未开启时保持原生绕过
+        if (isLive && !config.enableLiveAcceleration) {
             return null
         }
-        // 版权保护/DRM 加密流（Widevine/ChinaDRM/PSSH）绝对不重写至 BTR 本地代理，交由原生直连放行
+
+        val isEpisode = BiliAcceleratorCore.isEpisodeMediaUrl(originalUrl) ||
+                (result.changed && BiliAcceleratorCore.isEpisodeMediaUrl(result.finalUrl))
+
+        // 剧集专属模式控制：未开启时严格遵循 BTR 原版调度放行至原生播放器
+        if (isEpisode) {
+            if (!config.enableEpisodeAcceleration) {
+                Log.i(TAG, "Episode acceleration disabled in config, leaving to native player")
+                return null
+            }
+            // 剧集试看流（is_preview=1）：对齐 BTR 原版 unsupportedEpisode，试看流严禁代理介入
+            if (BiliAcceleratorCore.isEpisodePreview(originalUrl) || (result.changed && BiliAcceleratorCore.isEpisodePreview(result.finalUrl))) {
+                Log.i(TAG, "Episode preview detected, leaving to native player")
+                return null
+            }
+        }
+
+        // 版权保护/DRM 加密流（Widevine/ChinaDRM/PSSH/is_drm）绝对不重写至 BTR 本地代理，交由原生直连放行
         if (BiliAcceleratorCore.hasDrmSignal(originalUrl) || (result.changed && BiliAcceleratorCore.hasDrmSignal(result.finalUrl))) {
             Log.i(TAG, "DRM protected stream detected, bypassing BTR proxy")
             return null
         }
         val targetUrl = if (result.changed) result.finalUrl else originalUrl
-        val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty()
-        val isAudio = BiliAcceleratorCore.isAudioTrack(targetUrl)
+        val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty().toMutableList()
+
+        if (isLive) {
+            val cleanHost = builderInstance?.let { builderCleanLiveHost[it] } ?: latestCleanLiveHost
+            if (!cleanHost.isNullOrBlank()) {
+                val parsed = BiliAcceleratorCore.parseUri(targetUrl)
+                if (parsed != null && !BiliAcceleratorCore.isSlowLiveHost(cleanHost, portHeuristic = config.portHeuristic)) {
+                    val candidate = parsed.replaceAuthority(cleanHost)
+                    if (!pendingBackups.contains(candidate)) {
+                        pendingBackups.add(candidate)
+                    }
+                }
+            }
+        }
+
+        val isAudio = !isLive && BiliAcceleratorCore.isAudioTrack(targetUrl)
 
         val sessionId = io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.register(
             primaryUrl = targetUrl,
             backupUrls = pendingBackups,
             isAudio = isAudio,
+            isEpisode = isEpisode,
+            isLive = isLive,
             config = config
         )
         if (builderInstance != null) {
             io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.bindBuilderSession(builderInstance, sessionId)
         }
         val proxyPort = io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port
-        return "http://127.0.0.1:$proxyPort/stream/$sessionId.m4s"
+        val ext = when {
+            targetUrl.contains(".m3u8") -> "m3u8"
+            targetUrl.contains(".flv") -> "flv"
+            else -> "m4s"
+        }
+        return "http://127.0.0.1:$proxyPort/stream/$sessionId.$ext"
     }
 
     private fun rewriteArgIfMedia(args: List<Any?>, builderInstance: Any? = null): Array<Any?>? {
@@ -223,6 +265,15 @@ object PlayerHook {
         val result = BiliAcceleratorCore.rewriteUrl(originalUrl, config)
 
         if (isLive) {
+            if (config.enableLiveAcceleration) {
+                val btrUrl = tryRewriteToBtr(originalUrl, result, config, builderInstance)
+                if (btrUrl != null) {
+                    Log.i(TAG, "Rewrote live stream to BTR proxy: ${result.originalHost} -> 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
+                    val newArgs = args.toTypedArray()
+                    newArgs[strIndex] = btrUrl
+                    return newArgs
+                }
+            }
             if (result.changed) {
                 RemoteClient.notifyRewrite(result)
                 val newArgs = args.toTypedArray()

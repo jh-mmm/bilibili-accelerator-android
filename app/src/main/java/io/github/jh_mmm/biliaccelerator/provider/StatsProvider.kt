@@ -98,6 +98,8 @@ class StatsProvider : ContentProvider() {
         const val KEY_BTR_CHUNK_SIZE_KB = "cfg_btr_chunk_size_kb"
         const val KEY_CUSTOM_CDN_POOL = "cfg_custom_cdn_pool"
         const val KEY_BTR_CDN_POOL_SIZE = "cfg_btr_cdn_pool_size"
+        const val KEY_ENABLE_EPISODE_ACCELERATION = "cfg_enable_episode_acceleration"
+        const val KEY_ENABLE_LIVE_ACCELERATION = "cfg_enable_live_acceleration"
 
         private val gson = Gson()
 
@@ -160,7 +162,9 @@ class StatsProvider : ContentProvider() {
                 btrAutoChunkSize = sp.getBoolean(KEY_BTR_AUTO_CHUNK_SIZE, true),
                 btrChunkSizeKb = sp.getInt(KEY_BTR_CHUNK_SIZE_KB, 512),
                 customCdnPool = customPool,
-                btrCdnPoolSize = sp.getInt(KEY_BTR_CDN_POOL_SIZE, 8)
+                btrCdnPoolSize = sp.getInt(KEY_BTR_CDN_POOL_SIZE, 8),
+                enableEpisodeAcceleration = sp.getBoolean(KEY_ENABLE_EPISODE_ACCELERATION, true),
+                enableLiveAcceleration = sp.getBoolean(KEY_ENABLE_LIVE_ACCELERATION, false)
             )
         }
 
@@ -184,6 +188,8 @@ class StatsProvider : ContentProvider() {
                 .putInt(KEY_BTR_CHUNK_SIZE_KB, config.btrChunkSizeKb)
                 .putString(KEY_CUSTOM_CDN_POOL, gson.toJson(config.customCdnPool))
                 .putInt(KEY_BTR_CDN_POOL_SIZE, config.btrCdnPoolSize)
+                .putBoolean(KEY_ENABLE_EPISODE_ACCELERATION, config.enableEpisodeAcceleration)
+                .putBoolean(KEY_ENABLE_LIVE_ACCELERATION, config.enableLiveAcceleration)
                 .apply()
             runCatching {
                 context.contentResolver.notifyChange(CONTENT_URI, null)

@@ -116,7 +116,8 @@ object BtrChunkEngine {
         val sessionId: String,
         val primaryHost: String,
         val concurrency: Int,
-        val proxyPort: Int
+        val proxyPort: Int,
+        val isEpisode: Boolean = false
     ) {
         val totalChunks = AtomicInteger(0)
         val totalBytes = AtomicLong(0L)
@@ -138,7 +139,11 @@ object BtrChunkEngine {
             val avgLatency = totalLatency.get() / count
             val mbStr = String.format(Locale.getDefault(), "%.1f", bytes / (1024.0 * 1024.0))
 
-            val prefix = if (sessionId.startsWith("audio_") || primaryHost.contains("audio")) "BTR音频优化" else "BTR并发加速"
+            val prefix = when {
+                isEpisode -> "BTR剧集加速(兼容模式)"
+                sessionId.startsWith("audio_") || primaryHost.contains("audio") -> "BTR音频优化"
+                else -> "BTR并发加速"
+            }
             val summaryReason = "$prefix · ${count}分片(${mbStr}MB) · ${hitHosts.size}个CDN · 均时${avgLatency}ms"
 
             val result = RewriteResult(
@@ -189,16 +194,22 @@ object BtrChunkEngine {
 
     fun pipeStream(
         session: BtrMediaSession,
-        requestedStart: Long,
-        requestedEnd: Long?, // null 表示直至文件尾部
-        isHeadOnly: Boolean,
+        requestedStart: Long = 0L,
+        requestedEnd: Long? = null, // null 表示直至文件尾部
+        isHeadOnly: Boolean = false,
         clientOut: OutputStream,
         concurrency: Int = 6,
         chunkSizeKb: Int = 512,
         autoConcurrency: Boolean = true,
         autoChunkSize: Boolean = true,
-        proxyPort: Int = -1
-    ) {
+        proxyPort: Int = -1,
+        parsedRange: ParsedRange = ParsedRange(
+            hasRange = requestedStart > 0 || requestedEnd != null,
+            start = requestedStart,
+            end = requestedEnd
+        ),
+        keepAlive: Boolean = false
+    ): Boolean {
         val isAudio = session.isAudio || BiliAcceleratorCore.isAudioTrack(session.primaryUrl)
         val initialProbeChunkSize = if (isAudio) {
             CHUNK_SIZE_AUDIO.toLong() // 音频流采用 128KB 小切片低时延分片
@@ -206,63 +217,110 @@ object BtrChunkEngine {
             CHUNK_SIZE_VIDEO.toLong() // 探测首片统一使用 512KB 快速拉取总长度
         }
 
-        val baseConcurrency = if (isAudio) AUDIO_MAX_CONCURRENCY else concurrency.coerceIn(2, 16)
-        val useAuto = !isAudio && autoConcurrency
+        val isEpisode = session.isEpisode
+        val baseConcurrency = when {
+            isAudio -> AUDIO_MAX_CONCURRENCY
+            isEpisode -> minOf(concurrency, 6).coerceIn(2, 8) // 剧集专属兼容模式：收敛并发，降低鉴权断连风险
+            else -> concurrency.coerceIn(2, 16)
+        }
+        val useAuto = !isAudio && !isEpisode && autoConcurrency
         val burstConcurrency = if (useAuto) maxOf(baseConcurrency, 8).coerceAtMost(16) else baseConcurrency
 
         val candidateUrls = (listOf(session.primaryUrl) + session.backupUrls).distinct()
         val primaryHost = BiliAcceleratorCore.cleanHost(extractHostname(session.primaryUrl))
 
-        val statsTracker = StreamStatsTracker(session.sessionId, primaryHost, burstConcurrency, proxyPort)
+        val statsTracker = StreamStatsTracker(session.sessionId, primaryHost, burstConcurrency, proxyPort, isEpisode = isEpisode)
 
         try {
             val hasCachedMetadata = session.totalLength > 0
             val totalLength: Long
             val contentType: String
-            val firstChunk: ByteArray?
-            val currentOffset: Long
+            var firstChunk: ByteArray? = null
+            var currentOffset: Long
+            val effectiveStart: Long
+            val effectiveEnd: Long?
             val actualEnd: Long
 
-            if (hasCachedMetadata && requestedStart > 0) {
-                // P0: Seek 探针跳过优化！
-                // 该 session 早已完成元数据初始化，用户拖动 Seek 时直接跳过 probeMedia 512KB 网络往返，0ms 秒级起播！
-                totalLength = session.totalLength
-                contentType = session.contentType ?: if (isAudio) "audio/mp4" else "video/mp4"
-                firstChunk = null
-                currentOffset = requestedStart
-                actualEnd = when {
-                    requestedEnd != null && requestedEnd > 0 -> minOf(requestedEnd, totalLength - 1)
-                    totalLength > 0 -> totalLength - 1
-                    else -> -1L
+            if (parsedRange.isSuffix) {
+                // Suffix Range 模式: bytes=-suffixLength (如 bytes=-500)
+                if (hasCachedMetadata) {
+                    totalLength = session.totalLength
+                    contentType = session.contentType ?: if (isAudio) "audio/mp4" else "video/mp4"
+                } else {
+                    val probeResult = probeMedia(candidateUrls, session, 0L, initialProbeChunkSize)
+                    if (probeResult == null) {
+                        sendHttpError(clientOut, 502, "Bad Gateway - Upstream CDN Unreachable")
+                        return false
+                    }
+                    if (probeResult.isNonRange) {
+                        return pipeNonRangeStream(candidateUrls.firstOrNull() ?: session.primaryUrl, session, clientOut, statsTracker)
+                    }
+                    totalLength = probeResult.totalLength
+                    contentType = probeResult.contentType ?: if (isAudio) "audio/mp4" else "video/mp4"
+                    if (totalLength > 0) {
+                        session.totalLength = totalLength
+                        session.contentType = contentType
+                    }
+                    if (totalLength > 0 && probeResult.firstChunkData != null && totalLength <= probeResult.firstChunkData.size) {
+                        firstChunk = probeResult.firstChunkData
+                    }
+                }
+
+                effectiveStart = if (totalLength > 0) maxOf(0L, totalLength - parsedRange.suffixLength) else 0L
+                effectiveEnd = if (totalLength > 0) totalLength - 1L else null
+                actualEnd = effectiveEnd ?: -1L
+
+                if (firstChunk != null && effectiveStart < firstChunk.size) {
+                    val offsetInFirst = effectiveStart.toInt()
+                    val len = (actualEnd - effectiveStart + 1).toInt()
+                    firstChunk = firstChunk.copyOfRange(offsetInFirst, minOf(firstChunk.size, offsetInFirst + len))
+                    currentOffset = effectiveStart + firstChunk.size
+                } else {
+                    firstChunk = null
+                    currentOffset = effectiveStart
                 }
             } else {
-                // 首片探测 (使用 OkHttp 连接池与 HTTP/2 探针)
-                val probeResult = probeMedia(candidateUrls, session, requestedStart, initialProbeChunkSize)
-                if (probeResult == null) {
-                    sendHttpError(clientOut, 502, "Bad Gateway - Upstream CDN Unreachable")
-                    return
-                }
+                effectiveStart = parsedRange.start
+                effectiveEnd = parsedRange.end
 
-                if (probeResult.isNonRange) {
-                    // P0: HTTP 200 非 Range 容错，直接全量流式透传，避免老视频 512KB 截断
-                    pipeNonRangeStream(candidateUrls.firstOrNull() ?: session.primaryUrl, session, clientOut, statsTracker)
-                    return
-                }
+                if (hasCachedMetadata && effectiveStart > 0) {
+                    // P0: Seek 探针跳过优化！
+                    totalLength = session.totalLength
+                    contentType = session.contentType ?: if (isAudio) "audio/mp4" else "video/mp4"
+                    firstChunk = null
+                    currentOffset = effectiveStart
+                    actualEnd = when {
+                        effectiveEnd != null -> minOf(effectiveEnd, totalLength - 1L)
+                        totalLength > 0 -> totalLength - 1L
+                        else -> -1L
+                    }
+                } else {
+                    // 首片探测 (使用 OkHttp 连接池与 HTTP/2 探针)
+                    val probeResult = probeMedia(candidateUrls, session, effectiveStart, initialProbeChunkSize)
+                    if (probeResult == null) {
+                        sendHttpError(clientOut, 502, "Bad Gateway - Upstream CDN Unreachable")
+                        return false
+                    }
 
-                totalLength = probeResult.totalLength
-                contentType = probeResult.contentType ?: if (isAudio) "audio/mp4" else "video/mp4"
-                if (totalLength > 0) {
-                    session.totalLength = totalLength
-                    session.contentType = contentType
-                }
+                    if (probeResult.isNonRange) {
+                        return pipeNonRangeStream(candidateUrls.firstOrNull() ?: session.primaryUrl, session, clientOut, statsTracker)
+                    }
 
-                firstChunk = probeResult.firstChunkData
-                actualEnd = when {
-                    requestedEnd != null && requestedEnd > 0 -> minOf(requestedEnd, if (totalLength > 0) totalLength - 1 else requestedEnd)
-                    totalLength > 0 -> totalLength - 1
-                    else -> -1L
+                    totalLength = probeResult.totalLength
+                    contentType = probeResult.contentType ?: if (isAudio) "audio/mp4" else "video/mp4"
+                    if (totalLength > 0) {
+                        session.totalLength = totalLength
+                        session.contentType = contentType
+                    }
+
+                    firstChunk = probeResult.firstChunkData
+                    actualEnd = when {
+                        effectiveEnd != null -> minOf(effectiveEnd, if (totalLength > 0) totalLength - 1L else effectiveEnd)
+                        totalLength > 0 -> totalLength - 1L
+                        else -> -1L
+                    }
+                    currentOffset = effectiveStart + (firstChunk?.size ?: 0)
                 }
-                currentOffset = requestedStart + (firstChunk?.size ?: 0)
             }
 
             // 根据探针测得或已缓存的媒体总长度，自适应计算后续分片拉取的最佳 ChunkSize
@@ -274,19 +332,25 @@ object BtrChunkEngine {
             )
 
             // 2. 构造并发送 HTTP 206 Partial Content (或 200 OK) 响应头给播放器
-            val isPartial = requestedStart > 0 || actualEnd > 0
+            val isPartial = parsedRange.hasRange || effectiveStart > 0 || effectiveEnd != null
             val statusLine = if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n"
             val sb = StringBuilder(statusLine)
             sb.append("Content-Type: $contentType\r\n")
             sb.append("Accept-Ranges: bytes\r\n")
-            // 明确标记 Connection: close，杜绝客户端由于伪 keep-alive 产生复用连接重置 (Connection reset) 异常
-            sb.append("Connection: close\r\n")
 
-            if (totalLength > 0 && actualEnd >= requestedStart) {
-                val contentLength = actualEnd - requestedStart + 1
+            // HTTP Keep-Alive 支持：当客户端支持长连接且 Content-Length 明确时开启长连接复用
+            if (keepAlive && totalLength > 0 && actualEnd >= effectiveStart) {
+                sb.append("Connection: keep-alive\r\n")
+                sb.append("Keep-Alive: timeout=15, max=100\r\n")
+            } else {
+                sb.append("Connection: close\r\n")
+            }
+
+            if (totalLength > 0 && actualEnd >= effectiveStart) {
+                val contentLength = actualEnd - effectiveStart + 1
                 sb.append("Content-Length: $contentLength\r\n")
                 if (isPartial) {
-                    sb.append("Content-Range: bytes $requestedStart-$actualEnd/$totalLength\r\n")
+                    sb.append("Content-Range: bytes $effectiveStart-$actualEnd/$totalLength\r\n")
                 }
             } else if (!isPartial && totalLength > 0) {
                 sb.append("Content-Length: $totalLength\r\n")
@@ -296,24 +360,25 @@ object BtrChunkEngine {
             clientOut.write(sb.toString().toByteArray(Charsets.UTF_8))
             clientOut.flush()
 
-            if (isHeadOnly) return
+            if (isHeadOnly) return true
 
             // 3. 写出首片探测数据（仅在未跳过探针且有首片时）
             if (firstChunk != null && firstChunk.isNotEmpty()) {
-                val bytesToWrite = if (actualEnd > 0) {
-                    val needed = (actualEnd - requestedStart + 1).toInt()
+                val bytesToWrite = if (actualEnd >= effectiveStart) {
+                    val needed = (actualEnd - effectiveStart + 1).toInt()
                     if (needed < firstChunk.size) firstChunk.copyOf(needed) else firstChunk
                 } else firstChunk
 
                 clientOut.write(bytesToWrite)
                 clientOut.flush()
                 statsTracker.recordChunk(primaryHost, bytesToWrite.size.toLong(), 20L)
+                currentOffset = effectiveStart + bytesToWrite.size
             }
 
             // 计算剩余字节范围
-            if (actualEnd <= 0 || currentOffset > actualEnd) {
+            if (actualEnd < effectiveStart || currentOffset > actualEnd) {
                 // 已全部写出或未知长度单片传输完成
-                return
+                return true
             }
 
             // 4. 并发切片任务切分与滑动窗口流水线
@@ -412,6 +477,7 @@ object BtrChunkEngine {
                         break
                     }
                 }
+                return (nextDeliverIndex >= totalTasks && !isClientAborted.get())
             } finally {
                 isClientAborted.set(true)
                 dispatchFuture.cancel(true)
@@ -438,7 +504,7 @@ object BtrChunkEngine {
         session: BtrMediaSession,
         clientOut: OutputStream,
         statsTracker: StreamStatsTracker
-    ) {
+    ): Boolean {
         val host = extractHostname(url)
         val startTime = System.currentTimeMillis()
         val ua = session.userAgent ?: DEFAULT_USER_AGENT
@@ -450,7 +516,7 @@ object BtrChunkEngine {
             .header("Connection", "close")
             .build()
 
-        try {
+        return try {
             okClient.newCall(request).execute().use { response ->
                 val code = response.code
                 val cl = response.body?.contentLength() ?: -1L
@@ -474,8 +540,11 @@ object BtrChunkEngine {
                 }
                 clientOut.flush()
                 statsTracker.recordChunk(host, totalBytes, System.currentTimeMillis() - startTime)
+                false
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun probeMedia(
