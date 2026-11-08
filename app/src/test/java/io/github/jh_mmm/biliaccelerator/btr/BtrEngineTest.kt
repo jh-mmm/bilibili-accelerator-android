@@ -193,8 +193,8 @@ class BtrEngineTest {
         assertEquals(512 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(40 * 1024 * 1024L, 512, autoChunkSize = true, isAudio = false))
         // 60MB ~ 250MB -> 1024KB
         assertEquals(1024 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(150 * 1024 * 1024L, 512, autoChunkSize = true, isAudio = false))
-        // >= 250MB -> 1024KB (移动端 4K/8K 大文件切片上限收敛为 1MB 防 OOM)
-        assertEquals(1024 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(500 * 1024 * 1024L, 512, autoChunkSize = true, isAudio = false))
+        // >= 250MB -> 2048KB (4K/8K/超高码率大视频自适应提升至 2MB，减少高吞吐请求开销)
+        assertEquals(2048 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(500 * 1024 * 1024L, 512, autoChunkSize = true, isAudio = false))
     }
 
     @Test

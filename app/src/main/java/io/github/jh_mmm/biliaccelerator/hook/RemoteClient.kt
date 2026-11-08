@@ -64,14 +64,51 @@ object RemoteClient {
         // 从目标 App 私有目录载入历史持久化配置（1.0.5 逻辑，避免冷启动使用硬编码默认镜像）
         loadConfigFromLocalCache(app)
 
+        // 依据本地持久化配置初始化或同步 BTR Proxy 服务状态
+        syncBtrProxyState(cachedConfig)
+
         // 注册 ContentObserver 监听配置变更（实现毫秒级实时同步，彻底消除 30 秒延迟）
         registerConfigObserver(app)
 
         // 发送启动握手（同步包名、版本，更新看板“等待拦截”活跃状态）
         sendHandshakeAsync(app)
 
-        // 异步拉取最新配置
-        fetchConfigAsync(app)
+        // 异步拉取最新配置并在拉取成功后同步 BTR Proxy 状态
+        fetchConfigAsync(app) { latestConfig ->
+            syncBtrProxyState(latestConfig)
+        }
+    }
+
+    fun syncBtrProxyState(config: AcceleratorConfig) {
+        try {
+            if (config.enabled && config.enableBtr) {
+                if (!io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+                    io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.start(
+                        concurrency = config.btrConcurrency,
+                        chunkSizeKb = config.btrChunkSizeKb,
+                        autoConcurrency = config.btrAutoConcurrency,
+                        autoChunkSize = config.btrAutoChunkSize
+                    )
+                } else {
+                    io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.updateParameters(
+                        concurrency = config.btrConcurrency,
+                        chunkSizeKb = config.btrChunkSizeKb,
+                        autoConcurrency = config.btrAutoConcurrency,
+                        autoChunkSize = config.btrAutoChunkSize
+                    )
+                }
+                if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+                    HookStatusTracker.recordStatus("btr_proxy", "127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
+                }
+            } else {
+                if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+                    io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.stop()
+                    HookStatusTracker.recordStatus("btr_proxy", "disabled")
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to sync BTR proxy state: ${t.message}")
+        }
     }
 
     private fun registerConfigObserver(context: Context) {
@@ -82,14 +119,7 @@ object RemoteClient {
                         Log.i(TAG, "Configuration change detected via ContentObserver, reloading immediately...")
                         lastConfigFetchTime.set(0L)
                         fetchConfigAsync(context) { newConfig ->
-                            if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
-                                io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.updateParameters(
-                                    concurrency = newConfig.btrConcurrency,
-                                    chunkSizeKb = newConfig.btrChunkSizeKb,
-                                    autoConcurrency = newConfig.btrAutoConcurrency,
-                                    autoChunkSize = newConfig.btrAutoChunkSize
-                                )
-                            }
+                            syncBtrProxyState(newConfig)
                         }
                     }
                 }

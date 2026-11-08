@@ -91,13 +91,11 @@ jobs:
 
       - name: Build Release APK
         run: |
-          ./gradlew assembleRelease --stacktrace > release.log 2>&1 || true
-          cat release.log | tail -n 50
-          if grep -q "BUILD FAILED" release.log; then
+          ./gradlew assembleRelease --stacktrace 2>&1 | tee release.log || {
             ERR=$(grep -E "(e: |error:|FAILURE:|FAILED|Exception:)" release.log | head -n 30 | tr '\n' ' ' | tr '\r' ' ')
             echo "::error::Release build failed: $ERR"
             exit 1
-          fi
+          }
         env:
           KEYSTORE_FILE: release.jks
           KEYSTORE_PASSWORD: ${{ env.KEYSTORE_PASSWORD }}
@@ -117,9 +115,6 @@ jobs:
             echo "::warning::Non-release tag build produced a development artifact (-dev) with ephemeral signing key. Do NOT distribute as an official release."
           fi
           APK_FILE=$(find app/build/outputs -name "*release*.apk" 2>/dev/null | head -n 1)
-          if [ -z "$APK_FILE" ]; then
-            APK_FILE=$(find app/build/outputs -name "*.apk" 2>/dev/null | head -n 1)
-          fi
           if [ -z "$APK_FILE" ]; then
             echo "::error::No APK found! Outputs directory listing:"
             find app/build/outputs -type f || true

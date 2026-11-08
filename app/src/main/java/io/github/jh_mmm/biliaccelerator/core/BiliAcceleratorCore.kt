@@ -114,7 +114,7 @@ object BiliAcceleratorCore {
             val isMainlandTz = tzId.contains("shanghai") || tzId.contains("chongqing") ||
                     tzId.contains("harbin") || tzId.contains("urumqi") || tzId == "prc" || tzId == "cst"
             val isMainlandLocale = country == "CN"
-            !isMainlandTz || (!isMainlandLocale && !isMainlandTz)
+            !isMainlandTz && !isMainlandLocale
         } catch (_: Throwable) {
             false
         }
@@ -471,6 +471,9 @@ object BiliAcceleratorCore {
         return lowerPath.contains("/live-bvc/") ||
                 lowerPath.contains("/live-stream/") ||
                 lowerPath.contains("/live-flv/") ||
+                lowerUrl.contains("/live-bvc/") ||
+                lowerUrl.contains("/live-stream/") ||
+                lowerUrl.contains("/live-flv/") ||
                 lowerUrl.contains("gotcha") ||
                 lowerUrl.contains("live.bilibili.com") ||
                 lowerUrl.contains("live-play") ||
@@ -531,6 +534,9 @@ object BiliAcceleratorCore {
 
         val parsed = parseUri(original) ?: return noChange(original, "parse-failed")
         val hostname = parsed.host.lowercase()
+        if (hostname == "127.0.0.1" || hostname == "localhost") {
+            return noChange(original, "already-local-proxy")
+        }
         val segKey = extractSegmentKey(parsed.path)
         val cleanProxyHost = cleanHost(config.proxyHost).substringBefore(':').ifBlank { "proxy-tf-all-ws.bilivideo.com" }
         if (hostname == cleanProxyHost) {

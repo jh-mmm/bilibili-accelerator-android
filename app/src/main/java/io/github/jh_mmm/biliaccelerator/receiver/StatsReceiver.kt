@@ -118,7 +118,9 @@ class StatsReceiver : BroadcastReceiver() {
         if (action == ACTION_HANDSHAKE) {
             val clientPkg = intent.getStringExtra(EXTRA_CLIENT_PACKAGE)?.trim()
             val isAuthorized = hasValidCreator || (
-                    !clientPkg.isNullOrBlank() &&
+                    authToken != null &&
+                            creatorPackage == null &&
+                            !clientPkg.isNullOrBlank() &&
                             BiliAcceleratorCore.isTargetPackage(clientPkg) &&
                             isDirectedToModule(intent, context)
                     )
@@ -159,7 +161,9 @@ class StatsReceiver : BroadcastReceiver() {
         val singleJson = intent.getStringExtra(EXTRA_REWRITE_RESULT)
 
         val isAuthorized = hasValidCreator || (
-                isDirectedToModule(intent, context) &&
+                authToken != null &&
+                        creatorPackage == null &&
+                        isDirectedToModule(intent, context) &&
                         isPayloadLegitimate(batchJson, singleJson)
                 )
 

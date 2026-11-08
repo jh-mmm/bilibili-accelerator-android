@@ -109,6 +109,7 @@ fun SettingsScreen(
     var showUposDialog by rememberSaveable { mutableStateOf(false) }
     var showSpeedTestDialog by rememberSaveable { mutableStateOf(false) }
     var showProxyHostDialog by rememberSaveable { mutableStateOf(false) }
+    var showCustomCdnDialog by rememberSaveable { mutableStateOf(false) }
     var showMcdnStrategyDialog by rememberSaveable { mutableStateOf(false) }
     var showStyleDialog by rememberSaveable { mutableStateOf(false) }
     var showThemeModeDialog by rememberSaveable { mutableStateOf(false) }
@@ -156,6 +157,17 @@ fun SettingsScreen(
                 showProxyHostDialog = false
             },
             onDismiss = { showProxyHostDialog = false }
+        )
+    }
+
+    if (showCustomCdnDialog) {
+        CustomCdnPoolDialog(
+            customPool = config.customCdnPool,
+            onSave = { newPool ->
+                onConfigChange(config.copy(customCdnPool = newPool))
+                showCustomCdnDialog = false
+            },
+            onDismiss = { showCustomCdnDialog = false }
         )
     }
 
@@ -616,25 +628,34 @@ fun SettingsScreen(
                                     in 2..3 -> "${config.btrCdnPoolSize} 个节点 · 基础多源互备，低握手开销"
                                     in 4..6 -> "${config.btrCdnPoolSize} 个节点 · 骨干云厂商节点均衡并发"
                                     8 -> "8 个节点 · 推荐配置，官方多源全量并发拉取"
-                                    in 9..11 -> "${config.btrCdnPoolSize} 个节点 · 深度竞速，含全国混流节点"
-                                    else -> "12 个节点 · 全量白名单池跨源分片抢占"
+                                    in 9..12 -> "${config.btrCdnPoolSize} 个节点 · 深度竞速，含全国混流节点"
+                                    else -> "${config.btrCdnPoolSize} 个节点 · 极限全量并发，极高吞吐 (全池竞速)"
                                 }
 
                                 PreferenceSliderItem(
                                     title = "并发 CDN 节点池",
                                     summary = poolSummary,
-                                    value = config.btrCdnPoolSize.coerceIn(1, 12).toFloat(),
+                                    value = config.btrCdnPoolSize.coerceIn(1, 16).toFloat(),
                                     onValueChange = { newVal ->
-                                        val rounded = newVal.roundToInt()
+                                        val rounded = newVal.roundToInt().coerceIn(1, 16)
                                         if (rounded != config.btrCdnPoolSize) {
                                             onConfigChange(config.copy(btrCdnPoolSize = rounded))
                                         }
                                     },
-                                    valueRange = 1f..12f,
-                                    steps = 10,
+                                    valueRange = 1f..16f,
+                                    steps = 14,
                                     showKeyPoints = true,
-                                    keyPoints = listOf(1f, 2f, 4f, 6f, 8f, 12f),
+                                    keyPoints = listOf(1f, 2f, 4f, 6f, 8f, 12f, 16f),
                                     valueLabel = "${config.btrCdnPoolSize} 个节点",
+                                    enabled = config.enabled && config.enableBtr
+                                )
+
+                                PreferenceDivider()
+
+                                PreferenceItem(
+                                    title = "自定义 CDN 节点池",
+                                    summary = if (config.customCdnPool.isEmpty()) "未自定义 (使用系统默认 CDN 节点池)" else "已配置 ${config.customCdnPool.size} 个自定义节点",
+                                    onClick = { showCustomCdnDialog = true },
                                     enabled = config.enabled && config.enableBtr
                                 )
 
@@ -771,6 +792,68 @@ private fun SingleChoiceDialog(
 }
 
 @Composable
+private fun CustomCdnPoolDialog(
+    customPool: List<String>,
+    onSave: (List<String>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var textValue by rememberSaveable {
+        mutableStateOf(customPool.joinToString("\n"))
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("自定义 CDN 节点池") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = "每行填写一个 CDN 节点域名。留空则自动使用官方推荐的默认骨干 CDN 节点池。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                OutlinedTextField(
+                    value = textValue,
+                    onValueChange = { textValue = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(180.dp),
+                    placeholder = { Text("例:\nupos-sz-mirrorcos.bilivideo.com\nupos-sz-mirrorali.bilivideo.com", fontSize = 12.sp) }
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val hosts = textValue.lines()
+                    .map { BiliAcceleratorCore.cleanHost(it).trim().lowercase() }
+                    .filter { it.isNotBlank() && BiliAcceleratorCore.isValidHost(it) && !BiliAcceleratorCore.isAkamaiHost(it) }
+                    .distinct()
+                onSave(hosts)
+            }) {
+                Text("保存")
+            }
+        },
+        dismissButton = {
+            Row {
+                if (customPool.isNotEmpty()) {
+                    TextButton(onClick = { onSave(emptyList()) }) {
+                        Text("恢复默认")
+                    }
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("取消")
+                }
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+
+@Composable
 private fun ProxyHostDialog(
     currentHost: String,
     onSelect: (String) -> Unit,
@@ -865,7 +948,7 @@ private fun ProxyHostDialog(
                     presets[selectedPresetIndex].first
                 } else {
                     val cleaned = BiliAcceleratorCore.cleanHost(customHost).substringBefore(':')
-                    cleaned.ifBlank { "proxy-tf-all-ws.bilivideo.com" }
+                    if (BiliAcceleratorCore.isValidHost(cleaned)) cleaned else "proxy-tf-all-ws.bilivideo.com"
                 }
                 onSelect(chosenHost)
             }) {
@@ -919,7 +1002,7 @@ private fun UposSpeedTestDialog(
         try {
             conn.connect()
             val code = conn.responseCode
-            if (code !in 200..499) {
+            if (code !in 200..399) {
                 throw IllegalStateException("HTTP $code")
             }
             return (System.currentTimeMillis() - t0).coerceAtLeast(1L)

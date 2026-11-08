@@ -425,7 +425,7 @@ class BiliAcceleratorCoreTest {
     fun testEffectiveCdnPoolBehavior() {
         val defaultConfig = AcceleratorConfig()
         val defaultPool = BiliAcceleratorCore.getEffectiveCdnPool(defaultConfig)
-        assertEquals(BiliAcceleratorCore.MAINLAND_CANDIDATE_POOL.size, defaultPool.size)
+        assertEquals(defaultConfig.btrCdnPoolSize, defaultPool.size)
         assertTrue(defaultPool.contains("upos-sz-mirrorcos.bilivideo.com"))
 
         // 用户自定义白名单过滤非法与 Akamai 节点，上限 32

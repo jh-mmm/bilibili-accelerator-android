@@ -525,10 +525,14 @@ object StatsManager {
         sb.appendLine("【当前配置】")
         sb.appendLine("加速开关: ${if (config.enabled) "已启用" else "已关闭"}")
         sb.appendLine("首选 UPOS 镜像: ${config.targetHost}")
-        sb.appendLine("MCDN 官方代理: ${if (config.proxyMcdn) "开启 (中继: ${config.proxyHost})" else "关闭"}")
+        sb.appendLine("MCDN 官方代理: ${if (config.proxyMcdn) "开启 (中继: ${config.proxyHost}, 策略: ${config.mcdnStrategy})" else "关闭"}")
         sb.appendLine("PCDN 拦截: ${if (config.blockPcdn) "已开启" else "已关闭"}")
         sb.appendLine("强制统一线路: ${if (config.forceUpos) "开启" else "关闭"}")
         sb.appendLine("端口启发式: ${if (config.portHeuristic) "开启" else "关闭"}")
+        sb.appendLine("BTR 并发加速: ${if (config.enableBtr) "开启 (并发: ${if (config.btrAutoConcurrency) "自适应(最高${config.btrConcurrency})" else "${config.btrConcurrency}"}, 切片: ${if (config.btrAutoChunkSize) "自适应(基准${config.btrChunkSizeKb}KB)" else "${config.btrChunkSizeKb}KB"}, 节点池: ${config.btrCdnPoolSize})" else "关闭"}")
+        if (config.customCdnPool.isNotEmpty()) {
+            sb.appendLine("自定义 CDN 节点池: ${config.customCdnPool.size} 个节点")
+        }
         sb.appendLine("Moss gRPC 注入: ${if (config.enableMossHook) "开启 (实验性)" else "关闭 (默认)"}")
         sb.appendLine("剧集加速专属模式: ${if (config.enableEpisodeAcceleration) "开启 (专属调度)" else "关闭"}")
         sb.appendLine("直播多源并发加速: ${if (config.enableLiveAcceleration) "开启 (实验性对冲)" else "关闭"}")

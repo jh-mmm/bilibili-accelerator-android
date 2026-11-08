@@ -43,8 +43,12 @@ object NetworkSecurityHook {
             for (m in noArgMethods) {
                 try {
                     module.hook(m).intercept { chain ->
-                        // 允许明文流量兜底
-                        true
+                        val config = RemoteClient.fetchConfig()
+                        if (config.enabled && io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+                            true
+                        } else {
+                            chain.proceed()
+                        }
                     }
                     isHooked = true
                 } catch (_: Throwable) {}

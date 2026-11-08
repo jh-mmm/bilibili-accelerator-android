@@ -214,8 +214,7 @@ object BtrSessionManager {
         // 对齐 BTR：当海外账号仅分发 akamaized.net 节点或播放港澳台/海外专属剧集时，提取签名合成海外专属 ov 镜像
         val isOverseasStream = host.contains("ov.bilivideo.com") ||
                 isAkamai ||
-                (isEpisode && isRegionalPgcHost) ||
-                BiliAcceleratorCore.isOverseasEnvironment()
+                (isEpisode && isRegionalPgcHost)
 
         val candidateList = if (config != null && config.customCdnPool.isNotEmpty()) {
             BiliAcceleratorCore.getEffectiveCdnPool(config)

@@ -32,7 +32,6 @@ object BtrLiveEngine {
 
     private const val HEDGE_MS = 400L
     private const val URGENT_HEDGE_MS = 150L
-    private const val FIRST_BYTE_TIMEOUT_MS = 2500L
     private const val SEGMENT_TIMEOUT_MS = 8000L
     private const val CACHE_LIMIT = 32
     private const val CACHE_TTL_MS = 45_000L
@@ -62,6 +61,7 @@ object BtrLiveEngine {
     fun clearCache() {
         segmentCache.clear()
         prefetchQueue.clear()
+        probedSessions.clear()
     }
 
     private fun pruneCache() {
@@ -147,6 +147,7 @@ object BtrLiveEngine {
         val future = CompletableFuture<CachedLiveSegment>()
         val activeCalls = mutableListOf<Call>()
         val isCompleted = AtomicBoolean(false)
+        val failureCount = AtomicInteger(0)
 
         fun attemptOnHost(host: String, isPrimary: Boolean) {
             val targetUrl = BtrLiveCore.swapHost(url, host)
@@ -216,6 +217,9 @@ object BtrLiveEngine {
                 if (!call.isCanceled()) {
                     pool.failure(host, 0L)
                 }
+                if (failureCount.incrementAndGet() >= hosts.size) {
+                    future.completeExceptionally(t)
+                }
             }
         }
 
@@ -239,6 +243,9 @@ object BtrLiveEngine {
         return try {
             future.get(SEGMENT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         } catch (e: Exception) {
+            synchronized(activeCalls) {
+                activeCalls.forEach { if (!it.isCanceled()) runCatching { it.cancel() } }
+            }
             // 兜底回退：若竞速超时或失败，直接单线直连原始 URL
             val fallbackReq = Request.Builder()
                 .url(url)
@@ -413,43 +420,64 @@ object BtrLiveEngine {
             if (originHost.isNotBlank()) listOf(originHost) else listOf("d1--cn-gotcha204.bilivideo.com")
         }
 
-        val winnerHost = hosts.first()
-        val targetUrl = BtrLiveCore.swapHost(originalUrl, winnerHost)
+        fun tryStreamHost(host: String): Boolean {
+            val targetUrl = BtrLiveCore.swapHost(originalUrl, host)
+            val req = Request.Builder()
+                .url(targetUrl)
+                .header("User-Agent", session.userAgent ?: "BiliApp/7800300")
+                .header("Referer", session.referer)
+                .build()
 
-        val req = Request.Builder()
-            .url(targetUrl)
-            .header("User-Agent", session.userAgent ?: "BiliApp/7800300")
-            .header("Referer", session.referer)
-            .build()
+            return try {
+                BtrHttpClient.client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        return false
+                    }
 
-        return try {
-            val resp = BtrHttpClient.client.newCall(req).execute()
-            if (!resp.isSuccessful) {
-                sendError(clientOut, resp.code, "FLV upstream error")
-                resp.close()
-                return false
+                    val headerBuilder = StringBuilder()
+                    headerBuilder.append("HTTP/1.1 200 OK\r\n")
+                    headerBuilder.append("Content-Type: ${resp.header("Content-Type") ?: "video/x-flv"}\r\n")
+                    headerBuilder.append("Connection: close\r\n\r\n")
+                    clientOut.write(headerBuilder.toString().toByteArray(Charsets.US_ASCII))
+                    clientOut.flush()
+
+                    RemoteClient.notifyRewrite(
+                        RewriteResult(
+                            changed = true,
+                            originalUrl = originalUrl,
+                            finalUrl = targetUrl,
+                            originalHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(originalUrl)?.host),
+                            targetHost = host,
+                            reason = "BTR直播FLV加速",
+                            isPcdn = false,
+                            isMcdn = false,
+                            segmentKey = "live_flv_${session.sessionId}",
+                            isBtr = true
+                        )
+                    )
+
+                    val inStream = resp.body?.byteStream()
+                    val buf = ByteArray(32 * 1024)
+                    var read: Int
+                    while (inStream != null && inStream.read(buf).also { read = it } != -1) {
+                        clientOut.write(buf, 0, read)
+                        clientOut.flush()
+                    }
+                    true
+                }
+            } catch (t: Throwable) {
+                Log.i(TAG, "Live FLV stream on $host interrupted: ${t.message}")
+                false
             }
-
-            val headerBuilder = StringBuilder()
-            headerBuilder.append("HTTP/1.1 200 OK\r\n")
-            headerBuilder.append("Content-Type: ${resp.header("Content-Type") ?: "video/x-flv"}\r\n")
-            headerBuilder.append("Connection: close\r\n\r\n")
-            clientOut.write(headerBuilder.toString().toByteArray(Charsets.US_ASCII))
-            clientOut.flush()
-
-            val inStream = resp.body?.byteStream()
-            val buf = ByteArray(32 * 1024)
-            var read = 0
-            while (inStream != null && inStream.read(buf).also { read = it } != -1) {
-                clientOut.write(buf, 0, read)
-                clientOut.flush()
-            }
-            resp.close()
-            true
-        } catch (t: Throwable) {
-            Log.i(TAG, "Live FLV stream disconnected: ${t.message}")
-            false
         }
+
+        for (host in hosts) {
+            if (tryStreamHost(host)) {
+                return true
+            }
+        }
+        sendError(clientOut, 502, "FLV upstream all hosts failed")
+        return false
     }
 
     private fun extractUrlFromPath(path: String): String? {

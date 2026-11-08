@@ -184,6 +184,11 @@ object PlayerHook {
         if (!config.enabled || !config.enableBtr || !io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
             return null
         }
+        // 防重入：严禁对已重定向至本地代理回环的 URL 重复改写
+        if (originalUrl.contains("127.0.0.1:") || originalUrl.contains("localhost:") ||
+            (result.changed && (result.finalUrl.contains("127.0.0.1:") || result.finalUrl.contains("localhost:")))) {
+            return null
+        }
         val isLive = result.reason.startsWith("live-") ||
                 BiliAcceleratorCore.isLiveMediaUrl("", originalUrl) ||
                 (result.changed && BiliAcceleratorCore.isLiveMediaUrl("", result.finalUrl))
@@ -268,6 +273,9 @@ object PlayerHook {
             if (config.enableLiveAcceleration) {
                 val btrUrl = tryRewriteToBtr(originalUrl, result, config, builderInstance)
                 if (btrUrl != null) {
+                    if (result.changed) {
+                        RemoteClient.notifyRewrite(result)
+                    }
                     Log.i(TAG, "Rewrote live stream to BTR proxy: ${result.originalHost} -> 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
                     val newArgs = args.toTypedArray()
                     newArgs[strIndex] = btrUrl
@@ -307,6 +315,9 @@ object PlayerHook {
 
         val btrUrl = tryRewriteToBtr(originalUrl, result, config, builderInstance)
         if (btrUrl != null) {
+            if (result.changed) {
+                RemoteClient.notifyRewrite(result)
+            }
             Log.i(TAG, "Rewrote media url to BTR proxy: ${result.originalHost} -> 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
             val newArgs = args.toTypedArray()
             newArgs[strIndex] = btrUrl
@@ -344,6 +355,9 @@ object PlayerHook {
                             val result = BiliAcceleratorCore.rewriteUrl(original, config)
                             val btrUrl = tryRewriteToBtr(original, result, config, chain.thisObject)
                             if (btrUrl != null) {
+                                if (result.changed) {
+                                    RemoteClient.notifyRewrite(result)
+                                }
                                 Log.i(TAG, "Rewrote IjkMediaPlayer dataSource to BTR: 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
                                 val newArgs = chain.args.toTypedArray().apply { this[0] = btrUrl }
                                 return@intercept chain.proceed(newArgs)
@@ -377,6 +391,9 @@ object PlayerHook {
                                     val result = BiliAcceleratorCore.rewriteUrl(original, config)
                                     val btrUrl = tryRewriteToBtr(original, result, config, chain.thisObject)
                                     if (btrUrl != null) {
+                                        if (result.changed) {
+                                            RemoteClient.notifyRewrite(result)
+                                        }
                                         Log.i(TAG, "Rewrote IjkMediaPlayer Uri dataSource to BTR: 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
                                         val newArgs = chain.args.toTypedArray().apply { this[1] = Uri.parse(btrUrl) }
                                         return@intercept chain.proceed(newArgs)

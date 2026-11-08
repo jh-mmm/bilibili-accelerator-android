@@ -32,15 +32,22 @@ object BtrChunkEngine {
     private const val RESUME_MIN_BYTES = 32 * 1024      // 断点续传拼接最低字节门槛（对齐 BTR 原版）
     private const val DEFAULT_HEDGE_DELAY_MS = 1200L    // 对冲请求延迟触发阈值（毫秒）
 
-    // 全局共享工作线程池：复用线程，防止切集时线程暴增引发 OOM（core=8, max=32, 60s 存活）
+    // 全局共享工作线程池：复用线程，允许核心线程超时释放，防止切集时线程暴增引发 OOM（core=16, max=48）
     private val globalWorkerPool = ThreadPoolExecutor(
-        8,
-        32,
+        16,
+        48,
         60L,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue(512)
+        LinkedBlockingQueue(256)
     ) { r ->
         Thread(r, "BTR-GlobalWorker").apply { isDaemon = true }
+    }.apply {
+        allowCoreThreadTimeOut(true)
+    }
+
+    // 对冲竞速专属独立执行线程池：与主拉取线程隔离，彻底杜绝冲刺期对冲排队饥饿
+    private val hedgeWorkerPool = Executors.newCachedThreadPool { r ->
+        Thread(r, "BTR-HedgeWorker").apply { isDaemon = true }
     }
 
     // 全局分发调度线程池
@@ -48,20 +55,28 @@ object BtrChunkEngine {
         Thread(r, "BTR-Dispatcher").apply { isDaemon = true }
     }
 
-    // 活跃会话网络调用集合，用于切集/退出时秒级取消并释放网络和线程资源
-    private val sessionActiveCalls = ConcurrentHashMap<String, MutableSet<Call>>()
+    // 活跃网络调用映射表：支持按 streamCallKey 细粒度隔离与按 sessionId 会话级清理
+    private val streamActiveCalls = ConcurrentHashMap<String, MutableSet<Call>>()
+    private val sessionStreamKeys = ConcurrentHashMap<String, MutableSet<String>>()
 
-    private fun registerSessionCall(sessionId: String, call: Call) {
-        sessionActiveCalls.computeIfAbsent(sessionId) { ConcurrentHashMap.newKeySet() }.add(call)
+    private fun registerStreamCall(streamCallKey: String, sessionId: String, call: Call) {
+        streamActiveCalls.computeIfAbsent(streamCallKey) { ConcurrentHashMap.newKeySet() }.add(call)
+        sessionStreamKeys.computeIfAbsent(sessionId) { ConcurrentHashMap.newKeySet() }.add(streamCallKey)
     }
 
-    private fun unregisterSessionCall(sessionId: String, call: Call) {
-        sessionActiveCalls[sessionId]?.remove(call)
+    private fun unregisterStreamCall(streamCallKey: String, call: Call) {
+        streamActiveCalls[streamCallKey]?.remove(call)
     }
 
-    private fun cancelSessionCalls(sessionId: String) {
-        sessionActiveCalls.remove(sessionId)?.forEach { call ->
+    private fun cancelStreamCalls(streamCallKey: String) {
+        streamActiveCalls.remove(streamCallKey)?.forEach { call ->
             runCatching { call.cancel() }
+        }
+    }
+
+    fun cancelSessionCalls(sessionId: String) {
+        sessionStreamKeys.remove(sessionId)?.forEach { streamCallKey ->
+            cancelStreamCalls(streamCallKey)
         }
     }
 
@@ -74,11 +89,15 @@ object BtrChunkEngine {
 
     private val hostSpeeds = ConcurrentHashMap<String, HostSpeedInfo>()
     private const val SPEED_MEASURE_TTL_MS = 90_000L
+    private const val MAX_TRACKED_HOSTS = 256
 
     fun recordHostSpeed(host: String, bytes: Long, latencyMs: Long) {
         if (bytes < 32 * 1024 || latencyMs <= 0) return
         val bps = (bytes * 1000.0) / latencyMs
         val now = System.currentTimeMillis()
+        if (hostSpeeds.size > MAX_TRACKED_HOSTS) {
+            hostSpeeds.entries.removeIf { now - it.value.lastMeasuredAt > SPEED_MEASURE_TTL_MS }
+        }
         val info = hostSpeeds.getOrPut(host) { HostSpeedInfo() }
         synchronized(info) {
             if (now - info.lastMeasuredAt > SPEED_MEASURE_TTL_MS || info.avgBps <= 0.0) {
@@ -99,6 +118,14 @@ object BtrChunkEngine {
     }
 
     private val cdnPenalties = ConcurrentHashMap<String, Long>()
+
+    private fun penalizeHost(host: String, durationMs: Long) {
+        val now = System.currentTimeMillis()
+        if (cdnPenalties.size > MAX_TRACKED_HOSTS) {
+            cdnPenalties.entries.removeIf { it.value <= now }
+        }
+        cdnPenalties[host] = now + durationMs
+    }
 
     data class ChunkTask(
         val index: Long,
@@ -183,12 +210,14 @@ object BtrChunkEngine {
         isAudio: Boolean
     ): Long {
         if (isAudio) return 128 * 1024L
-        if (!autoChunkSize) return (baseChunkSizeKb.coerceIn(128, 2048) * 1024).toLong()
+        val baseBytes = (baseChunkSizeKb.coerceIn(128, 2048) * 1024).toLong()
+        if (!autoChunkSize) return baseBytes
         return when {
-            totalLength <= 0 -> (baseChunkSizeKb.coerceIn(128, 2048) * 1024).toLong()
+            totalLength <= 0 -> baseBytes
             totalLength < 15 * 1024 * 1024L -> 256 * 1024L
             totalLength < 60 * 1024 * 1024L -> 512 * 1024L
-            else -> 1024 * 1024L // 移动端自适应优化：大文件/4K 自动切片上限建议为 1024KB (1MB)，大幅缓解堆内存与 OOM 压力
+            totalLength < 250 * 1024 * 1024L -> 1024 * 1024L
+            else -> 2048 * 1024L // 4K/8K/超高码率大视频自适应切片提升至 2048KB (2MB)，大幅减少高吞吐握手开销
         }
     }
 
@@ -228,6 +257,7 @@ object BtrChunkEngine {
 
         val candidateUrls = (listOf(session.primaryUrl) + session.backupUrls).distinct()
         val primaryHost = BiliAcceleratorCore.cleanHost(extractHostname(session.primaryUrl))
+        val streamCallKey = "${session.sessionId}_${System.nanoTime()}"
 
         val statsTracker = StreamStatsTracker(session.sessionId, primaryHost, burstConcurrency, proxyPort, isEpisode = isEpisode)
 
@@ -420,15 +450,23 @@ object BtrChunkEngine {
                     val task = chunkTasks[dispatchIdx]
                     taskMap[task.index] = task
 
-                    globalWorkerPool.execute {
-                        if (!isClientAborted.get()) {
-                            try {
-                                fetchChunkWithFailover(task, candidateUrls, session, statsTracker, isClientAborted)
-                            } finally {
-                                synchronized(completionLock) {
-                                    completionLock.notifyAll()
+                    try {
+                        globalWorkerPool.execute {
+                            if (!isClientAborted.get()) {
+                                try {
+                                    fetchChunkWithFailover(task, candidateUrls, session, statsTracker, isClientAborted, streamCallKey)
+                                } finally {
+                                    synchronized(completionLock) {
+                                        completionLock.notifyAll()
+                                    }
                                 }
                             }
+                        }
+                    } catch (t: Throwable) {
+                        task.isFailed = true
+                        task.errorMessage = "Worker pool rejection: ${t.message}"
+                        synchronized(completionLock) {
+                            completionLock.notifyAll()
                         }
                     }
                     dispatchIdx++
@@ -481,7 +519,7 @@ object BtrChunkEngine {
             } finally {
                 isClientAborted.set(true)
                 dispatchFuture.cancel(true)
-                cancelSessionCalls(session.sessionId)
+                cancelStreamCalls(streamCallKey)
                 taskMap.clear()
             }
         } finally {
@@ -619,7 +657,8 @@ object BtrChunkEngine {
         urls: List<String>,
         session: BtrMediaSession,
         statsTracker: StreamStatsTracker,
-        isClientAborted: AtomicBoolean
+        isClientAborted: AtomicBoolean,
+        streamCallKey: String
     ) {
         if (isClientAborted.get()) return
 
@@ -640,7 +679,7 @@ object BtrChunkEngine {
 
         // 启动对冲并发监测任务（若单路慢/假死，超过 hedgeDelayMs 后第二路并发介入）
         val hedgeFuture = if (hedgeUrl != null && !isClientAborted.get()) {
-            globalWorkerPool.submit {
+            hedgeWorkerPool.submit {
                 try {
                     Thread.sleep(hedgeDelayMs)
                     if (!hasWinner.get() && !isClientAborted.get() && !task.isSuccess) {
@@ -652,7 +691,8 @@ object BtrChunkEngine {
                             hasWinner = hasWinner,
                             isHedge = true,
                             callHolder = hedgeCallRef,
-                            counterpartCallHolder = primaryCallRef
+                            counterpartCallHolder = primaryCallRef,
+                            streamCallKey = streamCallKey
                         )
                     }
                 } catch (_: InterruptedException) {}
@@ -668,10 +708,16 @@ object BtrChunkEngine {
             hasWinner = hasWinner,
             isHedge = false,
             callHolder = primaryCallRef,
-            counterpartCallHolder = hedgeCallRef
+            counterpartCallHolder = hedgeCallRef,
+            streamCallKey = streamCallKey
         )
 
         hedgeFuture?.cancel(true)
+        if (!task.isSuccess) {
+            hedgeCallRef.get()?.let { slowHedge ->
+                runCatching { slowHedge.cancel() }
+            }
+        }
 
         // 若前两路对冲/主请求未成功，按序尝试剩余备选节点（带断点续传）
         if (!task.isSuccess && !isClientAborted.get()) {
@@ -690,7 +736,8 @@ object BtrChunkEngine {
                     hasWinner = hasWinner,
                     isHedge = false,
                     callHolder = singleCallRef,
-                    counterpartCallHolder = null
+                    counterpartCallHolder = null,
+                    streamCallKey = streamCallKey
                 )
                 if (task.isSuccess) break
             }
@@ -715,7 +762,8 @@ object BtrChunkEngine {
         hasWinner: AtomicBoolean,
         isHedge: Boolean,
         callHolder: java.util.concurrent.atomic.AtomicReference<Call?>,
-        counterpartCallHolder: java.util.concurrent.atomic.AtomicReference<Call?>?
+        counterpartCallHolder: java.util.concurrent.atomic.AtomicReference<Call?>?,
+        streamCallKey: String
     ) {
         val host = extractHostname(url)
         val startTime = System.currentTimeMillis()
@@ -743,7 +791,7 @@ object BtrChunkEngine {
         val okClient = if (session.isAudio) BtrHttpClient.audioClient else BtrHttpClient.client
         val call = okClient.newCall(request)
         callHolder.set(call)
-        registerSessionCall(session.sessionId, call)
+        registerStreamCall(streamCallKey, session.sessionId, call)
 
         try {
             call.execute().use { response ->
@@ -771,9 +819,6 @@ object BtrChunkEngine {
                             return // 另一路对冲已胜出交付，立即退出
                         }
                         out.write(buffer, 0, read)
-                        if (resumeOffset == 0) {
-                            task.receivedBytes = out.size()
-                        }
                     }
 
                     val pieceBytes = out.toByteArray()
@@ -784,8 +829,8 @@ object BtrChunkEngine {
                     }
 
                     if (needBytes > 0 && pieceBytes.size < needBytes) {
-                        // 发生截断，保存已接收数据供下次断点拼接
-                        if (resumeOffset == 0 && pieceBytes.size >= RESUME_MIN_BYTES) {
+                        // 发生截断，保存已接收数据供下次断点拼接（仅当另一路未胜出且本路接收更多有效数据时）
+                        if (resumeOffset == 0 && pieceBytes.size >= RESUME_MIN_BYTES && !hasWinner.get()) {
                             task.prefixData = pieceBytes
                             task.receivedBytes = pieceBytes.size
                         }
@@ -828,7 +873,7 @@ object BtrChunkEngine {
                 reportFailover(host, "分片拉取异常: ${e.message}", session.sessionId)
             }
         } finally {
-            unregisterSessionCall(session.sessionId, call)
+            unregisterStreamCall(streamCallKey, call)
         }
     }
 
@@ -899,23 +944,10 @@ object BtrChunkEngine {
         }
     }
 
-    private fun sortUrlsByHealth(urls: List<String>): List<String> {
-        val now = System.currentTimeMillis()
-        return urls.sortedBy { url ->
-            val host = extractHostname(url)
-            val penaltyUntil = cdnPenalties[host] ?: 0L
-            if (penaltyUntil > now) penaltyUntil - now else 0L
-        }
-    }
-
     private fun extractHostname(url: String): String {
         return BiliAcceleratorCore.parseUri(url)?.host
             ?: runCatching { java.net.URI(url).host }.getOrNull()
             ?: ""
-    }
-
-    private fun penalizeHost(host: String, durationMs: Long) {
-        cdnPenalties[host] = System.currentTimeMillis() + durationMs
     }
 
     private fun isPenalized(host: String): Boolean {
