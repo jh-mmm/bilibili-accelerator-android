@@ -458,7 +458,7 @@ object BtrLiveEngine {
 
                     val inStream = resp.body?.byteStream()
                     val buf = ByteArray(32 * 1024)
-                    var read: Int
+                    var read = 0
                     while (inStream != null && inStream.read(buf).also { read = it } != -1) {
                         clientOut.write(buf, 0, read)
                         clientOut.flush()

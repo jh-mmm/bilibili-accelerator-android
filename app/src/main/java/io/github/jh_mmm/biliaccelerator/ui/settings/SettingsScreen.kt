@@ -652,11 +652,10 @@ fun SettingsScreen(
 
                                 PreferenceDivider()
 
-                                PreferenceItem(
+                                PreferenceActionItem(
                                     title = "自定义 CDN 节点池",
                                     summary = if (config.customCdnPool.isEmpty()) "未自定义 (使用系统默认 CDN 节点池)" else "已配置 ${config.customCdnPool.size} 个自定义节点",
-                                    onClick = { showCustomCdnDialog = true },
-                                    enabled = config.enabled && config.enableBtr
+                                    onClick = { if (config.enabled && config.enableBtr) showCustomCdnDialog = true }
                                 )
 
                                 PreferenceDivider()
