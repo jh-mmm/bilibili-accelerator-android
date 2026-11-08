@@ -9,7 +9,7 @@ android {
     compileSdk = 35
 
     val appVersionCode = 200
-    val appVersionName = "2.0.0-preview.1"
+    val appVersionName = "2.0.0-preview.2"
 
     defaultConfig {
         applicationId = "io.github.jh_mmm.biliaccelerator"

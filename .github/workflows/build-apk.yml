@@ -170,7 +170,8 @@ jobs:
           files: release_outputs/**/*.apk
           body_path: release_notes.md
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-') || contains(github.ref_name, 'preview') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          make_latest: ${{ !(contains(github.ref_name, '-') || contains(github.ref_name, 'preview') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc')) }}
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
