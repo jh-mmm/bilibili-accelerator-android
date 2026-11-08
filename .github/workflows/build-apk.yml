@@ -91,11 +91,15 @@ jobs:
 
       - name: Build Release APK
         run: |
-          ./gradlew assembleRelease --stacktrace 2>&1 | tee release.log || {
-            ERR=$(grep -E "(e: |error:|FAILURE:|FAILED|Exception:)" release.log | head -n 30 | tr '\n' ' ' | tr '\r' ' ')
-            echo "::error::Release build failed: $ERR"
+          ./gradlew assembleRelease --stacktrace 2>&1 | tee release.log
+          STATUS=${PIPESTATUS[0]}
+          if [ $STATUS -ne 0 ] || grep -q "BUILD FAILED" release.log; then
+            echo "### Release Build Failed" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 120 release.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
             exit 1
-          }
+          fi
         env:
           KEYSTORE_FILE: release.jks
           KEYSTORE_PASSWORD: ${{ env.KEYSTORE_PASSWORD }}
@@ -114,10 +118,16 @@ jobs:
             NAME="BiliAccelerator-${SHORT_SHA}-dev.apk"
             echo "::warning::Non-release tag build produced a development artifact (-dev) with ephemeral signing key. Do NOT distribute as an official release."
           fi
+          echo "### Outputs Listing" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          find app/build/outputs -type f >> $GITHUB_STEP_SUMMARY 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
           APK_FILE=$(find app/build/outputs -name "*release*.apk" 2>/dev/null | head -n 1)
           if [ -z "$APK_FILE" ]; then
-            echo "::error::No APK found! Outputs directory listing:"
-            find app/build/outputs -type f || true
+            APK_FILE=$(find app/build/outputs -name "*.apk" 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::No APK found in app/build/outputs!"
             exit 1
           fi
           cp "$APK_FILE" "outputs/${NAME}"
