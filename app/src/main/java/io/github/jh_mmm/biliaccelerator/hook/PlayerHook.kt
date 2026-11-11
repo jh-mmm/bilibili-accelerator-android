@@ -219,8 +219,21 @@ object PlayerHook {
             Log.i(TAG, "DRM protected stream detected, bypassing BTR proxy")
             return null
         }
-        val targetUrl = if (result.changed) result.finalUrl else originalUrl
+        var targetUrl = if (result.changed) result.finalUrl else originalUrl
         val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty().toMutableList()
+
+        if (!isLive && (result.isPcdn || result.isMcdn)) {
+            val cleanOfficialBackup = pendingBackups.firstOrNull { backup ->
+                val bHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(backup)?.host).lowercase()
+                bHost.isNotBlank() && BiliAcceleratorCore.isBiliCdnHost(bHost) &&
+                    !BiliAcceleratorCore.isMcdnHost(bHost) && !BiliAcceleratorCore.isKnownP2pHost(bHost) &&
+                    !BiliAcceleratorCore.isIpAddress(bHost) && !BiliAcceleratorCore.isAkamaiHost(bHost)
+            }
+            if (cleanOfficialBackup != null) {
+                targetUrl = cleanOfficialBackup
+                Log.i(TAG, "Promoted official backup mirror to primary: $cleanOfficialBackup")
+            }
+        }
 
         if (isLive) {
             val cleanHost = builderInstance?.let { builderCleanLiveHost[it] } ?: latestCleanLiveHost
@@ -326,9 +339,20 @@ object PlayerHook {
 
         RemoteClient.notifyRewrite(result)
         if (result.changed) {
-            Log.i(TAG, "Rewrote media url: ${result.originalHost} -> ${result.targetHost} [${result.reason}]")
+            val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty()
+            val cleanOfficialBackup = if (!isLive && (result.isPcdn || result.isMcdn)) {
+                pendingBackups.firstOrNull { backup ->
+                    val bHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(backup)?.host).lowercase()
+                    bHost.isNotBlank() && BiliAcceleratorCore.isBiliCdnHost(bHost) &&
+                        !BiliAcceleratorCore.isMcdnHost(bHost) && !BiliAcceleratorCore.isKnownP2pHost(bHost) &&
+                        !BiliAcceleratorCore.isIpAddress(bHost) && !BiliAcceleratorCore.isAkamaiHost(bHost)
+                }
+            } else null
+
+            val finalUrl = cleanOfficialBackup ?: result.finalUrl
+            Log.i(TAG, "Rewrote media url: ${result.originalHost} -> ${BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(finalUrl)?.host)} [${result.reason}]")
             val newArgs = args.toTypedArray()
-            newArgs[strIndex] = result.finalUrl
+            newArgs[strIndex] = finalUrl
             return newArgs
         }
         return null

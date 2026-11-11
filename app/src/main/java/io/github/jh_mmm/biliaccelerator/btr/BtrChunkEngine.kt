@@ -240,10 +240,15 @@ object BtrChunkEngine {
         keepAlive: Boolean = false
     ): Boolean {
         val isAudio = session.isAudio || BiliAcceleratorCore.isAudioTrack(session.primaryUrl)
-        val initialProbeChunkSize = if (isAudio) {
-            CHUNK_SIZE_AUDIO.toLong() // 音频流采用 128KB 小切片低时延分片
+        val requestedBytes = if (parsedRange.hasRange && parsedRange.end != null && parsedRange.end >= parsedRange.start) {
+            parsedRange.end - parsedRange.start + 1
+        } else -1L
+
+        val defaultProbeSize = if (isAudio) CHUNK_SIZE_AUDIO.toLong() else CHUNK_SIZE_VIDEO.toLong()
+        val initialProbeChunkSize = if (requestedBytes in 1 until defaultProbeSize) {
+            requestedBytes
         } else {
-            CHUNK_SIZE_VIDEO.toLong() // 探测首片统一使用 512KB 快速拉取总长度
+            defaultProbeSize
         }
 
         val isEpisode = session.isEpisode
@@ -432,10 +437,14 @@ object BtrChunkEngine {
                 var dispatchIdx = 0
                 while (dispatchIdx < totalTasks && !isClientAborted.get()) {
                     // 动态线程调节与背压控制：冲刺期放宽，稳定期按 baseConcurrency 约束在途分片
-                    val maxPrefetch = if (useAuto && deliveredIndex.get() >= 4) {
-                        minOf(MAX_PREFETCH_CHUNKS, baseConcurrency * 2)
+                    val maxPrefetch = if (useAuto) {
+                        if (deliveredIndex.get() >= 4) {
+                            minOf(MAX_PREFETCH_CHUNKS, baseConcurrency * 2)
+                        } else {
+                            maxOf(MAX_PREFETCH_CHUNKS, burstConcurrency)
+                        }
                     } else {
-                        MAX_PREFETCH_CHUNKS
+                        minOf(MAX_PREFETCH_CHUNKS, baseConcurrency * 2)
                     }
 
                     while (dispatchIdx - deliveredIndex.get() >= maxPrefetch && !isClientAborted.get()) {
@@ -634,8 +643,9 @@ object BtrChunkEngine {
                             recordHostSpeed(host, data.size.toLong(), latency)
                         }
                         return ProbeResult(total, cl, ct, data, host, latency, isNonRange = isNonRange)
-                    } else if (code == 403 || code >= 500) {
-                        penalizeHost(host, 20_000L)
+                    } else if (code == 403 || code == 412 || code == 429 || code >= 500) {
+                        val penaltyTime = if (code == 429) 45_000L else if (code == 412) 30_000L else 20_000L
+                        penalizeHost(host, penaltyTime)
                         // 仅当失败的节点是主节点时才上报熔断切换，避免在评估备用候选池时产生虚假熔断告警
                         if (host == primaryHost) {
                             reportFailover(host, "HTTP $code 错误", session.sessionId)
@@ -662,7 +672,8 @@ object BtrChunkEngine {
     ) {
         if (isClientAborted.get()) return
 
-        val tryUrls = sortUrlsByHealthAndSpeed(urls, task.index)
+        val rotationIndex = session.globalChunkIndex.getAndIncrement()
+        val tryUrls = sortUrlsByHealthAndSpeed(urls, rotationIndex)
         if (tryUrls.isEmpty()) {
             task.isFailed = true
             task.errorMessage = "No available CDN urls"
@@ -831,8 +842,12 @@ object BtrChunkEngine {
                     if (needBytes > 0 && pieceBytes.size < needBytes) {
                         // 发生截断，保存已接收数据供下次断点拼接（仅当另一路未胜出且本路接收更多有效数据时）
                         if (resumeOffset == 0 && pieceBytes.size >= RESUME_MIN_BYTES && !hasWinner.get()) {
-                            task.prefixData = pieceBytes
-                            task.receivedBytes = pieceBytes.size
+                            synchronized(task) {
+                                if (!hasWinner.get() && pieceBytes.size > task.receivedBytes) {
+                                    task.prefixData = pieceBytes
+                                    task.receivedBytes = pieceBytes.size
+                                }
+                            }
                         }
                         penalizeHost(host, 20_000L)
                         reportFailover(host, "分片数据截断 (${pieceBytes.size}/$needBytes 字节)", session.sessionId)
@@ -840,11 +855,27 @@ object BtrChunkEngine {
                     }
 
                     // 拼接前序断点数据（如果有）
-                    val finalData = if (resumeOffset > 0 && existingPrefix != null) {
+                    // 严格校验：只有当 HTTP 状态码为 206 且 Content-Range 明确从 requestStart 开始时才允许拼接断点数据
+                    val rangeStart = parseRangeStart(cr)
+                    val canResume = resumeOffset > 0 && existingPrefix != null && code == 206 && (rangeStart == null || rangeStart == requestStart)
+
+                    val finalData = if (canResume) {
                         val combined = ByteArray(expectedTotal)
-                        System.arraycopy(existingPrefix, 0, combined, 0, resumeOffset)
+                        System.arraycopy(existingPrefix!!, 0, combined, 0, resumeOffset)
                         System.arraycopy(pieceBytes, 0, combined, resumeOffset, pieceBytes.size)
                         combined
+                    } else if (resumeOffset > 0 && pieceBytes.size == expectedTotal) {
+                        // 服务器忽略了 Range 头部，返回了完整分片数据
+                        pieceBytes
+                    } else if (resumeOffset > 0) {
+                        // 服务器返回了不可拼接的错位数据，重置断点缓存避免数据损坏
+                        synchronized(task) {
+                            task.prefixData = null
+                            task.receivedBytes = 0
+                        }
+                        penalizeHost(host, 20_000L)
+                        reportFailover(host, "断点续传范围失配 (rangeStart=$rangeStart, reqStart=$requestStart)", session.sessionId)
+                        return
                     } else {
                         pieceBytes
                     }
@@ -862,8 +893,9 @@ object BtrChunkEngine {
                         }
                     }
                     return
-                } else if (code == 403 || code >= 500) {
-                    penalizeHost(host, 20_000L)
+                } else if (code == 403 || code == 412 || code == 429 || code >= 500) {
+                    val penaltyTime = if (code == 429) 45_000L else if (code == 412) 30_000L else 20_000L
+                    penalizeHost(host, penaltyTime)
                     reportFailover(host, "HTTP $code 熔断", session.sessionId)
                 }
             }
@@ -877,6 +909,12 @@ object BtrChunkEngine {
         }
     }
 
+    private fun parseRangeStart(cr: String?): Long? {
+        if (cr.isNullOrBlank()) return null
+        val match = Regex("""bytes\s+(\d+)-""").find(cr)
+        return match?.groupValues?.get(1)?.toLongOrNull()
+    }
+
     private fun sortUrlsByHealthAndSpeed(urls: List<String>, taskIndex: Long): List<String> {
         val now = System.currentTimeMillis()
         val sortedUrls = urls.sortedBy { url ->
@@ -885,19 +923,22 @@ object BtrChunkEngine {
             if (penaltyUntil > now) penaltyUntil - now else 0L
         }
         val healthyUrls = sortedUrls.filterNot { isPenalized(extractHostname(it)) }
-        if (healthyUrls.size <= 1) return sortedUrls
 
-        // P2: 按照 EWMA 节点实测测速加权（速度快的优先，淘汰极端落后节点）
-        val ranked = healthyUrls.sortedByDescending { getHostSpeed(extractHostname(it)) }
-        val topSpeed = getHostSpeed(extractHostname(ranked.first()))
-        val eligible = if (topSpeed > 0.0) {
-            ranked.filter {
-                val sp = getHostSpeed(extractHostname(it))
-                sp == 0.0 || sp >= (topSpeed / 8.0)
-            }
-        } else ranked
+        val pool = if (healthyUrls.isNotEmpty()) {
+            val ranked = healthyUrls.sortedByDescending { getHostSpeed(extractHostname(it)) }
+            val topSpeed = getHostSpeed(extractHostname(ranked.first()))
+            val eligible = if (topSpeed > 0.0) {
+                ranked.filter {
+                    val sp = getHostSpeed(extractHostname(it))
+                    sp == 0.0 || sp >= (topSpeed / 8.0)
+                }
+            } else ranked
+            if (eligible.isNotEmpty()) eligible else ranked
+        } else {
+            sortedUrls
+        }
 
-        val pool = if (eligible.isNotEmpty()) eligible else ranked
+        if (pool.isEmpty()) return emptyList()
         val offset = (taskIndex % pool.size).toInt()
         return pool.subList(offset, pool.size) + pool.subList(0, offset)
     }

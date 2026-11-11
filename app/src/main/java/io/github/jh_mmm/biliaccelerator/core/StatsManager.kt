@@ -261,7 +261,11 @@ object StatsManager {
     ): Boolean {
         val segKey = result.segmentKey.trim()
         if (segKey.isEmpty()) return true
-        val compositeKey = "$segKey|${result.originalHost}|${result.targetHost}|${result.reason}|${result.changed}"
+        val compositeKey = if (result.isBtr || segKey.startsWith("btr_stream_")) {
+            "$segKey|${result.originalHost}|${result.targetHost}|btr|${result.changed}"
+        } else {
+            "$segKey|${result.originalHost}|${result.targetHost}|${result.reason}|${result.changed}"
+        }
         synchronized(recentCrossProcessSegments) {
             val prev = recentCrossProcessSegments[compositeKey]
             if (prev != null && (now - prev) in 0..CROSS_PROCESS_DEDUP_WINDOW_MS) {

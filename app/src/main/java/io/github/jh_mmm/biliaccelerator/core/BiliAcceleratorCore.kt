@@ -510,7 +510,10 @@ object BiliAcceleratorCore {
         val cleanedTarget = cleanHost(config.targetHost)
         val targetHostOnly = cleanedTarget.substringBefore(':')
         val effectivePool = getEffectiveCdnPool(config)
-        return if (isValidHost(cleanedTarget) && (isBiliCdnHost(targetHostOnly) || effectivePool.contains(targetHostOnly) || CANDIDATE_POOL.contains(targetHostOnly)) && !isAkamaiHost(targetHostOnly)) {
+        val isDefaultTarget = cleanedTarget.isBlank() || cleanedTarget.equals("upos-sz-mirrorcos.bilivideo.com", ignoreCase = true)
+        return if (isDefaultTarget && isOverseasEnvironment() && config.customCdnPool.isEmpty()) {
+            effectivePool.firstOrNull() ?: CANDIDATE_POOL[0]
+        } else if (isValidHost(cleanedTarget) && (isBiliCdnHost(targetHostOnly) || effectivePool.contains(targetHostOnly) || CANDIDATE_POOL.contains(targetHostOnly)) && !isAkamaiHost(targetHostOnly)) {
             targetHostOnly
         } else {
             effectivePool.firstOrNull() ?: CANDIDATE_POOL[0]
@@ -622,10 +625,8 @@ object BiliAcceleratorCore {
                 } else {
                     return noChange(original, "ok", isMcdn = true, segmentKey = segKey)
                 }
-            } else if (config.mcdnStrategy.equals("replace", ignoreCase = true) || config.forceUpos) {
-                // 关键防护（对齐 BTR Issue #47）：
-                // 若 MCDN 路径以 /v1/resource/ 开头，普通 UPOS 节点没有中继资源，直接换 Host 必报 HTTP 403！
-                // 遇到此类地址必须强制降级走官方 CDN 中继代理 (proxyWrap)，杜绝 403 熔断。
+            } else {
+                // 非 /v1/resource/ 资源走 replace 或 proxy-v1 的常规 UPOS 替换
                 if (parsed.path.startsWith("/v1/resource/")) {
                     val rewritten = parsed.proxyWrap(cleanProxyHost)
                     return RewriteResult(
@@ -745,10 +746,11 @@ object BiliAcceleratorCore {
         }
 
         val sampleUrl = rawList.firstOrNull()
-        if (filtered.isEmpty() && sampleUrl != null) {
+        if (filtered.distinct().size <= 1 && sampleUrl != null) {
             // 对齐 BTR Issue #47：中继/MCDN 地址、DRM 加密地址与 Akamai 地址严禁作为 Donor 生成普通 UPOS 镜像
             if (!isRelayUrl(sampleUrl) && !isAkamaiHost(sampleUrl) && !hasDrmSignal(sampleUrl)) {
-                val candidates = CANDIDATE_POOL.filter { it != target }
+                val pool = getEffectiveCdnPool(config)
+                val candidates = pool.filter { it != target }
                 for (candidate in candidates.take(3)) {
                     val backupRes = rewriteUrl(
                         sampleUrl,

@@ -39,6 +39,9 @@ object BtrLiveEngine {
     // 内存分片缓存: Segment URL -> CachedLiveSegment
     private val segmentCache = ConcurrentHashMap<String, CachedLiveSegment>()
 
+    // 在途请求共享表: Segment URL -> CompletableFuture (避免预取与播放器即时请求双重下载)
+    private val inFlightSegments = ConcurrentHashMap<String, CompletableFuture<CachedLiveSegment>>()
+
     // 预加载队列
     private val prefetchQueue = ConcurrentLinkedQueue<Pair<BtrMediaSession, String>>()
     private val inflightPrefetches = AtomicInteger(0)
@@ -60,6 +63,7 @@ object BtrLiveEngine {
 
     fun clearCache() {
         segmentCache.clear()
+        inFlightSegments.clear()
         prefetchQueue.clear()
         probedSessions.clear()
     }
@@ -137,6 +141,21 @@ object BtrLiveEngine {
             }
         }
 
+        // 2. 避免预取与即时请求重复下载：共享 in-flight CompletableFuture
+        var isOwner = false
+        val future = inFlightSegments.computeIfAbsent(url) {
+            isOwner = true
+            CompletableFuture<CachedLiveSegment>()
+        }
+        if (!isOwner) {
+            return try {
+                future.get(SEGMENT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            } catch (_: Exception) {
+                segmentCache[url]?.let { return it }
+                downloadFallbackSegment(session, url)
+            }
+        }
+
         val pool = session.liveHostPool ?: BtrLiveHostPool().also { session.liveHostPool = it }
         val hosts = pool.pick(2).ifEmpty {
             val originHost = BiliAcceleratorCore.parseUri(url)?.host.orEmpty()
@@ -144,7 +163,6 @@ object BtrLiveEngine {
         }
 
         val hedgeDelay = if (urgent) URGENT_HEDGE_MS else HEDGE_MS
-        val future = CompletableFuture<CachedLiveSegment>()
         val activeCalls = mutableListOf<Call>()
         val isCompleted = AtomicBoolean(false)
         val failureCount = AtomicInteger(0)
@@ -172,6 +190,10 @@ object BtrLiveEngine {
                     }
                     val body = resp.body ?: throw Exception("Empty body")
                     val data = body.bytes()
+                    if (data.isEmpty()) {
+                        pool.failure(host, 0L)
+                        throw Exception("0KB empty response from $host")
+                    }
                     val latency = (System.currentTimeMillis() - startTime).toDouble()
                     val bps = (data.size * 1000.0) / maxOf(1.0, latency)
 
@@ -246,20 +268,36 @@ object BtrLiveEngine {
             synchronized(activeCalls) {
                 activeCalls.forEach { if (!it.isCanceled()) runCatching { it.cancel() } }
             }
-            // 兜底回退：若竞速超时或失败，直接单线直连原始 URL
-            val fallbackReq = Request.Builder()
-                .url(url)
-                .header("User-Agent", session.userAgent ?: "BiliApp/7800300")
-                .header("Referer", session.referer)
-                .build()
-            BtrHttpClient.client.newCall(fallbackReq).execute().use { resp ->
-                val bytes = resp.body?.bytes() ?: ByteArray(0)
-                CachedLiveSegment(
-                    bytes = bytes,
-                    contentType = resp.header("Content-Type") ?: "video/iso.segment",
-                    host = "fallback"
-                )
+            val fb = downloadFallbackSegment(session, url)
+            future.complete(fb)
+            fb
+        } finally {
+            inFlightSegments.remove(url)
+        }
+    }
+
+    private fun downloadFallbackSegment(session: BtrMediaSession, url: String): CachedLiveSegment {
+        val fallbackReq = Request.Builder()
+            .url(url)
+            .header("User-Agent", session.userAgent ?: "BiliApp/7800300")
+            .header("Referer", session.referer)
+            .build()
+        return BtrHttpClient.client.newCall(fallbackReq).execute().use { resp ->
+            if (!resp.isSuccessful) {
+                throw Exception("Fallback request failed: HTTP ${resp.code}")
             }
+            val bytes = resp.body?.bytes() ?: ByteArray(0)
+            if (bytes.isEmpty()) {
+                throw Exception("Fallback request returned 0 bytes")
+            }
+            val segment = CachedLiveSegment(
+                bytes = bytes,
+                contentType = resp.header("Content-Type") ?: "video/iso.segment",
+                host = "fallback"
+            )
+            segmentCache[url] = segment
+            pruneCache()
+            segment
         }
     }
 
@@ -291,6 +329,21 @@ object BtrLiveEngine {
                     return false
                 }
                 val text = resp.body?.string().orEmpty()
+                // 对齐 HLS 规范：若为 Master Playlist (#EXT-X-STREAM-INF)，包含的是多码率子播放列表索引，严禁改写为分片
+                if (text.contains("#EXT-X-STREAM-INF", ignoreCase = true)) {
+                    val bodyBytes = text.toByteArray(Charsets.UTF_8)
+                    val headerBuilder = StringBuilder()
+                    headerBuilder.append("HTTP/1.1 200 OK\r\n")
+                    headerBuilder.append("Content-Type: application/vnd.apple.mpegurl\r\n")
+                    headerBuilder.append("Content-Length: ${bodyBytes.size}\r\n")
+                    headerBuilder.append("Connection: keep-alive\r\n\r\n")
+
+                    clientOut.write(headerBuilder.toString().toByteArray(Charsets.US_ASCII))
+                    clientOut.write(bodyBytes)
+                    clientOut.flush()
+                    return true
+                }
+
                 val parsed = BtrLiveCore.parseM3u8(text, playlistFetchUrl)
 
                 // 探测候选节点
@@ -298,8 +351,8 @@ object BtrLiveEngine {
                     probeCandidates(session, parsed.segments[0].url)
                 }
 
-                // 预加载接下来即将播放的分片
-                pumpPrefetches(session, parsed.segments)
+                // 预加载接下来即将播放的分片 (优先预取 #EXT-X-MAP 初始化分片)
+                pumpPrefetches(session, parsed.segments, parsed.mapUrl)
 
                 // 改写分片 URL，使其全部流入本地代理调度
                 val rewrittenM3u8 = rewritePlaylistContent(text, playlistFetchUrl, session.sessionId, proxyPort)
@@ -343,10 +396,15 @@ object BtrLiveEngine {
                     sb.append(line).append("\n")
                 }
             } else if (line.isNotBlank() && !line.startsWith("#")) {
-                val resolved = try { java.net.URI(playlistUrl).resolve(line).toASCIIString() } catch (_: Throwable) { line }
-                val encoded = URLEncoder.encode(resolved, "UTF-8")
-                val proxied = "http://127.0.0.1:$proxyPort/stream/$sessionId/segment.m4s?url=$encoded"
-                sb.append(proxied).append("\n")
+                if (line.endsWith(".ts", ignoreCase = true)) {
+                    // TS 流不属于 fMP4 分片，按原样保留
+                    sb.append(rawLine).append("\n")
+                } else {
+                    val resolved = try { java.net.URI(playlistUrl).resolve(line).toASCIIString() } catch (_: Throwable) { line }
+                    val encoded = URLEncoder.encode(resolved, "UTF-8")
+                    val proxied = "http://127.0.0.1:$proxyPort/stream/$sessionId/segment.m4s?url=$encoded"
+                    sb.append(proxied).append("\n")
+                }
             } else {
                 sb.append(rawLine).append("\n")
             }
@@ -354,9 +412,15 @@ object BtrLiveEngine {
         return sb.toString()
     }
 
-    private fun pumpPrefetches(session: BtrMediaSession, segments: List<LiveSegment>) {
-        if (segments.isEmpty() || urgentInflight.get() > 0) return
+    private fun pumpPrefetches(session: BtrMediaSession, segments: List<LiveSegment>, mapUrl: String? = null) {
+        if ((segments.isEmpty() && mapUrl.isNullOrBlank()) || urgentInflight.get() > 0) return
         livePrefetchPool.execute {
+            // 优先预取首要元数据分片 (#EXT-X-MAP)
+            if (!mapUrl.isNullOrBlank() && !segmentCache.containsKey(mapUrl)) {
+                try {
+                    downloadLiveSegment(session, mapUrl, urgent = false)
+                } catch (_: Throwable) {}
+            }
             // 预取最新公布的前 3 个分片
             for (seg in segments.take(3)) {
                 if (!segmentCache.containsKey(seg.url)) {

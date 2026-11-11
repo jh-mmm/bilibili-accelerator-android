@@ -21,6 +21,10 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     val candidateKeystore = file("release.jks").takeIf { it.exists() && it.length() > 0L }
         ?: file("signing/release.jks").takeIf { it.exists() && it.length() > 0L }
     val envStorePass = System.getenv("KEYSTORE_PASSWORD")
@@ -97,6 +101,7 @@ android {
 }
 
 dependencies {
+    implementation(platform("org.jetbrains.kotlin:kotlin-bom:2.0.21"))
     compileOnly("io.github.libxposed:api:101.0.0")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("com.google.code.gson:gson:2.11.0")
@@ -115,4 +120,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("io.github.libxposed:api:101.0.0") {
+        exclude(group = "org.jetbrains.kotlin")
+    }
 }

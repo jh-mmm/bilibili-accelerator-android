@@ -110,7 +110,7 @@ class XposedServiceProvider : ContentProvider() {
                 return true
             }
 
-            Log.w(TAG, "verifyLibXposedBinder rejected: descriptor='$descriptor', frameworkName='$frameworkName'")
+            runCatching { Log.w(TAG, "verifyLibXposedBinder rejected: descriptor='$descriptor', frameworkName='$frameworkName'") }
             return false
         }
 
@@ -151,13 +151,13 @@ class XposedServiceProvider : ContentProvider() {
                 data.writeInterfaceToken(DESCRIPTOR)
                 val ok = binder.transact(TRANSACTION_GET_FRAMEWORK_NAME, data, reply, 0)
                 if (ok) {
-                    reply.readException()
+                    runCatching { reply.readException() }
                     reply.readString()
                 } else {
                     null
                 }
             } catch (t: Throwable) {
-                Log.w(TAG, "transact TRANSACTION_GET_FRAMEWORK_NAME failed: ${t.message}")
+                runCatching { Log.w(TAG, "transact TRANSACTION_GET_FRAMEWORK_NAME failed: ${t.message}") }
                 null
             } finally {
                 runCatching { reply.recycle() }
@@ -175,13 +175,13 @@ class XposedServiceProvider : ContentProvider() {
                 data.writeInterfaceToken(DESCRIPTOR)
                 val ok = binder.transact(TRANSACTION_GET_SCOPE, data, reply, 0)
                 if (ok) {
-                    reply.readException()
+                    runCatching { reply.readException() }
                     reply.createStringArrayList()
                 } else {
                     null
                 }
             } catch (t: Throwable) {
-                Log.w(TAG, "transact TRANSACTION_GET_SCOPE failed: ${t.message}")
+                runCatching { Log.w(TAG, "transact TRANSACTION_GET_SCOPE failed: ${t.message}") }
                 null
             } finally {
                 runCatching { reply.recycle() }
@@ -214,7 +214,7 @@ class XposedServiceProvider : ContentProvider() {
 
         private fun handleBinderDied(deadBinder: IBinder?) {
             synchronized(lock) {
-                if (deadBinder == null || serviceBinder == deadBinder) {
+                if (deadBinder == null || serviceBinder === deadBinder) {
                     rawIsBound = false
                     serviceBinder = null
                     deathRecipient = null
@@ -297,7 +297,7 @@ class XposedServiceProvider : ContentProvider() {
         synchronized(lock) {
             val current = serviceBinder
             if (current != null && current.isBinderAlive && current.pingBinder()) {
-                if (current == binder) {
+                if (current === binder) {
                     triggerScopeQueryAsync(binder, force = false)
                     return Bundle().apply { putBoolean("result", true) }
                 }

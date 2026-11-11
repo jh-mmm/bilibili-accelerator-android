@@ -20,7 +20,8 @@ data class BtrMediaSession(
     @Volatile var liveHostPool: BtrLiveHostPool? = null,
     val lastAccessed: AtomicLong = AtomicLong(System.currentTimeMillis()),
     @Volatile var totalLength: Long = -1L,
-    @Volatile var contentType: String? = null
+    @Volatile var contentType: String? = null,
+    val globalChunkIndex: AtomicLong = AtomicLong(0L)
 )
 
 object BtrSessionManager {
@@ -144,7 +145,9 @@ object BtrSessionManager {
         } else {
             validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
         }
-        current.backupUrls = isolatedBackups
+        if (isolatedBackups.isNotEmpty()) {
+            current.backupUrls = isolatedBackups
+        }
 
         // 若为直播会话，同时同步至直播节点池
         current.liveHostPool?.let { pool ->
@@ -168,7 +171,7 @@ object BtrSessionManager {
         if (samplePath.isNotBlank()) {
             for ((_, session) in sessions) {
                 if (extractComparablePath(session.primaryUrl) == samplePath) {
-                    session.backupUrls = backups.filter { it.isNotBlank() && it != session.primaryUrl }.distinct()
+                    updateBackups(session.sessionId, backups)
                     return
                 }
             }
@@ -235,13 +238,16 @@ object BtrSessionManager {
         }
 
         val maxBackups = if (config != null) config.btrCdnPoolSize.coerceIn(1, candidateList.size) else 3
+        val isCustom = config != null && config.customCdnPool.isNotEmpty()
 
         for (m in candidateList) {
             val cleanM = BiliAcceleratorCore.cleanHost(m).lowercase()
             if (cleanM == host || cleanM.endsWith(".akamaized.net")) continue
-            // 严格隔离：海外 ov 节点仅在海外主地址时合成，大陆节点仅在大陆主地址时合成，防止区域鉴权 403
-            val candidateIsOv = cleanM.contains("ov.bilivideo.com")
-            if (isOverseasStream != candidateIsOv) continue
+            // 严格隔离：非自定义 CDN 池时，海外 ov 节点仅在海外主地址时合成，大陆节点仅在大陆主地址时合成，防止区域鉴权 403
+            if (!isCustom) {
+                val candidateIsOverseas = cleanM.contains("ov.bilivideo.com") || cleanM.contains("cn-hk-eq") || cleanM.contains("bstar")
+                if (isOverseasStream != candidateIsOverseas) continue
+            }
 
             results.add(uri.replaceAuthority(cleanM))
             if (results.size >= maxBackups) break

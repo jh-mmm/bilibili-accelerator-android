@@ -989,7 +989,7 @@ private fun UposSpeedTestDialog(
 
     fun probeUposHostLatencyMs(host: String): Long {
         val t0 = System.currentTimeMillis()
-        val conn = (URL("https://$host/crossdomain.xml").openConnection() as HttpsURLConnection).apply {
+        val conn = (URL("https://$host/").openConnection() as HttpsURLConnection).apply {
             requestMethod = "HEAD"
             connectTimeout = 2500
             readTimeout = 2500
@@ -1001,7 +1001,8 @@ private fun UposSpeedTestDialog(
         try {
             conn.connect()
             val code = conn.responseCode
-            if (code !in 200..399) {
+            // UPOS 边缘节点通常未对根路径开放业务资源，返回 200~499 (如 403/404) 均证明 TCP+TLS 握手及网络连通正常
+            if (code !in 200..499) {
                 throw IllegalStateException("HTTP $code")
             }
             return (System.currentTimeMillis() - t0).coerceAtLeast(1L)
