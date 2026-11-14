@@ -256,8 +256,9 @@ object BtrLiveCore {
     }
 
     fun swapHost(originalUrl: String, newHost: String): String {
+        val normalized = unwrapProxyUrl(originalUrl).ifBlank { originalUrl }
         return try {
-            val uri = URI(originalUrl)
+            val uri = URI(normalized)
             URI(
                 uri.scheme,
                 uri.userInfo,
@@ -268,7 +269,33 @@ object BtrLiveCore {
                 uri.fragment
             ).toASCIIString()
         } catch (_: Throwable) {
-            originalUrl
+            normalized
+        }
+    }
+
+    /**
+     * 基于播放列表最后一个已知分片猜测下一未发布的分片 URL（对齐 BTR speculative prefetch: lastNum + 1）
+     */
+    fun guessNextSegmentUrl(lastSeg: LiveSegment): String? {
+        if (lastSeg.num <= 0L) return null
+        val nextNum = lastSeg.num + 1L
+        return try {
+            val uri = URI(lastSeg.url)
+            val path = uri.rawPath ?: return null
+            val regex = Regex("""(\d+)(\.m4s)$""", RegexOption.IGNORE_CASE)
+            val replacedPath = regex.replace(path) { "$nextNum${it.groupValues[2]}" }
+            if (replacedPath == path) return null
+            URI(
+                uri.scheme,
+                uri.userInfo,
+                uri.host,
+                uri.port,
+                replacedPath,
+                uri.rawQuery,
+                uri.rawFragment
+            ).toASCIIString()
+        } catch (_: Throwable) {
+            null
         }
     }
 

@@ -114,7 +114,7 @@ object PlayerHook {
                         return@intercept chain.proceed()
                     }
 
-                    val distinctFiltered = if (config.blockPcdn || config.proxyMcdn || config.forceUpos) {
+                    val distinctFiltered = if (config.blockPcdn || config.proxyMcdn || config.forceUpos || (config.rewriteAkamai && config.enableBtr)) {
                         filterAndFillBackupUrls(rawList, config) { res ->
                             RemoteClient.notifyRewrite(res)
                         }
@@ -222,6 +222,13 @@ object PlayerHook {
         var targetUrl = if (result.changed) result.finalUrl else originalUrl
         val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty().toMutableList()
 
+        // 对齐 BTR / realzza：BTR 模式下将 Akamai 重写至 UPOS 节点时，必须保留原签名 Akamai 地址作为 403 兜底备用源
+        if (!isLive && result.changed && (result.reason == "akamai-redirect" || BiliAcceleratorCore.isAkamaiHost(result.originalHost))) {
+            if (!pendingBackups.contains(originalUrl)) {
+                pendingBackups.add(originalUrl)
+            }
+        }
+
         if (!isLive && (result.isPcdn || result.isMcdn)) {
             val cleanOfficialBackup = pendingBackups.firstOrNull { backup ->
                 val bHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(backup)?.host).lowercase()
@@ -301,7 +308,7 @@ object PlayerHook {
                 newArgs[strIndex] = result.finalUrl
                 return newArgs
             }
-            if (result.isPcdn && config.blockPcdn && parsed != null) {
+            if (result.isPcdn && config.blockPcdn) {
                 val cleanLiveHost = builderInstance?.let { builderCleanLiveHost[it] } ?: latestCleanLiveHost
                 if (!cleanLiveHost.isNullOrBlank() && !BiliAcceleratorCore.isSlowLiveHost(cleanLiveHost, portHeuristic = config.portHeuristic)) {
                     val rewritten = parsed.replaceAuthority(cleanLiveHost)

@@ -546,6 +546,41 @@ object BiliAcceleratorCore {
             return noChange(original, "already-proxied", isMcdn = true)
         }
 
+        // 0. 解包 .smtcdns.net/.com 商业中继代理 URL（对齐 BTR unwrapProxyUrl，点播与直播通用）
+        val unwrappedProxy = io.github.jh_mmm.biliaccelerator.btr.BtrLiveCore.unwrapProxyUrl(original)
+        if (unwrappedProxy.isNotBlank() && unwrappedProxy != original) {
+            val unwrappedUri = parseUri(unwrappedProxy)
+            val unwrappedHost = unwrappedUri?.host?.lowercase() ?: ""
+            if (unwrappedUri != null && unwrappedHost.isNotBlank() && !isIpAddress(unwrappedHost) && !isKnownP2pHost(unwrappedHost)) {
+                val unwrappedSegKey = extractSegmentKey(unwrappedUri.path)
+                if (isLiveMediaUrl(unwrappedUri.path, unwrappedProxy)) {
+                    return RewriteResult(
+                        changed = true,
+                        originalUrl = original,
+                        finalUrl = unwrappedProxy,
+                        originalHost = hostname,
+                        targetHost = unwrappedHost,
+                        reason = "live-smtcdns-unwrap",
+                        isPcdn = true,
+                        isMcdn = false,
+                        segmentKey = unwrappedSegKey
+                    )
+                }
+                val innerRes = rewriteUrl(unwrappedProxy, config)
+                return RewriteResult(
+                    changed = true,
+                    originalUrl = original,
+                    finalUrl = if (innerRes.changed) innerRes.finalUrl else unwrappedProxy,
+                    originalHost = hostname,
+                    targetHost = if (innerRes.changed) innerRes.targetHost else unwrappedHost,
+                    reason = if (innerRes.changed) innerRes.reason else "smtcdns-unwrap",
+                    isPcdn = true,
+                    isMcdn = innerRes.isMcdn,
+                    segmentKey = unwrappedSegKey
+                )
+            }
+        }
+
         val isLive = isLiveMediaUrl(parsed.path, original)
         val port = parsed.port
         val isBiliFamily = isBiliFamilyHost(hostname)
@@ -557,9 +592,13 @@ object BiliAcceleratorCore {
         val isIp = isIpAddress(hostname)
         val hasNonDefaultPort = config.portHeuristic && port != -1 && port != 80 && port != 443
         val queryMcdn = parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
-        val isMcdn = isMcdnHost(hostname) || queryMcdn
+        val explicitMcdnHost = isMcdnHost(hostname)
+        val isMcdn = explicitMcdnHost || queryMcdn
+        // 当关闭 MCDN 代理且开启 PCDN 拦截时，非典型 *.mcdn.* 域名的伪装 os=mcdn 节点按 PCDN 节点拦截改写
+        val disguisedMcdnPcdn = queryMcdn && !explicitMcdnHost && !config.proxyMcdn
         val isPcdn = (isIp && (hasBiliMediaSignature || isKnownP2pHost(hostname) || isLive)) ||
                 isKnownP2pHost(hostname) ||
+                disguisedMcdnPcdn ||
                 (hasNonDefaultPort && (isBiliFamily || hasBiliMediaSignature || isLive))
 
         // 1. szbdyd / mountaintoys 调度器：直接恢复 xy_usource 参数所携带的真实原生 CDN 域名（点播与直播通用）
@@ -740,25 +779,27 @@ object BiliAcceleratorCore {
             if (res.changed) {
                 onRewrite?.invoke(res)
                 filtered.add(res.finalUrl)
+                // 对齐 BTR：在 BTR 开启且改写 Akamai 为 UPOS 时保留原签名 Akamai 地址作为 403 兜底
+                if (res.reason == "akamai-redirect") {
+                    filtered.add(url)
+                }
             } else if (!res.isPcdn || !config.blockPcdn) {
                 filtered.add(url)
             }
         }
 
-        val sampleUrl = rawList.firstOrNull()
-        if (filtered.distinct().size <= 1 && sampleUrl != null) {
+        val donorUrl = rawList.firstOrNull { !isRelayUrl(it) && !isAkamaiHost(it) && !hasDrmSignal(it) }
+        if (filtered.distinct().size <= 1 && donorUrl != null) {
             // 对齐 BTR Issue #47：中继/MCDN 地址、DRM 加密地址与 Akamai 地址严禁作为 Donor 生成普通 UPOS 镜像
-            if (!isRelayUrl(sampleUrl) && !isAkamaiHost(sampleUrl) && !hasDrmSignal(sampleUrl)) {
-                val pool = getEffectiveCdnPool(config)
-                val candidates = pool.filter { it != target }
-                for (candidate in candidates.take(3)) {
-                    val backupRes = rewriteUrl(
-                        sampleUrl,
-                        config.copy(targetHost = candidate, forceUpos = true)
-                    )
-                    if (backupRes.changed) {
-                        filtered.add(backupRes.finalUrl)
-                    }
+            val pool = getEffectiveCdnPool(config)
+            val candidates = pool.filter { it != target }
+            for (candidate in candidates.take(3)) {
+                val backupRes = rewriteUrl(
+                    donorUrl,
+                    config.copy(targetHost = candidate, forceUpos = true)
+                )
+                if (backupRes.changed) {
+                    filtered.add(backupRes.finalUrl)
                 }
             }
         }

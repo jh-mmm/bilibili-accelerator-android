@@ -2,11 +2,83 @@ package io.github.jh_mmm.biliaccelerator.btr
 
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
+import java.net.URLDecoder
 import java.util.Collections
 import java.util.UUID
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * 会话级拦截封禁名单（对齐 BTR createBanList）：
+ * 区分单条 URL 地址鉴权失败 (address: 403/404/410) 与节点级限流/宕机 (node: 412/429/5xx/超时)，
+ * 避免某一视频的签名地址被单节点拒收时全局拉黑健康的 CDN 节点，影响其他正常播放。
+ */
+class SessionBanList {
+    private val goodHosts = ConcurrentHashMap.newKeySet<String>()
+    private val goodUrls = ConcurrentHashMap.newKeySet<String>()
+    private val bannedUrls = ConcurrentHashMap<String, Long>()
+    private val bannedHosts = ConcurrentHashMap<String, Long>()
+
+    fun recordSuccess(url: String, host: String) {
+        if (url.isNotBlank()) {
+            goodUrls.add(url)
+            bannedUrls.remove(url)
+        }
+        if (host.isNotBlank()) {
+            goodHosts.add(host)
+            bannedHosts.remove(host)
+        }
+    }
+
+    /**
+     * 记录 HTTP 状态码故障。
+     * @return true 表示属于节点限流或服务端故障，可额外施加全局短时冷却；false 表示仅当前地址或单会话鉴权隔离。
+     */
+    fun recordHttpFailure(url: String, host: String, code: Int, now: Long = System.currentTimeMillis()): Boolean {
+        return when {
+            code == 403 || code == 404 || code == 410 -> {
+                if (url.isNotBlank()) {
+                    bannedUrls[url] = Long.MAX_VALUE
+                }
+                if (host.isNotBlank() && !goodHosts.contains(host)) {
+                    bannedHosts[host] = now + 30_000L
+                }
+                false
+            }
+            code == 412 || code == 429 -> {
+                if (host.isNotBlank()) {
+                    val ttl = if (code == 429) 45_000L else 30_000L
+                    bannedHosts[host] = now + ttl
+                }
+                true
+            }
+            else -> {
+                if (host.isNotBlank()) {
+                    bannedHosts[host] = now + 20_000L
+                }
+                true
+            }
+        }
+    }
+
+    fun recordTransportFailure(host: String, durationMs: Long = 15_000L, now: Long = System.currentTimeMillis()) {
+        if (host.isNotBlank()) {
+            bannedHosts[host] = now + durationMs
+        }
+    }
+
+    fun isBanned(url: String, host: String, now: Long = System.currentTimeMillis()): Boolean {
+        val urlUntil = bannedUrls[url]
+        if (urlUntil != null && urlUntil > now) return true
+        val hostUntil = bannedHosts[host]
+        if (hostUntil != null && hostUntil > now) return true
+        return false
+    }
+
+    fun isHostKnownGood(host: String): Boolean = goodHosts.contains(host)
+}
 
 data class BtrMediaSession(
     val sessionId: String,
@@ -21,7 +93,11 @@ data class BtrMediaSession(
     val lastAccessed: AtomicLong = AtomicLong(System.currentTimeMillis()),
     @Volatile var totalLength: Long = -1L,
     @Volatile var contentType: String? = null,
-    val globalChunkIndex: AtomicLong = AtomicLong(0L)
+    val globalChunkIndex: AtomicLong = AtomicLong(0L),
+    val banList: SessionBanList = SessionBanList(),
+    @Volatile var liveMapUrl: String? = null,
+    val liveLastNum: AtomicLong = AtomicLong(0L),
+    val liveSpeculativeMisses: AtomicInteger = AtomicInteger(0)
 )
 
 object BtrSessionManager {
@@ -57,10 +133,12 @@ object BtrSessionManager {
             "https://www.bilibili.com/"
         }
 
+        val cleanPrimaryLiveUrl = if (isLive) BtrLiveCore.unwrapProxyUrl(primaryUrl).ifBlank { primaryUrl } else primaryUrl
+
         val pool: BtrLiveHostPool? = if (isLive) {
             val livePool = BtrLiveHostPool()
-            val primaryHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(primaryUrl)?.host).lowercase()
-            if (primaryHost.isNotBlank() && !BtrLiveCore.isP2pUrl(primaryUrl)) {
+            val primaryHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cleanPrimaryLiveUrl)?.host).lowercase()
+            if (primaryHost.isNotBlank() && !BtrLiveCore.isP2pUrl(cleanPrimaryLiveUrl)) {
                 livePool.add(primaryHost, proven = true)
             }
             // 注入已知官方 fMP4 集群
@@ -71,8 +149,9 @@ object BtrSessionManager {
             }
             // 注入备用节点中包含的候选官方直播域名
             for (backup in validBackups) {
-                val bHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(backup)?.host).lowercase()
-                if (bHost.isNotBlank() && !BtrLiveCore.isP2pUrl(backup)) {
+                val unwrappedBackup = BtrLiveCore.unwrapProxyUrl(backup).ifBlank { backup }
+                val bHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(unwrappedBackup)?.host).lowercase()
+                if (bHost.isNotBlank() && !BtrLiveCore.isP2pUrl(unwrappedBackup)) {
                     livePool.add(bHost, proven = false)
                 }
             }
@@ -90,25 +169,34 @@ object BtrSessionManager {
             null
         }
 
-        // 若宿主未传入备用地址，自动合成兼容的官方同源 UPOS 镜像（优先支持用户自定义 CDN 白名单），确保多源 CDN 并发调度生效
+        // 若宿主未传入备用地址或仅传入了 Akamai 兜底原链，自动补充兼容的官方同源 UPOS 镜像（优先支持用户自定义 CDN 白名单）
         val finalBackups = if (isLive) {
             validBackups
-        } else if (validBackups.isEmpty()) {
-            synthesizeCompatibleBackups(primaryUrl, config, isEpisode = isEpisode)
         } else {
             // 隔离检查（对齐 BTR 规范）：
             // 若当前主地址是中继流，严禁混入普通 UPOS 镜像；
             // 若当前主地址是普通 UPOS 流，严禁混入中继地址（避免触发普通节点 403）
-            if (isPrimaryRelay) {
+            val isolated = if (isPrimaryRelay) {
                 validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
             } else {
                 validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
+            }
+            if (!isPrimaryRelay && isolated.none { !BiliAcceleratorCore.isAkamaiHost(it) }) {
+                val donor = listOf(primaryUrl).plus(isolated).firstOrNull {
+                    !BiliAcceleratorCore.isRelayUrl(it) &&
+                        !BiliAcceleratorCore.isAkamaiHost(it) &&
+                        !BiliAcceleratorCore.hasDrmSignal(it)
+                } ?: primaryUrl
+                val synthesized = synthesizeCompatibleBackups(donor, config, isEpisode = isEpisode)
+                (synthesized + isolated).distinct().filter { it != primaryUrl }
+            } else {
+                isolated
             }
         }
 
         val session = BtrMediaSession(
             sessionId = id,
-            primaryUrl = primaryUrl,
+            primaryUrl = cleanPrimaryLiveUrl,
             backupUrls = finalBackups,
             userAgent = userAgent,
             referer = referer,
@@ -152,8 +240,9 @@ object BtrSessionManager {
         // 若为直播会话，同时同步至直播节点池
         current.liveHostPool?.let { pool ->
             for (b in isolatedBackups) {
-                val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(b)?.host).lowercase()
-                if (host.isNotBlank() && !BtrLiveCore.isP2pUrl(b)) {
+                val unwrappedBackup = BtrLiveCore.unwrapProxyUrl(b).ifBlank { b }
+                val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(unwrappedBackup)?.host).lowercase()
+                if (host.isNotBlank() && !BtrLiveCore.isP2pUrl(unwrappedBackup)) {
                     pool.add(host, proven = false)
                 }
             }
@@ -167,20 +256,67 @@ object BtrSessionManager {
 
     fun updateBackupsByCandidateUrls(backups: List<String>) {
         if (backups.isEmpty()) return
-        val samplePath = extractComparablePath(backups.first())
-        if (samplePath.isNotBlank()) {
-            for ((_, session) in sessions) {
-                if (extractComparablePath(session.primaryUrl) == samplePath) {
-                    updateBackups(session.sessionId, backups)
-                    return
-                }
+        val incomingSigs = backups.map { extractNormalizedPathAndKey(it) }
+        val incomingPaths = incomingSigs.mapNotNull { it.first.takeIf(String::isNotBlank) }.toSet()
+        val incomingKeys = incomingSigs.mapNotNull { it.second.takeIf { key -> key.isNotBlank() && key.contains('.') } }.toSet()
+        val incomingIsAudio = backups.any { BiliAcceleratorCore.isAudioTrack(unwrapCandidateUrl(it)) }
+        val incomingIsLive = backups.any { BiliAcceleratorCore.isLiveMediaUrl("", unwrapCandidateUrl(it)) }
+
+        val orderedSessions = sessions.values.sortedByDescending { it.lastAccessed.get() }
+
+        // 1. 优先精确路径匹配（涵盖主备任一地址，规避代理外衣或单地址路径偏移）
+        if (incomingPaths.isNotEmpty()) {
+            val exactPathMatch = orderedSessions.firstOrNull { session ->
+                val sessionUrls = listOf(session.primaryUrl) + session.backupUrls
+                sessionUrls.any { extractNormalizedPathAndKey(it).first in incomingPaths }
+            }
+            if (exactPathMatch != null) {
+                updateBackups(exactPathMatch.sessionId, backups)
+                return
             }
         }
-        updateBackupsForLatest(backups)
+
+        // 2. 次级回退：同轨道类型 (isAudio/isLive 一致) + 文件名片段关键帧一致，严禁音视频串台
+        if (incomingKeys.isNotEmpty()) {
+            val keyMatch = orderedSessions.firstOrNull { session ->
+                session.isAudio == incomingIsAudio &&
+                    session.isLive == incomingIsLive &&
+                    extractNormalizedPathAndKey(session.primaryUrl).second in incomingKeys
+            }
+            if (keyMatch != null) {
+                updateBackups(keyMatch.sessionId, backups)
+                return
+            }
+        }
+
+        // 3. 兜底匹配：仅限同轨道类型（音视频、点直播严格隔离）的最近访问会话
+        val sameTrackLatest = orderedSessions.firstOrNull { session ->
+            session.isAudio == incomingIsAudio && session.isLive == incomingIsLive
+        }
+        if (sameTrackLatest != null) {
+            updateBackups(sameTrackLatest.sessionId, backups)
+        }
     }
 
-    private fun extractComparablePath(url: String): String {
-        return BiliAcceleratorCore.parseUri(url)?.path ?: ""
+    private fun unwrapCandidateUrl(rawUrl: String): String {
+        val step1 = BtrLiveCore.unwrapProxyUrl(rawUrl).ifBlank { rawUrl }
+        val parsed = BiliAcceleratorCore.parseUri(step1) ?: return step1
+        val host = parsed.host.lowercase()
+        val wrapped = if (host.startsWith("proxy-tf-all-") || parsed.path == "/") {
+            parsed.queryParam("url")
+        } else null
+        return if (!wrapped.isNullOrBlank()) {
+            runCatching { URLDecoder.decode(wrapped, "UTF-8") }.getOrDefault(wrapped)
+        } else {
+            step1
+        }
+    }
+
+    private fun extractNormalizedPathAndKey(rawUrl: String): Pair<String, String> {
+        val unwrapped = unwrapCandidateUrl(rawUrl)
+        val path = BiliAcceleratorCore.parseUri(unwrapped)?.path?.trim()?.trimEnd('/')?.lowercase().orEmpty()
+        val key = path.substringAfterLast('/')
+        return path to key
     }
 
     /**
@@ -214,30 +350,21 @@ object BtrSessionManager {
                 host.contains("ov.bilivideo.com") ||
                 isAkamai
 
-        // 对齐 BTR：当海外账号仅分发 akamaized.net 节点或播放港澳台/海外专属剧集时，提取签名合成海外专属 ov 镜像
+        // 对齐 BTR：当海外账号仅分发 akamaized.net 节点或播放港澳台/海外专属剧集时，提取签名合成海外专属镜像
         val isOverseasStream = host.contains("ov.bilivideo.com") ||
+                host.contains("cn-hk-eq") ||
                 isAkamai ||
                 (isEpisode && isRegionalPgcHost)
 
         val candidateList = if (config != null && config.customCdnPool.isNotEmpty()) {
             BiliAcceleratorCore.getEffectiveCdnPool(config)
         } else if (isOverseasStream) {
-            listOf(
-                "upos-sz-mirrorcosov.bilivideo.com",
-                "upos-sz-mirroraliov.bilivideo.com",
-                "upos-sz-mirrorhwov.bilivideo.com"
-            )
+            BiliAcceleratorCore.OVERSEAS_CANDIDATE_POOL
         } else {
-            listOf(
-                "upos-sz-mirrorcos.bilivideo.com",
-                "upos-sz-mirrorali.bilivideo.com",
-                "upos-sz-mirrorhw.bilivideo.com",
-                "upos-tf-all-tx.bilivideo.com",
-                "upos-tf-all-hw.bilivideo.com"
-            )
+            BiliAcceleratorCore.MAINLAND_CANDIDATE_POOL
         }
 
-        val maxBackups = if (config != null) config.btrCdnPoolSize.coerceIn(1, candidateList.size) else 3
+        val maxBackups = if (config != null) config.btrCdnPoolSize.coerceIn(1, candidateList.size) else minOf(5, candidateList.size)
         val isCustom = config != null && config.customCdnPool.isNotEmpty()
 
         for (m in candidateList) {

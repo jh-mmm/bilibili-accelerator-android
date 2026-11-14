@@ -10,6 +10,7 @@ import java.io.ByteArrayOutputStream
 import java.io.OutputStream
 import java.net.SocketException
 import java.util.Locale
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
@@ -27,10 +28,13 @@ object BtrChunkEngine {
     const val AUDIO_MAX_CONCURRENCY = 2
     const val PROBE_PREFIX_BYTES = 64 * 1024
 
-    private const val MAX_PREFETCH_CHUNKS = 8           // 移动端自适应内存滑动窗口上限 (限制在 4MB~8MB，严格防 OOM)
+    private const val MAX_PREFETCH_CHUNKS = 8           // 基础滑动窗口参考值
+    private const val MAX_BUFFER_BYTES = 16L * 1024 * 1024 // 单流内存缓存上限 16MB，防 OOM 同时避免队头阻塞
     private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36 BiliApp/7800300"
     private const val RESUME_MIN_BYTES = 32 * 1024      // 断点续传拼接最低字节门槛（对齐 BTR 原版）
+    private const val CANCEL_SPEED_MIN_BYTES = 48 * 1024L // 被取消竞争请求记录历史带宽门槛（对齐 BTR 48KB）
     private const val DEFAULT_HEDGE_DELAY_MS = 1200L    // 对冲请求延迟触发阈值（毫秒）
+    private val CONCURRENCY_LADDER = intArrayOf(2, 4, 6, 8, 12, 16)
 
     // 全局共享工作线程池：复用线程，允许核心线程超时释放，防止切集时线程暴增引发 OOM（core=16, max=48）
     private val globalWorkerPool = ThreadPoolExecutor(
@@ -137,12 +141,197 @@ object BtrChunkEngine {
         @Volatile var errorMessage: String? = null,
         @Volatile var receivedBytes: Int = 0,
         @Volatile var prefixData: ByteArray? = null
-    )
+    ) {
+        private var prefixOwnerId: Long = 0L
+        private var prefixOwnerFailed: Boolean = false
+        private var livePrefixOut: ByteArrayOutputStream? = null
+
+        fun tryClaimPrefixProducer(attemptId: Long): Boolean {
+            synchronized(this) {
+                if (isSuccess || prefixData != null) return false
+                if (prefixOwnerId == 0L || (prefixOwnerFailed && receivedBytes == 0)) {
+                    prefixOwnerId = attemptId
+                    prefixOwnerFailed = false
+                    if (livePrefixOut == null) {
+                        val initCap = minOf(512 * 1024, (endByte - startByte + 1).toInt().coerceAtLeast(1024))
+                        livePrefixOut = ByteArrayOutputStream(initCap)
+                    }
+                    return true
+                }
+                return prefixOwnerId == attemptId
+            }
+        }
+
+        fun appendLivePrefix(attemptId: Long, buf: ByteArray, len: Int, expectedTotal: Int) {
+            if (len <= 0) return
+            synchronized(this) {
+                if (prefixOwnerId != attemptId || isSuccess) return
+                val out = livePrefixOut ?: return
+                val maxAppend = minOf(len, (expectedTotal - 1) - out.size())
+                if (maxAppend > 0) {
+                    out.write(buf, 0, maxAppend)
+                    receivedBytes = out.size()
+                }
+            }
+        }
+
+        fun releasePrefixProducer(attemptId: Long, keepPartial: Boolean) {
+            synchronized(this) {
+                if (prefixOwnerId == attemptId) {
+                    prefixOwnerFailed = true
+                    if (!keepPartial || receivedBytes < RESUME_MIN_BYTES) {
+                        prefixOwnerId = 0L
+                        livePrefixOut?.reset()
+                        receivedBytes = 0
+                    }
+                }
+            }
+        }
+
+        fun takePrefixSnapshot(minResumeBytes: Int, expectedTotal: Int): ByteArray? {
+            synchronized(this) {
+                if (isSuccess) return null
+                val out = livePrefixOut
+                if (out != null && out.size() in minResumeBytes until expectedTotal) {
+                    return out.toByteArray()
+                }
+                val external = prefixData
+                if (external != null && receivedBytes in minResumeBytes until expectedTotal && external.size >= receivedBytes) {
+                    return if (external.size == receivedBytes) external else external.copyOf(receivedBytes)
+                }
+                return null
+            }
+        }
+
+        fun clearPrefixBuffersOnWin() {
+            synchronized(this) {
+                prefixData = null
+                livePrefixOut = null
+                prefixOwnerId = 0L
+                prefixOwnerFailed = false
+            }
+        }
+
+        fun resetPrefix() {
+            synchronized(this) {
+                prefixData = null
+                livePrefixOut = null
+                prefixOwnerId = 0L
+                prefixOwnerFailed = false
+                receivedBytes = 0
+            }
+        }
+
+        fun releaseBuffers() {
+            synchronized(this) {
+                data = null
+                prefixData = null
+                livePrefixOut = null
+                prefixOwnerId = 0L
+                receivedBytes = 0
+            }
+        }
+    }
+
+    /**
+     * 自适应动态并发控制器（对齐 BTR createAutoConcurrency 阶梯试探 + 412/429 退避）：
+     * - 维护 [2, 4, 6, 8, 12, 16] 并发阶梯
+     * - 周期性测算吞吐量决定升档或回退，遇上游限流 (412/429) 立即降档并静默休眠
+     */
+    internal class DynamicConcurrencyController(
+        initialConcurrency: Int,
+        private val autoScale: Boolean,
+        private val minConcurrency: Int = 2,
+        private val maxConcurrency: Int = 16,
+        initialNowMs: Long = System.currentTimeMillis()
+    ) {
+        private val lock = Any()
+        private var ladderIdx: Int
+        @Volatile
+        var currentConcurrency: Int
+            private set
+        @Volatile
+        var peakConcurrency: Int
+            private set
+
+        private var intervalStartMs: Long = initialNowMs
+        private var intervalBytes: Long = 0L
+        private var bestBps: Double = 0.0
+        private var lastTrialDirection: Int = 0
+        private var prevIndexBeforeTrial: Int = 0
+        private var pushbackCooldownUntilMs: Long = 0L
+
+        init {
+            val clampedInitial = initialConcurrency.coerceIn(minConcurrency, maxConcurrency)
+            val idx = CONCURRENCY_LADDER.indexOfFirst { it >= clampedInitial }
+                .let { if (it == -1) CONCURRENCY_LADDER.lastIndex else it }
+            ladderIdx = idx
+            currentConcurrency = CONCURRENCY_LADDER[idx].coerceIn(minConcurrency, maxConcurrency)
+            peakConcurrency = currentConcurrency
+        }
+
+        fun recordProgress(bytes: Long, nowMs: Long = System.currentTimeMillis()) {
+            if (!autoScale || bytes <= 0L) return
+            synchronized(lock) {
+                intervalBytes += bytes
+                val elapsed = nowMs - intervalStartMs
+                if (elapsed < 1000L || intervalBytes < 256 * 1024L) return
+
+                val currentBps = (intervalBytes * 1000.0) / elapsed.coerceAtLeast(1L)
+                intervalStartMs = nowMs
+                intervalBytes = 0L
+
+                if (nowMs < pushbackCooldownUntilMs) {
+                    if (bestBps <= 0.0) bestBps = currentBps
+                    return
+                }
+
+                if (lastTrialDirection > 0) {
+                    if (currentBps >= bestBps * 1.08) {
+                        bestBps = currentBps
+                        lastTrialDirection = 0
+                    } else {
+                        ladderIdx = prevIndexBeforeTrial
+                        currentConcurrency = CONCURRENCY_LADDER[ladderIdx].coerceIn(minConcurrency, maxConcurrency)
+                        lastTrialDirection = 0
+                        pushbackCooldownUntilMs = nowMs + 6_000L
+                    }
+                    return
+                }
+
+                if (currentBps > bestBps) {
+                    bestBps = currentBps
+                }
+
+                if (ladderIdx + 1 < CONCURRENCY_LADDER.size && CONCURRENCY_LADDER[ladderIdx + 1] <= maxConcurrency) {
+                    prevIndexBeforeTrial = ladderIdx
+                    ladderIdx++
+                    currentConcurrency = CONCURRENCY_LADDER[ladderIdx].coerceIn(minConcurrency, maxConcurrency)
+                    if (currentConcurrency > peakConcurrency) peakConcurrency = currentConcurrency
+                    lastTrialDirection = 1
+                }
+            }
+        }
+
+        fun onPushback(nowMs: Long = System.currentTimeMillis()): Int {
+            synchronized(lock) {
+                if (ladderIdx > 0) {
+                    ladderIdx--
+                }
+                currentConcurrency = CONCURRENCY_LADDER[ladderIdx].coerceIn(minConcurrency, maxConcurrency)
+                lastTrialDirection = 0
+                pushbackCooldownUntilMs = nowMs + 15_000L
+                intervalStartMs = nowMs
+                intervalBytes = 0L
+                return currentConcurrency
+            }
+        }
+    }
 
     private class StreamStatsTracker(
         val sessionId: String,
         val primaryHost: String,
-        val concurrency: Int,
+        @Volatile var concurrency: Int,
         val proxyPort: Int,
         val isEpisode: Boolean = false
     ) {
@@ -244,33 +433,47 @@ object BtrChunkEngine {
             parsedRange.end - parsedRange.start + 1
         } else -1L
 
-        val defaultProbeSize = if (isAudio) CHUNK_SIZE_AUDIO.toLong() else CHUNK_SIZE_VIDEO.toLong()
-        val initialProbeChunkSize = if (requestedBytes in 1 until defaultProbeSize) {
+        val baseProbeSize = PROBE_PREFIX_BYTES.toLong()
+        val initialProbeChunkSize = if (requestedBytes in 1 until baseProbeSize) {
             requestedBytes
         } else {
-            defaultProbeSize
+            baseProbeSize
         }
 
         val isEpisode = session.isEpisode
-        val baseConcurrency = when {
+        val minCon = 2
+        val maxCon = when {
             isAudio -> AUDIO_MAX_CONCURRENCY
-            isEpisode -> minOf(concurrency, 6).coerceIn(2, 8) // 剧集专属兼容模式：收敛并发，降低鉴权断连风险
-            else -> concurrency.coerceIn(2, 16)
+            isEpisode -> minOf(concurrency, 6).coerceIn(2, 8)
+            else -> 16
+        }
+        val initialCon = when {
+            isAudio -> AUDIO_MAX_CONCURRENCY
+            isEpisode -> maxCon
+            autoConcurrency -> maxOf(concurrency, 6).coerceIn(minCon, maxCon)
+            else -> concurrency.coerceIn(minCon, maxCon)
         }
         val useAuto = !isAudio && !isEpisode && autoConcurrency
-        val burstConcurrency = if (useAuto) maxOf(baseConcurrency, 8).coerceAtMost(16) else baseConcurrency
+        val concurrencyController = DynamicConcurrencyController(
+            initialConcurrency = initialCon,
+            autoScale = useAuto,
+            minConcurrency = minCon,
+            maxConcurrency = if (useAuto) maxCon else initialCon
+        )
 
         val candidateUrls = (listOf(session.primaryUrl) + session.backupUrls).distinct()
         val primaryHost = BiliAcceleratorCore.cleanHost(extractHostname(session.primaryUrl))
         val streamCallKey = "${session.sessionId}_${System.nanoTime()}"
 
-        val statsTracker = StreamStatsTracker(session.sessionId, primaryHost, burstConcurrency, proxyPort, isEpisode = isEpisode)
+        val statsTracker = StreamStatsTracker(session.sessionId, primaryHost, initialCon, proxyPort, isEpisode = isEpisode)
 
         try {
             val hasCachedMetadata = session.totalLength > 0
             val totalLength: Long
             val contentType: String
             var firstChunk: ByteArray? = null
+            var probeServingHost = primaryHost
+            var probeLatencyMs = 20L
             var currentOffset: Long
             val effectiveStart: Long
             val effectiveEnd: Long?
@@ -282,7 +485,7 @@ object BtrChunkEngine {
                     totalLength = session.totalLength
                     contentType = session.contentType ?: if (isAudio) "audio/mp4" else "video/mp4"
                 } else {
-                    val probeResult = probeMedia(candidateUrls, session, 0L, initialProbeChunkSize)
+                    val probeResult = probeMedia(candidateUrls, session, 0L, initialProbeChunkSize, concurrencyController)
                     if (probeResult == null) {
                         sendHttpError(clientOut, 502, "Bad Gateway - Upstream CDN Unreachable")
                         return false
@@ -292,6 +495,8 @@ object BtrChunkEngine {
                     }
                     totalLength = probeResult.totalLength
                     contentType = probeResult.contentType ?: if (isAudio) "audio/mp4" else "video/mp4"
+                    probeServingHost = probeResult.servingHost.ifBlank { primaryHost }
+                    probeLatencyMs = probeResult.probeLatencyMs
                     if (totalLength > 0) {
                         session.totalLength = totalLength
                         session.contentType = contentType
@@ -330,8 +535,8 @@ object BtrChunkEngine {
                         else -> -1L
                     }
                 } else {
-                    // 首片探测 (使用 OkHttp 连接池与 HTTP/2 探针)
-                    val probeResult = probeMedia(candidateUrls, session, effectiveStart, initialProbeChunkSize)
+                    // 首片 64KB 竞速探针 (多源并发对冲探针，极速返回 HTTP 响应头)
+                    val probeResult = probeMedia(candidateUrls, session, effectiveStart, initialProbeChunkSize, concurrencyController)
                     if (probeResult == null) {
                         sendHttpError(clientOut, 502, "Bad Gateway - Upstream CDN Unreachable")
                         return false
@@ -343,6 +548,8 @@ object BtrChunkEngine {
 
                     totalLength = probeResult.totalLength
                     contentType = probeResult.contentType ?: if (isAudio) "audio/mp4" else "video/mp4"
+                    probeServingHost = probeResult.servingHost.ifBlank { primaryHost }
+                    probeLatencyMs = probeResult.probeLatencyMs
                     if (totalLength > 0) {
                         session.totalLength = totalLength
                         session.contentType = contentType
@@ -406,7 +613,8 @@ object BtrChunkEngine {
 
                 clientOut.write(bytesToWrite)
                 clientOut.flush()
-                statsTracker.recordChunk(primaryHost, bytesToWrite.size.toLong(), 20L)
+                statsTracker.recordChunk(probeServingHost, bytesToWrite.size.toLong(), probeLatencyMs)
+                concurrencyController.recordProgress(bytesToWrite.size.toLong())
                 currentOffset = effectiveStart + bytesToWrite.size
             }
 
@@ -416,7 +624,7 @@ object BtrChunkEngine {
                 return true
             }
 
-            // 4. 并发切片任务切分与滑动窗口流水线
+            // 4. 并发切片任务切分与自适应并发流水线（工作线程数与缓存窗口解耦，防止单块重试引起全局阻塞）
             val chunkTasks = mutableListOf<ChunkTask>()
             var offset = currentOffset
             var taskIdx = 0L
@@ -429,51 +637,71 @@ object BtrChunkEngine {
             val totalTasks = chunkTasks.size
             val taskMap = ConcurrentHashMap<Long, ChunkTask>()
             val completionLock = Object()
+            val workerGate = Object()
+            val activeWorkers = AtomicInteger(0)
             val isClientAborted = AtomicBoolean(false)
             val deliveredIndex = AtomicLong(0L)
+
+            val maxWindowByBytes = (MAX_BUFFER_BYTES / activeChunkSize.coerceAtLeast(64 * 1024L))
+                .toInt()
+                .coerceIn(MAX_PREFETCH_CHUNKS, 32)
 
             // 调度分发协作者在 globalDispatcherPool 异步执行
             val dispatchFuture = globalDispatcherPool.submit {
                 var dispatchIdx = 0
                 while (dispatchIdx < totalTasks && !isClientAborted.get()) {
-                    // 动态线程调节与背压控制：冲刺期放宽，稳定期按 baseConcurrency 约束在途分片
-                    val maxPrefetch = if (useAuto) {
-                        if (deliveredIndex.get() >= 4) {
-                            minOf(MAX_PREFETCH_CHUNKS, baseConcurrency * 2)
-                        } else {
-                            maxOf(MAX_PREFETCH_CHUNKS, burstConcurrency)
-                        }
-                    } else {
-                        minOf(MAX_PREFETCH_CHUNKS, baseConcurrency * 2)
-                    }
+                    val activeLimit = concurrencyController.currentConcurrency
+                    val maxBufferWindow = minOf(maxWindowByBytes, maxOf(12, activeLimit * 2))
 
-                    while (dispatchIdx - deliveredIndex.get() >= maxPrefetch && !isClientAborted.get()) {
-                        try {
-                            Thread.sleep(15)
-                        } catch (_: InterruptedException) {
-                            break
+                    synchronized(workerGate) {
+                        while (!isClientAborted.get() &&
+                            (activeWorkers.get() >= concurrencyController.currentConcurrency ||
+                                (dispatchIdx - deliveredIndex.get()) >= maxBufferWindow)
+                        ) {
+                            try {
+                                workerGate.wait(25)
+                            } catch (_: InterruptedException) {
+                                break
+                            }
                         }
                     }
                     if (isClientAborted.get()) break
 
                     val task = chunkTasks[dispatchIdx]
                     taskMap[task.index] = task
+                    activeWorkers.incrementAndGet()
 
                     try {
                         globalWorkerPool.execute {
-                            if (!isClientAborted.get()) {
-                                try {
-                                    fetchChunkWithFailover(task, candidateUrls, session, statsTracker, isClientAborted, streamCallKey)
-                                } finally {
-                                    synchronized(completionLock) {
-                                        completionLock.notifyAll()
-                                    }
+                            try {
+                                if (!isClientAborted.get()) {
+                                    fetchChunkWithFailover(
+                                        task = task,
+                                        urls = candidateUrls,
+                                        session = session,
+                                        statsTracker = statsTracker,
+                                        concurrencyController = concurrencyController,
+                                        isClientAborted = isClientAborted,
+                                        streamCallKey = streamCallKey
+                                    )
+                                }
+                            } finally {
+                                activeWorkers.decrementAndGet()
+                                synchronized(workerGate) {
+                                    workerGate.notifyAll()
+                                }
+                                synchronized(completionLock) {
+                                    completionLock.notifyAll()
                                 }
                             }
                         }
                     } catch (t: Throwable) {
+                        activeWorkers.decrementAndGet()
                         task.isFailed = true
                         task.errorMessage = "Worker pool rejection: ${t.message}"
+                        synchronized(workerGate) {
+                            workerGate.notifyAll()
+                        }
                         synchronized(completionLock) {
                             completionLock.notifyAll()
                         }
@@ -510,13 +738,17 @@ object BtrChunkEngine {
                         if (data != null) {
                             clientOut.write(data)
                             clientOut.flush()
+                            concurrencyController.recordProgress(data.size.toLong())
+                            statsTracker.concurrency = concurrencyController.peakConcurrency
                         }
                         // 及时置空，释放堆内存并同步已交付游标
-                        currentTask.data = null
-                        currentTask.prefixData = null
+                        currentTask.releaseBuffers()
                         taskMap.remove(nextDeliverIndex)
                         nextDeliverIndex++
                         deliveredIndex.set(nextDeliverIndex)
+                        synchronized(workerGate) {
+                            workerGate.notifyAll()
+                        }
                     } catch (e: SocketException) {
                         // 客户端断开连接 (例如用户拖动进度条 Seek 或切集)
                         Log.i(TAG, "Client disconnected (Seek or stop). Session=${session.sessionId}")
@@ -527,6 +759,9 @@ object BtrChunkEngine {
                 return (nextDeliverIndex >= totalTasks && !isClientAborted.get())
             } finally {
                 isClientAborted.set(true)
+                synchronized(workerGate) {
+                    workerGate.notifyAll()
+                }
                 dispatchFuture.cancel(true)
                 cancelStreamCalls(streamCallKey)
                 taskMap.clear()
@@ -545,6 +780,45 @@ object BtrChunkEngine {
         val probeLatencyMs: Long,
         val isNonRange: Boolean = false
     )
+
+    private data class ContentRangeInfo(
+        val start: Long,
+        val end: Long?,
+        val total: Long?
+    )
+
+    private val attemptSeq = AtomicLong(0L)
+    private val CONTENT_RANGE_REGEX = Regex("""bytes\s+(\d+)-(\d+|\*)/(\d+|\*)""", RegexOption.IGNORE_CASE)
+
+    private fun parseContentRange(cr: String?): ContentRangeInfo? {
+        if (cr.isNullOrBlank()) return null
+        val full = CONTENT_RANGE_REGEX.find(cr)
+        if (full != null) {
+            val start = full.groupValues[1].toLongOrNull() ?: return null
+            val end = full.groupValues[2].toLongOrNull()
+            val total = full.groupValues[3].toLongOrNull()
+            return ContentRangeInfo(start, end, total)
+        }
+        val fallbackStart = parseRangeStart(cr) ?: return null
+        val fallbackTotal = cr.substringAfterLast('/', "").trim().toLongOrNull()
+        return ContentRangeInfo(fallbackStart, null, fallbackTotal)
+    }
+
+    internal fun isValidContentRange(
+        code: Int,
+        cr: String?,
+        expectedStart: Long,
+        session: BtrMediaSession
+    ): Boolean {
+        if (code != 206) return true
+        if (cr.isNullOrBlank()) return true
+        val info = parseContentRange(cr) ?: return false
+        if (info.start != expectedStart) return false
+        if (info.total != null && session.totalLength > 0 && info.total != session.totalLength) {
+            return false
+        }
+        return true
+    }
 
     private fun pipeNonRangeStream(
         url: String,
@@ -594,70 +868,174 @@ object BtrChunkEngine {
         }
     }
 
-    private fun probeMedia(
-        urls: List<String>,
+    private fun executeSingleProbe(
+        url: String,
         session: BtrMediaSession,
         startOffset: Long,
-        chunkSize: Long
+        chunkSize: Long,
+        okClient: okhttp3.OkHttpClient,
+        primaryHost: String,
+        concurrencyController: DynamicConcurrencyController?,
+        activeCalls: MutableSet<Call>?,
+        isDecided: AtomicBoolean?
     ): ProbeResult? {
-        val sortedUrls = sortUrlsByHealthAndSpeed(urls, 0L)
-        val ua = session.userAgent ?: DEFAULT_USER_AGENT
-        val primaryHost = extractHostname(session.primaryUrl)
-        val okClient = if (session.isAudio) BtrHttpClient.audioClient else BtrHttpClient.probeClient
-        for (url in sortedUrls) {
-            val host = extractHostname(url)
-            val startTime = System.currentTimeMillis()
-            val endOffset = startOffset + chunkSize - 1
-            val request = Request.Builder()
-                .url(url)
-                .header("Range", "bytes=$startOffset-$endOffset")
-                .header("Referer", session.referer)
-                .header("User-Agent", ua)
-                .header("Connection", "keep-alive")
-                .build()
+        if (isDecided?.get() == true) return null
+        val host = extractHostname(url)
+        val startTime = System.currentTimeMillis()
+        val endOffset = startOffset + chunkSize - 1
+        val request = Request.Builder()
+            .url(url)
+            .header("Range", "bytes=$startOffset-$endOffset")
+            .header("Referer", session.referer)
+            .header("User-Agent", session.userAgent ?: DEFAULT_USER_AGENT)
+            .header("Connection", "keep-alive")
+            .build()
 
-            try {
-                okClient.newCall(request).execute().use { response ->
-                    val code = response.code
-                    if (code == 200 || code == 206) {
-                        val cr = response.header("Content-Range")
-                        val isNonRange = (code == 200 && cr == null)
-                        val total = if (isNonRange) {
-                            response.body?.contentLength() ?: -1L
-                        } else {
-                            cr?.substringAfterLast("/")?.trim()?.toLongOrNull() ?: -1L
+        val call = okClient.newCall(request)
+        activeCalls?.add(call)
+        return try {
+            call.execute().use { response ->
+                if (isDecided?.get() == true) return null
+                val code = response.code
+                if (code == 200 || code == 206) {
+                    val cr = response.header("Content-Range")
+                    val isNonRange = (code == 200 && cr == null)
+                    if (!isNonRange && !isValidContentRange(code, cr, startOffset, session)) {
+                        session.banList.recordHttpFailure(url, host, 410)
+                        if (host == primaryHost) {
+                            reportFailover(host, "首片 Content-Range 异常 ($cr)", session.sessionId)
                         }
-                        val cl = response.body?.contentLength() ?: -1L
-                        val ct = response.header("Content-Type")?.takeIf { it.isNotBlank() }
+                        return null
+                    }
+                    val crInfo = parseContentRange(cr)
+                    val cl = response.body?.contentLength() ?: -1L
+                    val total = if (isNonRange) cl else (crInfo?.total ?: cr?.substringAfterLast("/")?.trim()?.toLongOrNull() ?: -1L)
+                    val ct = response.header("Content-Type")?.takeIf { it.isNotBlank() }
 
-                        val data = if (isNonRange) ByteArray(0) else (response.body?.bytes() ?: ByteArray(0))
-                        if (!isNonRange && data.isEmpty()) {
-                            penalizeHost(host, 30_000L)
-                            if (host == primaryHost) {
-                                reportFailover(host, "首片探测返回 0KB 空数据熔断", session.sessionId)
-                            }
-                            return@use
+                    val data = if (isNonRange) ByteArray(0) else (response.body?.bytes() ?: ByteArray(0))
+                    if (!isNonRange && data.isEmpty()) {
+                        session.banList.recordTransportFailure(host, 20_000L)
+                        penalizeHost(host, 20_000L)
+                        if (host == primaryHost) {
+                            reportFailover(host, "首片探测返回 0KB 空数据熔断", session.sessionId)
                         }
-                        val latency = maxOf(1L, System.currentTimeMillis() - startTime)
-                        if (data.isNotEmpty()) {
-                            recordHostSpeed(host, data.size.toLong(), latency)
-                        }
-                        return ProbeResult(total, cl, ct, data, host, latency, isNonRange = isNonRange)
-                    } else if (code == 403 || code == 412 || code == 429 || code >= 500) {
+                        return null
+                    }
+                    val latency = maxOf(1L, System.currentTimeMillis() - startTime)
+                    session.banList.recordSuccess(url, host)
+                    if (data.isNotEmpty()) {
+                        recordHostSpeed(host, data.size.toLong(), latency)
+                    }
+                    ProbeResult(total, cl, ct, data, host, latency, isNonRange = isNonRange)
+                } else {
+                    val isNodeFault = session.banList.recordHttpFailure(url, host, code)
+                    if (code == 412 || code == 429) {
+                        concurrencyController?.onPushback()
+                    }
+                    if (isNodeFault) {
                         val penaltyTime = if (code == 429) 45_000L else if (code == 412) 30_000L else 20_000L
                         penalizeHost(host, penaltyTime)
-                        // 仅当失败的节点是主节点时才上报熔断切换，避免在评估备用候选池时产生虚假熔断告警
-                        if (host == primaryHost) {
-                            reportFailover(host, "HTTP $code 错误", session.sessionId)
-                        }
                     }
+                    if (host == primaryHost) {
+                        reportFailover(host, "HTTP $code 错误", session.sessionId)
+                    }
+                    null
                 }
-            } catch (e: Exception) {
-                penalizeHost(host, 15_000L)
+            }
+        } catch (e: Exception) {
+            if (!call.isCanceled()) {
+                session.banList.recordTransportFailure(host, 15_000L)
+                penalizeHost(host, 12_000L)
                 if (host == primaryHost) {
                     reportFailover(host, e.message ?: "连接超时", session.sessionId)
                 }
             }
+            null
+        } finally {
+            activeCalls?.remove(call)
+        }
+    }
+
+    private fun probeMedia(
+        urls: List<String>,
+        session: BtrMediaSession,
+        startOffset: Long,
+        chunkSize: Long,
+        concurrencyController: DynamicConcurrencyController? = null
+    ): ProbeResult? {
+        val sortedUrls = sortUrlsByHealthAndSpeed(urls, 0L, session)
+        if (sortedUrls.isEmpty()) return null
+        val primaryHost = extractHostname(session.primaryUrl)
+        val okClient = if (session.isAudio) BtrHttpClient.audioClient else BtrHttpClient.probeClient
+
+        val raceCandidates = sortedUrls.take(3)
+        val fallbackCandidates = sortedUrls.drop(3)
+
+        if (raceCandidates.size == 1) {
+            executeSingleProbe(
+                raceCandidates[0], session, startOffset, chunkSize, okClient, primaryHost,
+                concurrencyController, activeCalls = null, isDecided = null
+            )?.let { return it }
+        } else {
+            val isDecided = AtomicBoolean(false)
+            val resultFuture = CompletableFuture<ProbeResult?>()
+            val activeCalls = ConcurrentHashMap.newKeySet<Call>()
+            val failedCount = AtomicInteger(0)
+            val staggerLock = Object()
+            val delaysMs = longArrayOf(0L, 120L, 300L)
+
+            for (i in raceCandidates.indices) {
+                val url = raceCandidates[i]
+                val delayMs = delaysMs.getOrElse(i) { 300L }
+                hedgeWorkerPool.execute {
+                    if (delayMs > 0L) {
+                        val deadline = System.currentTimeMillis() + delayMs
+                        synchronized(staggerLock) {
+                            while (!isDecided.get() && failedCount.get() < i) {
+                                val rem = deadline - System.currentTimeMillis()
+                                if (rem <= 0L) break
+                                try {
+                                    staggerLock.wait(rem)
+                                } catch (_: InterruptedException) {
+                                    break
+                                }
+                            }
+                        }
+                    }
+                    if (isDecided.get()) return@execute
+
+                    val probeRes = executeSingleProbe(
+                        url, session, startOffset, chunkSize, okClient, primaryHost,
+                        concurrencyController, activeCalls, isDecided
+                    )
+                    if (probeRes != null && isDecided.compareAndSet(false, true)) {
+                        resultFuture.complete(probeRes)
+                        synchronized(staggerLock) { staggerLock.notifyAll() }
+                        activeCalls.forEach { call -> runCatching { call.cancel() } }
+                    } else if (!isDecided.get()) {
+                        val failures = failedCount.incrementAndGet()
+                        synchronized(staggerLock) { staggerLock.notifyAll() }
+                        if (failures >= raceCandidates.size && isDecided.compareAndSet(false, true)) {
+                            resultFuture.complete(null)
+                        }
+                    }
+                }
+            }
+
+            try {
+                val winner = resultFuture.get(15, TimeUnit.SECONDS)
+                if (winner != null) return winner
+            } catch (_: Exception) {
+                isDecided.set(true)
+                activeCalls.forEach { call -> runCatching { call.cancel() } }
+            }
+        }
+
+        for (url in fallbackCandidates) {
+            executeSingleProbe(
+                url, session, startOffset, chunkSize, okClient, primaryHost,
+                concurrencyController, activeCalls = null, isDecided = null
+            )?.let { return it }
         }
         return null
     }
@@ -667,13 +1045,14 @@ object BtrChunkEngine {
         urls: List<String>,
         session: BtrMediaSession,
         statsTracker: StreamStatsTracker,
+        concurrencyController: DynamicConcurrencyController?,
         isClientAborted: AtomicBoolean,
         streamCallKey: String
     ) {
         if (isClientAborted.get()) return
 
         val rotationIndex = session.globalChunkIndex.getAndIncrement()
-        val tryUrls = sortUrlsByHealthAndSpeed(urls, rotationIndex)
+        val tryUrls = sortUrlsByHealthAndSpeed(urls, rotationIndex, session)
         if (tryUrls.isEmpty()) {
             task.isFailed = true
             task.errorMessage = "No available CDN urls"
@@ -685,20 +1064,30 @@ object BtrChunkEngine {
         val hedgeDelayMs = if (task.index <= 1L) 800L else DEFAULT_HEDGE_DELAY_MS
 
         val hasWinner = AtomicBoolean(false)
+        val primaryFinished = AtomicBoolean(false)
+        val hedgeLock = Object()
         val primaryCallRef = java.util.concurrent.atomic.AtomicReference<Call?>(null)
         val hedgeCallRef = java.util.concurrent.atomic.AtomicReference<Call?>(null)
 
-        // 启动对冲并发监测任务（若单路慢/假死，超过 hedgeDelayMs 后第二路并发介入）
+        // 启动对冲并发监测任务（主请求慢/假死超阈值，或主请求提前失败时立即唤醒第二路接力）
         val hedgeFuture = if (hedgeUrl != null && !isClientAborted.get()) {
             hedgeWorkerPool.submit {
                 try {
-                    Thread.sleep(hedgeDelayMs)
+                    val deadline = System.currentTimeMillis() + hedgeDelayMs
+                    synchronized(hedgeLock) {
+                        while (!hasWinner.get() && !primaryFinished.get() && !isClientAborted.get()) {
+                            val rem = deadline - System.currentTimeMillis()
+                            if (rem <= 0L) break
+                            hedgeLock.wait(rem)
+                        }
+                    }
                     if (!hasWinner.get() && !isClientAborted.get() && !task.isSuccess) {
                         tryAttemptFetch(
                             task = task,
                             url = hedgeUrl,
                             session = session,
                             statsTracker = statsTracker,
+                            concurrencyController = concurrencyController,
                             hasWinner = hasWinner,
                             isHedge = true,
                             callHolder = hedgeCallRef,
@@ -711,32 +1100,45 @@ object BtrChunkEngine {
         } else null
 
         // 主请求在当前线程执行
-        tryAttemptFetch(
-            task = task,
-            url = primaryUrl,
-            session = session,
-            statsTracker = statsTracker,
-            hasWinner = hasWinner,
-            isHedge = false,
-            callHolder = primaryCallRef,
-            counterpartCallHolder = hedgeCallRef,
-            streamCallKey = streamCallKey
-        )
+        try {
+            tryAttemptFetch(
+                task = task,
+                url = primaryUrl,
+                session = session,
+                statsTracker = statsTracker,
+                concurrencyController = concurrencyController,
+                hasWinner = hasWinner,
+                isHedge = false,
+                callHolder = primaryCallRef,
+                counterpartCallHolder = hedgeCallRef,
+                streamCallKey = streamCallKey
+            )
+        } finally {
+            primaryFinished.set(true)
+            synchronized(hedgeLock) { hedgeLock.notifyAll() }
+        }
 
-        hedgeFuture?.cancel(true)
-        if (!task.isSuccess) {
-            hedgeCallRef.get()?.let { slowHedge ->
-                runCatching { slowHedge.cancel() }
+        if (hedgeFuture != null) {
+            if (task.isSuccess || isClientAborted.get()) {
+                hedgeFuture.cancel(true)
+                hedgeCallRef.get()?.let { slowHedge -> runCatching { slowHedge.cancel() } }
+            } else {
+                // 若主路失败、对冲已唤醒接力，短暂等待其完成而非立即误杀
+                runCatching { hedgeFuture.get(15, TimeUnit.SECONDS) }
+                if (!task.isSuccess) {
+                    hedgeCallRef.get()?.let { slowHedge -> runCatching { slowHedge.cancel() } }
+                }
             }
         }
 
-        // 若前两路对冲/主请求未成功，按序尝试剩余备选节点（带断点续传）
+        // 若前两路对冲/主请求未成功，按序尝试剩余备选节点（带会话级地址隔离 + 断点续传）
         if (!task.isSuccess && !isClientAborted.get()) {
             val remainingUrls = tryUrls.drop(2)
+            val now = System.currentTimeMillis()
             for (url in remainingUrls) {
                 if (isClientAborted.get() || task.isSuccess) break
                 val host = extractHostname(url)
-                if (isPenalized(host)) continue
+                if (session.banList.isBanned(url, host, now) || isPenalized(host)) continue
 
                 val singleCallRef = java.util.concurrent.atomic.AtomicReference<Call?>(null)
                 tryAttemptFetch(
@@ -744,6 +1146,7 @@ object BtrChunkEngine {
                     url = url,
                     session = session,
                     statsTracker = statsTracker,
+                    concurrencyController = concurrencyController,
                     hasWinner = hasWinner,
                     isHedge = false,
                     callHolder = singleCallRef,
@@ -756,7 +1159,11 @@ object BtrChunkEngine {
 
         // 最终直连兜底尝试
         if (!task.isSuccess && !isClientAborted.get() && urls.isNotEmpty()) {
-            tryDirectFetch(task, urls.first(), session, statsTracker)
+            val fallbackCandidate = tryUrls.firstOrNull { u ->
+                val h = extractHostname(u)
+                !session.banList.isBanned(u, h)
+            } ?: urls.first()
+            tryDirectFetch(task, fallbackCandidate, session, statsTracker, concurrencyController)
         }
 
         if (!task.isSuccess && !isClientAborted.get()) {
@@ -770,6 +1177,7 @@ object BtrChunkEngine {
         url: String,
         session: BtrMediaSession,
         statsTracker: StreamStatsTracker,
+        concurrencyController: DynamicConcurrencyController?,
         hasWinner: AtomicBoolean,
         isHedge: Boolean,
         callHolder: java.util.concurrent.atomic.AtomicReference<Call?>,
@@ -777,18 +1185,15 @@ object BtrChunkEngine {
         streamCallKey: String
     ) {
         val host = extractHostname(url)
+        val attemptId = attemptSeq.incrementAndGet()
         val startTime = System.currentTimeMillis()
         val ua = session.userAgent ?: DEFAULT_USER_AGENT
         val expectedTotal = (task.endByte - task.startByte + 1).toInt()
 
-        // P1: 断点续传优化（对齐 BTR 原版）
-        // 若前序尝试已成功接收部分数据，且达到断点续传门槛，本次只拉取缺失的剩余字节
-        val existingPrefix = task.prefixData
-        val resumeOffset = if (existingPrefix != null && task.receivedBytes in RESUME_MIN_BYTES until expectedTotal) {
-            task.receivedBytes
-        } else {
-            0
-        }
+        // P1: 在途实时前缀共享 + 断点续传（对齐 BTR readBody 实时累加）
+        // 当主路正在下载（或已部分截断）且已积攒 >= 32KB 有效前缀时，对冲/重试直接从 start + resumeOffset 拉取剩余部分
+        val existingPrefix = task.takePrefixSnapshot(RESUME_MIN_BYTES, expectedTotal)
+        val resumeOffset = existingPrefix?.size ?: 0
 
         val requestStart = task.startByte + resumeOffset
         val request = Request.Builder()
@@ -804,6 +1209,10 @@ object BtrChunkEngine {
         callHolder.set(call)
         registerStreamCall(streamCallKey, session.sessionId, call)
 
+        var localBytesRead = 0L
+        var completedNormally = false
+        val isPrefixProducer = (resumeOffset == 0) && task.tryClaimPrefixProducer(attemptId)
+
         try {
             call.execute().use { response ->
                 val code = response.code
@@ -813,16 +1222,24 @@ object BtrChunkEngine {
 
                 // HTTP 200 非 Range 响应防 OOM 保护
                 if (code == 200 && cr == null && (cl > needBytes + 32 * 1024 || cl <= 0)) {
-                    penalizeHost(host, 30_000L)
+                    session.banList.recordTransportFailure(host, 20_000L)
+                    penalizeHost(host, 20_000L)
                     reportFailover(host, "HTTP 200 非 Range 响应防御 (防 OOM)", session.sessionId)
                     return
                 }
 
                 if (code == 200 || code == 206) {
+                    // 严格校验所有 206 响应的 Content-Range 起止字节及文件总长一致性
+                    if (code == 206 && !isValidContentRange(code, cr, requestStart, session)) {
+                        session.banList.recordHttpFailure(url, host, 410)
+                        reportFailover(host, "分片 Content-Range 异常 ($cr vs reqStart=$requestStart)", session.sessionId)
+                        return
+                    }
+
                     val body = response.body ?: return
                     val stream = body.byteStream()
                     val buffer = ByteArray(16 * 1024)
-                    val out = ByteArrayOutputStream(needBytes)
+                    val out = ByteArrayOutputStream(needBytes.coerceAtLeast(1024))
                     var read: Int
 
                     while (stream.read(buffer).also { read = it } != -1) {
@@ -830,18 +1247,23 @@ object BtrChunkEngine {
                             return // 另一路对冲已胜出交付，立即退出
                         }
                         out.write(buffer, 0, read)
+                        localBytesRead += read
+                        if (isPrefixProducer) {
+                            task.appendLivePrefix(attemptId, buffer, read, expectedTotal)
+                        }
                     }
 
                     val pieceBytes = out.toByteArray()
                     if (pieceBytes.isEmpty()) {
-                        penalizeHost(host, 30_000L)
+                        session.banList.recordTransportFailure(host, 20_000L)
+                        penalizeHost(host, 20_000L)
                         reportFailover(host, "分片拉取返回 0KB 空响应熔断", session.sessionId)
                         return
                     }
 
-                    if (needBytes > 0 && pieceBytes.size < needBytes) {
-                        // 发生截断，保存已接收数据供下次断点拼接（仅当另一路未胜出且本路接收更多有效数据时）
-                        if (resumeOffset == 0 && pieceBytes.size >= RESUME_MIN_BYTES && !hasWinner.get()) {
+                    val allowTruncatedFullIgnoreRange = (resumeOffset > 0 && code == 200 && pieceBytes.size == expectedTotal)
+                    if (needBytes > 0 && pieceBytes.size < needBytes && !allowTruncatedFullIgnoreRange) {
+                        if (resumeOffset == 0 && pieceBytes.size >= RESUME_MIN_BYTES && !hasWinner.get() && !isPrefixProducer) {
                             synchronized(task) {
                                 if (!hasWinner.get() && pieceBytes.size > task.receivedBytes) {
                                     task.prefixData = pieceBytes
@@ -849,15 +1271,16 @@ object BtrChunkEngine {
                                 }
                             }
                         }
-                        penalizeHost(host, 20_000L)
+                        session.banList.recordTransportFailure(host, 15_000L)
+                        penalizeHost(host, 15_000L)
                         reportFailover(host, "分片数据截断 (${pieceBytes.size}/$needBytes 字节)", session.sessionId)
                         return
                     }
 
                     // 拼接前序断点数据（如果有）
-                    // 严格校验：只有当 HTTP 状态码为 206 且 Content-Range 明确从 requestStart 开始时才允许拼接断点数据
                     val rangeStart = parseRangeStart(cr)
-                    val canResume = resumeOffset > 0 && existingPrefix != null && code == 206 && (rangeStart == null || rangeStart == requestStart)
+                    val canResume = resumeOffset > 0 && existingPrefix != null && code == 206 &&
+                        (rangeStart == null || rangeStart == requestStart) && pieceBytes.size == needBytes
 
                     val finalData = if (canResume) {
                         val combined = ByteArray(expectedTotal)
@@ -868,24 +1291,26 @@ object BtrChunkEngine {
                         // 服务器忽略了 Range 头部，返回了完整分片数据
                         pieceBytes
                     } else if (resumeOffset > 0) {
-                        // 服务器返回了不可拼接的错位数据，重置断点缓存避免数据损坏
-                        synchronized(task) {
-                            task.prefixData = null
-                            task.receivedBytes = 0
-                        }
-                        penalizeHost(host, 20_000L)
-                        reportFailover(host, "断点续传范围失配 (rangeStart=$rangeStart, reqStart=$requestStart)", session.sessionId)
+                        task.resetPrefix()
+                        session.banList.recordHttpFailure(url, host, 410)
+                        reportFailover(host, "断点续传范围失配 (rangeStart=$rangeStart, reqStart=$requestStart, len=${pieceBytes.size}/$needBytes)", session.sessionId)
                         return
+                    } else if (expectedTotal > 0 && pieceBytes.size > expectedTotal) {
+                        pieceBytes.copyOf(expectedTotal)
                     } else {
                         pieceBytes
                     }
 
+                    completedNormally = true
                     if (hasWinner.compareAndSet(false, true)) {
                         task.data = finalData
                         task.isSuccess = true
+                        task.clearPrefixBuffersOnWin()
+                        session.banList.recordSuccess(url, host)
                         val latency = maxOf(1L, System.currentTimeMillis() - startTime)
                         recordHostSpeed(host, finalData.size.toLong(), latency)
                         statsTracker.recordChunk(host, finalData.size.toLong(), latency)
+                        concurrencyController?.recordProgress(finalData.size.toLong())
 
                         // 赢家诞生，秒级中断另一路竞争 Call 释放连接池与网络带宽
                         counterpartCallHolder?.get()?.let { slowCall ->
@@ -893,18 +1318,34 @@ object BtrChunkEngine {
                         }
                     }
                     return
-                } else if (code == 403 || code == 412 || code == 429 || code >= 500) {
-                    val penaltyTime = if (code == 429) 45_000L else if (code == 412) 30_000L else 20_000L
-                    penalizeHost(host, penaltyTime)
-                    reportFailover(host, "HTTP $code 熔断", session.sessionId)
+                } else if (code >= 400) {
+                    val isNodeFault = session.banList.recordHttpFailure(url, host, code)
+                    if (code == 412 || code == 429) {
+                        concurrencyController?.onPushback()
+                    }
+                    if (isNodeFault) {
+                        val penaltyTime = if (code == 429) 45_000L else if (code == 412) 30_000L else 20_000L
+                        penalizeHost(host, penaltyTime)
+                    }
+                    if (!isHedge || session.banList.isHostKnownGood(host)) {
+                        reportFailover(host, "HTTP $code 熔断", session.sessionId)
+                    }
                 }
             }
         } catch (e: Exception) {
             if (!call.isCanceled()) {
-                penalizeHost(host, 15_000L)
+                session.banList.recordTransportFailure(host, 15_000L)
+                penalizeHost(host, 12_000L)
                 reportFailover(host, "分片拉取异常: ${e.message}", session.sessionId)
             }
         } finally {
+            if (!completedNormally && localBytesRead >= CANCEL_SPEED_MIN_BYTES) {
+                val partialElapsed = maxOf(1L, System.currentTimeMillis() - startTime)
+                recordHostSpeed(host, localBytesRead, partialElapsed)
+            }
+            if (isPrefixProducer && !task.isSuccess) {
+                task.releasePrefixProducer(attemptId, keepPartial = !hasWinner.get())
+            }
             unregisterStreamCall(streamCallKey, call)
         }
     }
@@ -915,14 +1356,23 @@ object BtrChunkEngine {
         return match?.groupValues?.get(1)?.toLongOrNull()
     }
 
-    private fun sortUrlsByHealthAndSpeed(urls: List<String>, taskIndex: Long): List<String> {
+    private fun sortUrlsByHealthAndSpeed(
+        urls: List<String>,
+        taskIndex: Long,
+        session: BtrMediaSession? = null
+    ): List<String> {
         val now = System.currentTimeMillis()
         val sortedUrls = urls.sortedBy { url ->
             val host = extractHostname(url)
+            val isUrlBanned = session?.banList?.isBanned(url, host, now) == true
             val penaltyUntil = cdnPenalties[host] ?: 0L
-            if (penaltyUntil > now) penaltyUntil - now else 0L
+            val globalPenalty = if (penaltyUntil > now) penaltyUntil - now else 0L
+            (if (isUrlBanned) 60_000L else 0L) + globalPenalty
         }
-        val healthyUrls = sortedUrls.filterNot { isPenalized(extractHostname(it)) }
+        val healthyUrls = sortedUrls.filter { url ->
+            val host = extractHostname(url)
+            !isPenalized(host) && session?.banList?.isBanned(url, host, now) != true
+        }
 
         val pool = if (healthyUrls.isNotEmpty()) {
             val ranked = healthyUrls.sortedByDescending { getHostSpeed(extractHostname(it)) }
@@ -947,7 +1397,8 @@ object BtrChunkEngine {
         task: ChunkTask,
         url: String,
         session: BtrMediaSession,
-        statsTracker: StreamStatsTracker
+        statsTracker: StreamStatsTracker,
+        concurrencyController: DynamicConcurrencyController? = null
     ) {
         val host = extractHostname(url)
         val startTime = System.currentTimeMillis()
@@ -971,14 +1422,24 @@ object BtrChunkEngine {
                 if (code == 200 && cr == null && (cl > expectedBytes + 32 * 1024 || cl <= 0)) {
                     return@use
                 }
+                if (code == 206 && !isValidContentRange(code, cr, task.startByte, session)) {
+                    session.banList.recordHttpFailure(url, host, 410)
+                    return@use
+                }
 
                 if (code in 200..299) {
-                    val bytes = response.body?.bytes() ?: ByteArray(0)
-                    if (bytes.isNotEmpty() && (expectedBytes <= 0 || bytes.size >= expectedBytes)) {
+                    val rawBytes = response.body?.bytes() ?: ByteArray(0)
+                    if (rawBytes.isNotEmpty() && (expectedBytes <= 0 || rawBytes.size >= expectedBytes)) {
+                        val bytes = if (expectedBytes > 0 && rawBytes.size > expectedBytes) rawBytes.copyOf(expectedBytes) else rawBytes
                         task.data = bytes
                         task.isSuccess = true
-                        statsTracker.recordChunk(host, bytes.size.toLong(), System.currentTimeMillis() - startTime)
+                        session.banList.recordSuccess(url, host)
+                        val latency = maxOf(1L, System.currentTimeMillis() - startTime)
+                        statsTracker.recordChunk(host, bytes.size.toLong(), latency)
+                        concurrencyController?.recordProgress(bytes.size.toLong())
                     }
+                } else if (code == 412 || code == 429) {
+                    concurrencyController?.onPushback()
                 }
             }
         } catch (_: Throwable) {

@@ -442,4 +442,57 @@ class BiliAcceleratorCoreTest {
         assertTrue(customEffective.contains("upos-tf-all-hw.bilivideo.com"))
         assertFalse(customEffective.contains("upos-hz-mirrorakam.akamaized.net"))
     }
+
+    @Test
+    fun testDisguisedOsMcdnBlockedWhenProxyMcdnDisabled() {
+        val disguisedUrl = "https://edge-p2p-cache.example.com/upgcxcode/54/12/34567.m4s?os=mcdn"
+        val explicitMcdnUrl = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/34567.m4s?os=mcdn"
+
+        // 关闭 proxyMcdn 但开启 blockPcdn 时，非 *.mcdn.* 域名的伪装 os=mcdn 节点必须被识别为 PCDN 并拦截改写
+        val cfg = defaultConfig.copy(proxyMcdn = false, blockPcdn = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
+        val resDisguised = BiliAcceleratorCore.rewriteUrl(disguisedUrl, cfg)
+        assertTrue("Disguised os=mcdn URL should be rewritten when blockPcdn=true", resDisguised.changed)
+        assertTrue("Disguised os=mcdn should be flagged as PCDN", resDisguised.isPcdn)
+        assertEquals("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s?os=mcdn", resDisguised.finalUrl)
+
+        // 原生 *.mcdn.bilivideo.cn 仍严格受 proxyMcdn 控制（放行）
+        val resExplicit = BiliAcceleratorCore.rewriteUrl(explicitMcdnUrl, cfg)
+        assertFalse("Explicit *.mcdn.* URL should remain governed by proxyMcdn=false", resExplicit.changed)
+
+        // 当同时关闭 blockPcdn 时，伪装 os=mcdn 节点允许透传
+        val resPass = BiliAcceleratorCore.rewriteUrl(disguisedUrl, defaultConfig.copy(proxyMcdn = false, blockPcdn = false))
+        assertFalse("Disguised os=mcdn should pass when blockPcdn=false", resPass.changed)
+    }
+
+    @Test
+    fun testSmtcdnsProxyUnwrapInRewriteUrl() {
+        val wrappedLive = "https://cdn-edge.smtcdns.net/d1--ov-gotcha05.bilivideo.com/live-bvc/123456/live_123.m3u8?token=xyz"
+        val liveRes = BiliAcceleratorCore.rewriteUrl(wrappedLive, defaultConfig)
+        assertTrue("Wrapped live .smtcdns.net URL must be unwrapped", liveRes.changed)
+        assertEquals("https://d1--ov-gotcha05.bilivideo.com/live-bvc/123456/live_123.m3u8?token=xyz", liveRes.finalUrl)
+        assertEquals("live-smtcdns-unwrap", liveRes.reason)
+        assertTrue(liveRes.isPcdn)
+
+        val wrappedVod = "https://cdn-edge.smtcdns.net/upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s?deadline=1"
+        val vodRes = BiliAcceleratorCore.rewriteUrl(wrappedVod, defaultConfig)
+        assertTrue("Wrapped VOD .smtcdns.net URL must be unwrapped", vodRes.changed)
+        assertEquals("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s?deadline=1", vodRes.finalUrl)
+        assertEquals("smtcdns-unwrap", vodRes.reason)
+    }
+
+    @Test
+    fun testFilterAndFillBackupUrlsPreservesAkamaiAndSelectsNonAkamaiDonor() {
+        val akamaiUrl = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/34567.m4s?token=sig"
+        val cleanUposUrl = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s?deadline=1"
+        val btrAkamaiCfg = defaultConfig.copy(enableBtr = true, rewriteAkamai = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
+
+        // 1. 纯 Akamai 地址开启 rewriteAkamai 时：产出重写 UPOS 并保留原签名 Akamai 作为 403 兜底
+        val akamaiOnly = BiliAcceleratorCore.filterAndFillBackupUrls(listOf(akamaiUrl), btrAkamaiCfg)
+        assertTrue("Rewritten UPOS mirror must exist", akamaiOnly.any { it.contains("upos-sz-mirrorcos.bilivideo.com") })
+        assertTrue("Original signed Akamai URL must be preserved as fallback", akamaiOnly.contains(akamaiUrl))
+
+        // 2. 首元素是 Akamai 时，Donor 探测必须跳过 Akamai 选中后续 UPOS 镜像来合成备选
+        val mixed = BiliAcceleratorCore.filterAndFillBackupUrls(listOf(akamaiUrl, cleanUposUrl), defaultConfig)
+        assertTrue("Non-Akamai donor URL must be preserved", mixed.contains(cleanUposUrl))
+    }
 }

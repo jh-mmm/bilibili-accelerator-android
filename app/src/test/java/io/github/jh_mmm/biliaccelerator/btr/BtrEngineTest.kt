@@ -64,7 +64,8 @@ class BtrEngineTest {
         val backups = BtrSessionManager.synthesizeCompatibleBackups(akamaiPrimary)
         assertTrue("Overseas Akamai stream should synthesize overseas mirrors", backups.isNotEmpty())
         for (backup in backups) {
-            assertTrue("Synthesized backup must be an overseas ov node", backup.contains("ov.bilivideo.com"))
+            val isOverseasNode = backup.contains("ov.bilivideo.com") || backup.contains("cn-hk-eq-")
+            assertTrue("Synthesized backup must be an overseas node (ov or hk): $backup", isOverseasNode)
         }
     }
 
@@ -220,7 +221,8 @@ class BtrEngineTest {
 
         assertTrue("Overseas stream should synthesize overseas mirrors", backups.isNotEmpty())
         for (backup in backups) {
-            assertTrue("Synthesized backup must be an overseas ov node", backup.contains("ov.bilivideo.com"))
+            val isOverseasNode = backup.contains("ov.bilivideo.com") || backup.contains("cn-hk-eq-")
+            assertTrue("Synthesized backup must be an overseas node (ov or hk): $backup", isOverseasNode)
             assertFalse("Must not include primary host", backup.contains("mirrorcosov"))
         }
     }
@@ -413,7 +415,8 @@ class BtrEngineTest {
         val backups = session?.backupUrls.orEmpty()
         assertTrue("Regional PGC must synthesize backups", backups.isNotEmpty())
         for (backup in backups) {
-            assertTrue("Regional PGC must strictly use overseas/ov mirrors, never mainland UPOS", backup.contains("ov.bilivideo.com"))
+            val isOverseasNode = backup.contains("ov.bilivideo.com") || backup.contains("cn-hk-eq-")
+            assertTrue("Regional PGC must strictly use overseas/hk mirrors, never mainland UPOS: $backup", isOverseasNode)
         }
     }
 
@@ -497,5 +500,148 @@ class BtrEngineTest {
 
         val picked = session?.liveHostPool?.pick(3).orEmpty()
         assertTrue("Live host pool must contain primary host", picked.contains("d1--cn-gotcha204.bilivideo.com"))
+    }
+
+    @Test
+    fun testSynthesizeUsesFullMainlandAndOverseasPools() {
+        val mainlandPrimary = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s?deadline=1"
+        val fullMainlandBackups = BtrSessionManager.synthesizeCompatibleBackups(
+            mainlandPrimary,
+            AcceleratorConfig(btrCdnPoolSize = 10)
+        )
+        assertTrue("Full mainland synthesis should include mirrorcoso1/mirrorbos/mirrorbd",
+            fullMainlandBackups.any { it.contains("mirrorcoso1") || it.contains("mirrorbos") || it.contains("mirrorbd") })
+        assertTrue("Mainland pool should include > 5 mirrors", fullMainlandBackups.size > 5)
+
+        val overseasPrimary = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/54/12/12345.m4s?deadline=1"
+        val fullOverseasBackups = BtrSessionManager.synthesizeCompatibleBackups(
+            overseasPrimary,
+            AcceleratorConfig(btrCdnPoolSize = 8)
+        )
+        assertTrue("Overseas synthesis must include HK nodes cn-hk-eq-01-01/03",
+            fullOverseasBackups.any { it.contains("cn-hk-eq-01-01.bilivideo.com") } &&
+                fullOverseasBackups.any { it.contains("cn-hk-eq-01-03.bilivideo.com") })
+        assertFalse("Overseas synthesis must exclude mainland nodes",
+            fullOverseasBackups.any { it.contains("mirrorcos.bilivideo.com") || it.contains("mirrorali.bilivideo.com") })
+    }
+
+    @Test
+    fun testSessionBanListIsolatesUrlVsHostAcrossSessions() {
+        val host = "upos-sz-mirrorcos.bilivideo.com"
+        val sidA = BtrSessionManager.register("https://$host/upgcxcode/1/videoA.m4s?bad=1")
+        val sidB = BtrSessionManager.register("https://$host/upgcxcode/2/videoB.m4s?good=1")
+        val sessionA = BtrSessionManager.get(sidA)!!
+        val sessionB = BtrSessionManager.get(sidB)!!
+
+        val urlA1 = "https://$host/upgcxcode/1/videoA.m4s?bad=1"
+        val urlA2 = "https://$host/upgcxcode/1/videoA.m4s?alt=2"
+
+        // 先标记 host 在 sessionA 曾成功服务过 urlA2
+        sessionA.banList.recordSuccess(urlA2, host)
+        // urlA1 返回 HTTP 403，此时应仅封禁 urlA1（address 级），而保留已验证可用的节点 host
+        val isNodeFault = sessionA.banList.recordHttpFailure(urlA1, host, 403)
+        assertFalse("HTTP 403 must not trigger global node-level fault", isNodeFault)
+        assertTrue("Failed URL must be banned inside session A", sessionA.banList.isBanned(urlA1, host))
+        assertFalse("Known-good host must keep serving other URLs in session A", sessionA.banList.isBanned(urlA2, host))
+
+        // 另一视频会话 sessionB 对同一健康 CDN host 绝不受 sessionA 403 污染
+        assertFalse("Unrelated session B must not be penalized by session A's 403", sessionB.banList.isBanned(sessionB.primaryUrl, host))
+    }
+
+    @Test
+    fun testChunkTaskLiveInFlightPrefixSharingSnapshot() {
+        val expectedTotal = 512 * 1024
+        val task = BtrChunkEngine.ChunkTask(index = 0L, startByte = 0L, endByte = expectedTotal - 1L)
+
+        // 模拟主请求尚未结束、正在流式读取前 48KB（已超越 RESUME_MIN_BYTES 32KB 门槛）
+        assertTrue(task.tryClaimPrefixProducer(attemptId = 101L))
+        val chunk16k = ByteArray(16 * 1024) { 0x2A.toByte() }
+        repeat(3) {
+            task.appendLivePrefix(101L, chunk16k, chunk16k.size, expectedTotal)
+        }
+
+        assertEquals(48 * 1024, task.receivedBytes)
+        val snapshot = task.takePrefixSnapshot(32 * 1024, expectedTotal)
+        assertNotNull("In-flight prefix snapshot must be available immediately for hedged attempt", snapshot)
+        assertEquals(48 * 1024, snapshot?.size)
+        assertEquals(0x2A.toByte(), snapshot?.get(0))
+
+        // 主路胜出后清理前缀缓存
+        task.isSuccess = true
+        task.clearPrefixBuffersOnWin()
+        assertEquals(null, task.takePrefixSnapshot(32 * 1024, expectedTotal))
+    }
+
+    @Test
+    fun testDynamicConcurrencyControllerScalingAndPushback() {
+        var t = 1_000_000L
+        val controller = BtrChunkEngine.DynamicConcurrencyController(
+            initialConcurrency = 6,
+            autoScale = true,
+            minConcurrency = 2,
+            maxConcurrency = 16,
+            initialNowMs = t
+        )
+        assertEquals(6, controller.currentConcurrency)
+
+        // 第一个 1500ms 周期记录基准吞吐并上探试跑 8，第二个 1500ms 周期确认增益 >= 8% 并保留 8
+        controller.recordProgress(1024 * 1024L, nowMs = t)
+        t += 1_500L
+        controller.recordProgress(4 * 1024 * 1024L, nowMs = t)
+        assertEquals("Should probe up from 6 to 8", 8, controller.currentConcurrency)
+
+        t += 1_500L
+        controller.recordProgress(6 * 1024 * 1024L, nowMs = t)
+        assertEquals("Should commit 8 after >8% throughput gain", 8, controller.currentConcurrency)
+
+        // 模拟上游返回 HTTP 429 Pushback -> 立即降档并进入冷却
+        val steppedDown = controller.onPushback(nowMs = t + 100L)
+        assertEquals("Pushback must step down concurrency rung from 8 to 6", 6, steppedDown)
+        assertEquals(6, controller.currentConcurrency)
+    }
+
+    @Test
+    fun testContentRangeStartAndTotalLengthValidation() {
+        val sid = BtrSessionManager.register("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/12345.m4s")
+        val session = BtrSessionManager.get(sid)!!
+        session.totalLength = 10_000_000L
+
+        assertTrue(BtrChunkEngine.isValidContentRange(206, "bytes 0-65535/10000000", 0L, session))
+        assertFalse("Mismatched Content-Range start must be rejected",
+            BtrChunkEngine.isValidContentRange(206, "bytes 128-65535/10000000", 0L, session))
+        assertFalse("Mismatched total length across CDN mirrors must be rejected",
+            BtrChunkEngine.isValidContentRange(206, "bytes 0-65535/9999999", 0L, session))
+    }
+
+    @Test
+    fun testLiveMapUrlProtectionAndSpeculativeNextSegmentUrl() {
+        BtrLiveEngine.clearCache()
+        val mapUrl = "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123/init.m4s"
+        BtrLiveEngine.protectMapUrl(mapUrl)
+        BtrLiveEngine.putCacheForTest(
+            mapUrl,
+            CachedLiveSegment(byteArrayOf(1, 2, 3), "video/mp4", "d1--cn-gotcha204.bilivideo.com", cachedAt = 1L)
+        )
+
+        // 塞入超过 CACHE_LIMIT (32) 个普通分片触发缓存淘汰
+        for (i in 1..40) {
+            val segUrl = "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123/live_$i.m4s"
+            BtrLiveEngine.putCacheForTest(
+                segUrl,
+                CachedLiveSegment(byteArrayOf(i.toByte()), "video/iso.segment", "d1--cn-gotcha204.bilivideo.com", cachedAt = 1000L + i)
+            )
+        }
+
+        assertNotNull("Protected #EXT-X-MAP init segment must survive cache eviction", BtrLiveEngine.getCachedForTest(mapUrl))
+
+        val lastSeg = LiveSegment(
+            name = "live_105.m4s",
+            url = "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123/live_105.m4s?sign=abc",
+            num = 105L,
+            duration = 1.0
+        )
+        val guessed = BtrLiveCore.guessNextSegmentUrl(lastSeg)
+        assertEquals("https://d1--cn-gotcha204.bilivideo.com/live-bvc/123/live_106.m4s?sign=abc", guessed)
+        BtrLiveEngine.clearCache()
     }
 }
