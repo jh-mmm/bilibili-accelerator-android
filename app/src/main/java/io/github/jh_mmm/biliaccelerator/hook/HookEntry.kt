@@ -38,17 +38,33 @@ class HookEntry : XposedModule() {
             ":mall",
             ":patch",
             ":canary",
-            ":guard"
+            ":guard",
+            ":sandbox",
+            ":sandboxed",
+            ":isolated",
+            ":webview",
+            ":report",
+            ":monitor",
+            ":log",
+            ":download",
+            ":updater",
+            ":plugin",
+            ":tinker",
+            ":bugly"
         )
 
         internal fun isRelevantProcess(packageName: String, processName: String?): Boolean {
             val proc = processName?.trim()?.takeIf { it.isNotEmpty() } ?: return true
             if (proc == packageName || !proc.contains(':')) return true
             val suffix = proc.substringAfter(':').lowercase()
-            if (suffix.contains("media") || suffix.contains("player") || suffix.contains("video") || suffix.contains("ijk")) {
+            if (suffix.contains("media") || suffix.contains("play") || suffix.contains("video") || suffix.contains("ijk") || suffix == "live") {
                 return true
             }
-            if (IGNORED_PROCESS_SUFFIXES.any { suffix == it.removePrefix(":") || suffix.startsWith(it.removePrefix(":") + ":") }) {
+            if (IGNORED_PROCESS_SUFFIXES.any { ignored ->
+                    val prefix = ignored.removePrefix(":")
+                    suffix == prefix || suffix.startsWith("$prefix:") || suffix.startsWith("${prefix}_") || suffix.startsWith("${prefix}process")
+                } || suffix.contains("sandbox") || suffix.contains("isolated") || suffix.contains("webview")
+            ) {
                 return false
             }
             return true

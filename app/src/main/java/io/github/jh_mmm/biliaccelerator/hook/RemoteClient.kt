@@ -15,6 +15,7 @@ import android.util.Log
 import com.google.gson.Gson
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
+import io.github.jh_mmm.biliaccelerator.core.PlayinfoRegistry
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
 import io.github.jh_mmm.biliaccelerator.provider.XposedServiceProvider
@@ -69,6 +70,11 @@ object RemoteClient {
 
     fun getCachedConfig(): AcceleratorConfig = cachedConfig
 
+    internal fun setCachedConfigForTesting(config: AcceleratorConfig, fetchTimeMs: Long = System.currentTimeMillis()) {
+        cachedConfig = config
+        lastConfigFetchTime.set(fetchTimeMs)
+    }
+
     fun attachXposedModule(module: XposedModule) {
         if (!isRemotePrefsAttached.compareAndSet(false, true)) return
         try {
@@ -116,6 +122,9 @@ object RemoteClient {
             return
         }
 
+        // 初始化跨进程共享状态目录（Playinfo 元数据与跨会话并发持久化）
+        PlayinfoRegistry.configureSharedStateDir(runCatching { app.noBackupFilesDir ?: app.cacheDir }.getOrNull())
+
         // 从目标 App 私有目录载入历史持久化配置，若未从 RemotePreferences 同步到则使用本地缓存
         if (lastConfigFetchTime.get() == 0L) {
             loadConfigFromLocalCache(app)
@@ -141,8 +150,12 @@ object RemoteClient {
         }
     }
 
+    @Volatile
+    private var hasStartedBtrProxy = false
+
     fun ensureBtrProxyStarted(config: AcceleratorConfig): Boolean {
         if (!config.enabled || !config.enableBtr) return false
+        hasStartedBtrProxy = true
         val proxy = io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer
         if (!proxy.isStarted) {
             proxy.start(
@@ -167,6 +180,13 @@ object RemoteClient {
 
     fun syncBtrProxyState(config: AcceleratorConfig) {
         try {
+            if (!hasStartedBtrProxy) {
+                HookStatusTracker.recordStatus(
+                    "btr_proxy",
+                    if (config.enabled && config.enableBtr) "ready (on-demand)" else "disabled"
+                )
+                return
+            }
             val proxy = io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer
             if (config.enabled && config.enableBtr) {
                 if (proxy.isStarted) {

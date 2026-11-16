@@ -1,8 +1,11 @@
 package io.github.jh_mmm.biliaccelerator.core
 
+import io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager
+import io.github.jh_mmm.biliaccelerator.hook.PlayerHook
 import io.github.jh_mmm.biliaccelerator.hook.RemoteClient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -579,5 +582,178 @@ class BiliAcceleratorCoreTest {
             0L,
             BiliAcceleratorCore.extractUrlDeadlineSeconds("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/123.m4s?os=upos")
         )
+    }
+
+    @Test
+    fun testCrossTierCandidatePoolInterleavesMainlandAndOverseasEvenWhenSmall() {
+        val prevTz = java.util.TimeZone.getDefault()
+        try {
+            val smallBtrConfig = defaultConfig.copy(enableBtr = true, btrCdnPoolSize = 3)
+            for (tzId in listOf("Asia/Shanghai", "America/Los_Angeles")) {
+                java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone(tzId))
+                val filled = PlayerHook.filterAndFillBackupUrls(
+                    listOf("http://112.34.56.78:8080/upgcxcode/54/12/34567.m4s"),
+                    smallBtrConfig
+                )
+                assertTrue("[$tzId] filled mirrors should include mainland node", filled.any { !it.contains("ov.bilivideo.com") && it.contains("bilivideo.com") })
+                assertTrue("[$tzId] filled mirrors should include overseas node", filled.any { it.contains("ov.bilivideo.com") })
+
+                val synthesized = BtrSessionManager.synthesizeCompatibleBackups(
+                    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s",
+                    smallBtrConfig
+                )
+                assertTrue("[$tzId] synthesized BTR mirrors must be cross-tier", synthesized.any { !it.contains("ov.bilivideo.com") })
+                assertTrue("[$tzId] synthesized BTR mirrors must include overseas tier", synthesized.any { it.contains("ov.bilivideo.com") })
+            }
+        } finally {
+            java.util.TimeZone.setDefault(prevTz)
+        }
+    }
+
+    @Test
+    fun testNonMcdnV1ResourceWithMcdnHintDoesNotFallThroughToPcdnSwap() {
+        val raw = "http://112.34.56.78:8080/v1/resource/chunk-1.m4s?os=mcdn&deadline=1899999999"
+        val resReplace = BiliAcceleratorCore.rewriteUrl(raw, defaultConfig.copy(mcdnStrategy = "replace"))
+        assertFalse("v1/resource path must pass through instead of PCDN swap", resReplace.changed)
+        assertEquals("mcdn-v1-pass", resReplace.reason)
+    }
+
+    private enum class MockDrmTechType { UNKNOWN_DRM, NON, FAIR_PLAY, WIDEVINE }
+    private class MockStreamInfo(val isDrm: Boolean, val isPreview: Boolean, val drmTechType: MockDrmTechType = MockDrmTechType.NON) {
+        fun getDrmTechTypeValue(): Int = drmTechType.ordinal
+    }
+    private class MockDashVideo(val baseUrl: String, val backupUrl: List<String>)
+    private class MockStream(val streamInfo: MockStreamInfo, val dashVideo: MockDashVideo)
+    private class MockViewInfo(val isPreview: Boolean, val epId: Long)
+    private class MockVideoInfo(val streamList: List<MockStream>)
+    private class MockPlayViewUniteReply(val videoInfo: MockVideoInfo, val viewInfo: MockViewInfo)
+
+    @Test
+    fun testPlayinfoRegistryJsonProtobufAndSharedFilePersistence() {
+        val tempDir = java.nio.file.Files.createTempDirectory("playinfo_test").toFile()
+        try {
+            PlayinfoRegistry.resetForTesting(clearDir = true)
+            PlayinfoRegistry.configureSharedStateDir(tempDir)
+
+            val json = """
+                {
+                  "code": 0,
+                  "data": {
+                    "ep_id": 888999,
+                    "is_preview": 0,
+                    "dash": {
+                      "video": [
+                        {
+                          "id": 80,
+                          "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/22/clean-80.m4s?deadline=1800000100",
+                          "backup_url": ["https://upos-sz-mirrorali.bilivideo.com/upgcxcode/11/22/clean-80.m4s?deadline=1800000200"],
+                          "is_drm": false
+                        },
+                        {
+                          "id": 120,
+                          "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/22/drm-120.m4s?deadline=1800000100",
+                          "is_drm": true
+                        }
+                      ]
+                    }
+                  }
+                }
+            """.trimIndent()
+            val ingested = PlayinfoRegistry.ingestJson(json, "https://api.bilibili.com/pgc/player/web/playurl?ep_id=888999")
+            assertEquals(2, ingested.size)
+
+            val cleanTrack = PlayinfoRegistry.lookup("https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/11/22/clean-80.m4s")!!
+            assertFalse("Clean sibling track must not be tainted by DRM sibling", cleanTrack.hasDrm)
+            assertTrue("PGC ep_id must mark isEpisode=true", cleanTrack.isEpisode)
+            assertFalse("is_preview=0 must keep isPreview=false", cleanTrack.isPreview)
+            assertEquals(1800000100L, cleanTrack.deadlineEpochSec)
+            assertEquals(1, cleanTrack.backupUrls.size)
+
+            val drmTrack = PlayinfoRegistry.lookup("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/11/22/drm-120.m4s")!!
+            assertTrue("Track with is_drm=true must be flagged", drmTrack.hasDrm)
+
+            // Simulate second process reading shared state directory (retains primaryUrl, backupUrls, DRM, and episode flags)
+            PlayinfoRegistry.resetForTesting(clearDir = false)
+            val crossProcClean = PlayinfoRegistry.lookup("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/22/clean-80.m4s")!!
+            assertTrue("Cross-process shared state must retain primaryUrl", crossProcClean.primaryUrl.contains("clean-80.m4s"))
+            assertEquals("Cross-process shared state must retain backupUrls", 1, crossProcClean.backupUrls.size)
+            val crossProcDrm = PlayinfoRegistry.lookup("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/22/drm-120.m4s")!!
+            assertTrue("Cross-process shared state must retain DRM flag", crossProcDrm.hasDrm)
+            assertTrue("Cross-process shared state must retain episode flag", crossProcDrm.isEpisode)
+
+            // Test vod_info + dash_audio + loss_less_item JSON parsing
+            val vodInfoJson = """
+                {
+                  "code": 0,
+                  "vod_info": {
+                    "stream_list": [
+                      {
+                        "stream_info": { "drm_tech_type": "NON" },
+                        "dash_video": {
+                          "base_url": "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/44/55/unite-v.m4s?deadline=1900000100"
+                        }
+                      }
+                    ],
+                    "dash_audio": [
+                      {
+                        "base_url": "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/44/55/unite-a.m4s?deadline=1900000100"
+                      }
+                    ],
+                    "loss_less_item": {
+                      "audio": {
+                        "base_url": "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/44/55/unite-flac.m4s?deadline=1900000100"
+                      }
+                    }
+                  }
+                }
+            """.trimIndent()
+            val vodTracks = PlayinfoRegistry.ingestJson(vodInfoJson)
+            assertEquals(3, vodTracks.size)
+            val uniteVideo = PlayinfoRegistry.lookup("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/44/55/unite-v.m4s")!!
+            val uniteAudio = PlayinfoRegistry.lookup("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/44/55/unite-a.m4s")!!
+            val uniteFlac = PlayinfoRegistry.lookup("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/44/55/unite-flac.m4s")!!
+            assertFalse("drm_tech_type=NON must not falsely flag DRM", uniteVideo.hasDrm)
+            assertTrue(uniteAudio.isAudio)
+            assertTrue(uniteFlac.isAudio)
+
+            // Test Moss Protobuf reflection inspection with per-stream DRM isolation + DrmTechType.NON (ordinal=1)
+            PlayinfoRegistry.resetForTesting(clearDir = true)
+            val mockReply = MockPlayViewUniteReply(
+                videoInfo = MockVideoInfo(
+                    listOf(
+                        MockStream(
+                            streamInfo = MockStreamInfo(isDrm = true, isPreview = false, drmTechType = MockDrmTechType.WIDEVINE),
+                            dashVideo = MockDashVideo(
+                                baseUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/33/44/pb-drm.m4s?deadline=1900000100",
+                                backupUrl = emptyList()
+                            )
+                        ),
+                        MockStream(
+                            streamInfo = MockStreamInfo(isDrm = false, isPreview = false, drmTechType = MockDrmTechType.NON),
+                            dashVideo = MockDashVideo(
+                                baseUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/33/44/pb-clean.m4s?deadline=1900000100",
+                                backupUrl = listOf("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/33/44/pb-clean.m4s?deadline=1900000100")
+                            )
+                        )
+                    )
+                ),
+                viewInfo = MockViewInfo(isPreview = true, epId = 777111L)
+            )
+            val pbEntries = PlayinfoRegistry.ingestPlayViewReply(mockReply, "test-pb")
+            assertEquals(2, pbEntries.size)
+            val pbDrm = PlayinfoRegistry.lookup("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/33/44/pb-drm.m4s")!!
+            val pbClean = PlayinfoRegistry.lookup("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/33/44/pb-clean.m4s")!!
+            assertTrue(pbDrm.hasDrm)
+            assertFalse("Non-DRM protobuf sibling (including DrmTechType.NON=1) must stay non-DRM", pbClean.hasDrm)
+            assertTrue("ViewInfo isPreview must propagate", pbClean.isPreview)
+            assertTrue("ViewInfo epId must set isEpisode", pbClean.isEpisode)
+
+            // Reject false-positive /v1.0/ smtcdns unwrap in BiliAcceleratorCore too
+            assertEquals("", BiliAcceleratorCore.unwrapSmtcdnsUrl("https://proxy.smtcdns.net/v1.0/live/room.m4s"))
+            assertEquals("", BiliAcceleratorCore.unwrapSmtcdnsUrl("https://proxy.smtcdns.net/api.v2/upgcxcode/1/2/3.m4s"))
+        } finally {
+            PlayinfoRegistry.resetForTesting(clearDir = true)
+            tempDir.deleteRecursively()
+        }
     }
 }

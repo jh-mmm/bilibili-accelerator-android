@@ -563,6 +563,14 @@ class ActivationStateTest {
             "Empty dummy entry must be rejected",
             io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver.isPayloadLegitimate(gson.toJson(listOf(bogusResult)), null)
         )
+
+        val mixedBatchJson = gson.toJson(listOf(bogusResult, legitimateResult))
+        val extracted = io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver.extractLegitimateBatch(mixedBatchJson)
+        assertEquals("Mixed batch should retain the valid entry", 1, extracted.size)
+        assertTrue(
+            "Mixed batch containing at least one legitimate entry must match onReceive any-semantics",
+            io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver.isPayloadLegitimate(mixedBatchJson, null)
+        )
     }
 }
 

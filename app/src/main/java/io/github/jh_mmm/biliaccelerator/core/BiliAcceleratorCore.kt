@@ -73,6 +73,22 @@ object BiliAcceleratorCore {
                 p.startsWith("com.bstar.")
     }
 
+    // 跨区统一交错候选池（对齐 bilibili-accelerator v0.5.0：不预设地域顺序，保证小池尺寸下大陆与海外节点均被包含，由实测吞吐动态决定优胜者）
+    val INTERLEAVED_CANDIDATE_POOL = listOf(
+        "upos-sz-mirrorcos.bilivideo.com",
+        "upos-sz-mirrorcosov.bilivideo.com",
+        "upos-sz-mirrorali.bilivideo.com",
+        "upos-sz-mirroraliov.bilivideo.com",
+        "upos-sz-mirrorhw.bilivideo.com",
+        "upos-sz-mirrorhwov.bilivideo.com",
+        "upos-tf-all-hw.bilivideo.com",
+        "upos-tf-all-tx.bilivideo.com",
+        "upos-sz-mirrorcoso1.bilivideo.com",
+        "upos-sz-mirrorbos.bilivideo.com",
+        "upos-sz-mirror08c.bilivideo.com",
+        "upos-sz-mirrorbd.bilivideo.com"
+    )
+
     val MAINLAND_CANDIDATE_POOL = listOf(
         "upos-sz-mirrorcos.bilivideo.com",
         "upos-sz-mirrorali.bilivideo.com",
@@ -108,7 +124,7 @@ object BiliAcceleratorCore {
         "cn-hk-eq-01-03.bilivideo.com"
     )
 
-    val CANDIDATE_POOL = MAINLAND_CANDIDATE_POOL
+    val CANDIDATE_POOL = INTERLEAVED_CANDIDATE_POOL
     val DEFAULT_CDN_POOL = CANDIDATE_POOL
 
     /**
@@ -130,9 +146,7 @@ object BiliAcceleratorCore {
             .map { cleanHost(it).lowercase() }
             .filter { isValidHost(it) && !isAkamaiHost(it) }
             .distinct()
-        val basePool = if (userList.isNotEmpty()) userList else {
-            if (isOverseasEnvironment()) OVERSEAS_CANDIDATE_POOL else MAINLAND_CANDIDATE_POOL
-        }
+        val basePool = if (userList.isNotEmpty()) userList else CANDIDATE_POOL
         val poolSize = config.btrCdnPoolSize.coerceIn(1, 32)
         return basePool.take(poolSize)
     }
@@ -141,10 +155,6 @@ object BiliAcceleratorCore {
     private val MEDIA_PATH_REGEX = Regex("""\.(m4s|mp4|flv|m3u8)(?:$|[?#])""", RegexOption.IGNORE_CASE)
     private val IPV6_GROUP_REGEX = Regex("""^[0-9a-fA-F]{1,4}$""")
     private val XY_MCDN_REGEX = Regex("""^xy(?:\d+x){3}\d+xy\.mcdn\.bilivideo\.(?:cn|com|net)$""", RegexOption.IGNORE_CASE)
-    private val GENERAL_SMTCDNS_WRAP_REGEX = Regex(
-        """^(https?:)//[\w.-]+\.smtcdns\.(?:net|com)/([a-zA-Z0-9.-]+\.[a-zA-Z0-9.-]+(?::\d{1,5})?|\[[0-9a-fA-F:]+\](?::\d{1,5})?)(/.*)$""",
-        RegexOption.IGNORE_CASE
-    )
 
     fun isIpAddress(rawHost: String): Boolean {
         var h = cleanHost(rawHost).lowercase()
@@ -385,11 +395,7 @@ object BiliAcceleratorCore {
     }
 
     fun unwrapSmtcdnsUrl(url: String): String {
-        val trimmed = url.trim()
-        val liveUnwrapped = io.github.jh_mmm.biliaccelerator.btr.BtrLiveCore.unwrapProxyUrl(trimmed)
-        if (liveUnwrapped.isNotBlank()) return liveUnwrapped
-        val match = GENERAL_SMTCDNS_WRAP_REGEX.matchEntire(trimmed) ?: return ""
-        return "${match.groupValues[1]}//${match.groupValues[2]}${match.groupValues[3]}"
+        return io.github.jh_mmm.biliaccelerator.btr.BtrLiveCore.unwrapProxyUrl(url.trim())
     }
 
     fun isBiliFamilyHost(hostname: String): Boolean {
@@ -680,9 +686,10 @@ object BiliAcceleratorCore {
         }
 
         // 2. MCDN 节点处理：
-        // - proxyMcdn=true 时按 proxy-all / proxy-v1 / replace 策略执行（replace 严格全量替换为 UPOS）
+        // - proxyMcdn=true 时按 proxy-all / proxy-v1 / replace 策略执行（replace 对 /v1/resource/ 安全放行以杜绝 403）
         // - proxyMcdn=false 时，非 /v1/resource/ 的 *.mcdn.* 节点在 blockPcdn 或 forceUpos 开启下同样替换为 UPOS；
         //   而 /v1/resource/ 路径因 UPOS 节点不支持并会直接 403，停用代理时保持直连放行
+        val isV1Resource = parsed.path.startsWith("/v1/resource/", ignoreCase = true)
         if (isMcdn) {
             if (config.proxyMcdn) {
                 val shouldProxy = shouldProxyMcdn(true, parsed.path, config)
@@ -704,6 +711,9 @@ object BiliAcceleratorCore {
                         return noChange(original, "ok", isMcdn = true, segmentKey = segKey)
                     }
                 } else {
+                    if (isV1Resource) {
+                        return noChange(original, "mcdn-v1-pass", isPcdn = isPcdn, isMcdn = true, segmentKey = segKey)
+                    }
                     val target = resolveTargetHost(config)
                     val rewritten = parsed.replaceAuthority(target)
                     if (rewritten != original) {
@@ -723,7 +733,7 @@ object BiliAcceleratorCore {
                     }
                 }
             } else {
-                if (parsed.path.startsWith("/v1/resource/")) {
+                if (isV1Resource) {
                     return noChange(original, "mcdn-v1-pass", isPcdn = false, isMcdn = true, segmentKey = segKey)
                 }
                 if (config.blockPcdn || config.forceUpos) {
@@ -745,6 +755,11 @@ object BiliAcceleratorCore {
                 }
                 return noChange(original, "ok", isPcdn = isPcdn, isMcdn = true, segmentKey = segKey)
             }
+        }
+
+        // /v1/resource/ 路径依赖边缘中继鉴权，普通 UPOS 节点不支持并会直接 403；即使非 *.mcdn.* 域名也禁止改写为普通 UPOS
+        if (isV1Resource) {
+            return noChange(original, "mcdn-v1-pass", isPcdn = isPcdn, isMcdn = false, segmentKey = segKey)
         }
 
         // 3. Akamai 节点处理：默认放行官方 Akamai 鉴权线路；杜绝非 BTR 模式下直接改写 Host 导致 403 播放失败
@@ -800,7 +815,7 @@ object BiliAcceleratorCore {
             return false
         }
         if (parsed.port != -1 && parsed.port != 80 && parsed.port != 443) return false
-        if (isRelayUrl(url) || hasDrmSignal(url)) return false
+        if (isRelayUrl(url) || hasDrmSignal(url) || isEpisodePreview(url)) return false
         if (requireUpgcxcode && !parsed.path.contains("/upgcxcode/")) return false
         return isBiliCdnHost(host)
     }
@@ -857,7 +872,8 @@ object BiliAcceleratorCore {
             val candidates = pool.filter {
                 !it.equals(resolvedTarget, ignoreCase = true) && !existingHosts.contains(it.lowercase())
             }
-            for (candidate in candidates.take(3)) {
+            val fillCount = config.btrCdnPoolSize.coerceIn(2, 6)
+            for (candidate in candidates.take(fillCount)) {
                 val backupRes = rewriteUrl(
                     donorUrl,
                     config.copy(targetHost = candidate, forceUpos = true)

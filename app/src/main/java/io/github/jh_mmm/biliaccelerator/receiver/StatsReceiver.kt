@@ -57,24 +57,34 @@ class StatsReceiver : BroadcastReceiver() {
             "akamai-redirect"
         )
 
+        internal fun extractLegitimateBatch(batchJson: String?): List<RewriteResult> {
+            if (batchJson.isNullOrEmpty()) return emptyList()
+            return try {
+                val listType = object : TypeToken<List<RewriteResultDto>>() {}.type
+                val dtos: List<RewriteResultDto> = gson.fromJson(batchJson, listType) ?: return emptyList()
+                dtos.take(200).map { it.toDomain() }.filter { isValidResultItem(it) }
+            } catch (_: Throwable) {
+                emptyList()
+            }
+        }
+
+        internal fun extractLegitimateSingle(singleJson: String?): RewriteResult? {
+            if (singleJson.isNullOrEmpty()) return null
+            return try {
+                val dto: RewriteResultDto = gson.fromJson(singleJson, RewriteResultDto::class.java) ?: return null
+                val result = dto.toDomain()
+                if (isValidResultItem(result)) result else null
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
         internal fun isPayloadLegitimate(batchJson: String?, singleJson: String?): Boolean {
             if (!batchJson.isNullOrEmpty()) {
-                return try {
-                    val listType = object : TypeToken<List<RewriteResultDto>>() {}.type
-                    val results: List<RewriteResultDto> = gson.fromJson(batchJson, listType) ?: return false
-                    if (results.isEmpty() || results.size > 200) return false
-                    results.all { isValidResultItem(it.toDomain()) }
-                } catch (_: Throwable) {
-                    false
-                }
+                return extractLegitimateBatch(batchJson).isNotEmpty()
             }
             if (!singleJson.isNullOrEmpty()) {
-                return try {
-                    val result: RewriteResultDto = gson.fromJson(singleJson, RewriteResultDto::class.java) ?: return false
-                    isValidResultItem(result.toDomain())
-                } catch (_: Throwable) {
-                    false
-                }
+                return extractLegitimateSingle(singleJson) != null
             }
             return false
         }
@@ -205,40 +215,28 @@ class StatsReceiver : BroadcastReceiver() {
 
         // 优先处理批量上报
         if (!batchJson.isNullOrEmpty()) {
-            try {
-                val listType = object : TypeToken<List<RewriteResultDto>>() {}.type
-                val dtos: List<RewriteResultDto> = gson.fromJson(batchJson, listType)
-                val results = dtos.take(200).map { it.toDomain() }.filter { isValidResultItem(it) }
-                if (results.isEmpty()) return
-                StatsManager.recordRequests(results, context)
-                StatsManager.recordHeartbeat(context)
-                if (!resolvedSenderPkg.isNullOrBlank()) {
-                    StatsManager.recordHandshake(pkg = resolvedSenderPkg, version = null, process = reportProc, context = context)
-                    StatsProvider.pushConfigToPackageAsync(context, resolvedSenderPkg)
-                }
-                Log.i(TAG, "通过 Broadcast 成功记录批量重定向 (${results.size} 条)")
-                return
-            } catch (e: Exception) {
-                Log.e(TAG, "Broadcast 批量记录解析失败: $e")
+            val results = extractLegitimateBatch(batchJson)
+            if (results.isEmpty()) return
+            StatsManager.recordRequests(results, context)
+            StatsManager.recordHeartbeat(context)
+            if (!resolvedSenderPkg.isNullOrBlank()) {
+                StatsManager.recordHandshake(pkg = resolvedSenderPkg, version = null, process = reportProc, context = context)
+                StatsProvider.pushConfigToPackageAsync(context, resolvedSenderPkg)
             }
+            Log.i(TAG, "通过 Broadcast 成功记录批量重定向 (${results.size} 条)")
+            return
         }
 
         // 单条记录兜底兼容
         if (!singleJson.isNullOrEmpty()) {
-            try {
-                val dto = gson.fromJson(singleJson, RewriteResultDto::class.java)
-                val result = dto.toDomain()
-                if (!isValidResultItem(result)) return
-                StatsManager.recordRequests(listOf(result), context)
-                StatsManager.recordHeartbeat(context)
-                if (!resolvedSenderPkg.isNullOrBlank()) {
-                    StatsManager.recordHandshake(pkg = resolvedSenderPkg, version = null, process = reportProc, context = context)
-                    StatsProvider.pushConfigToPackageAsync(context, resolvedSenderPkg)
-                }
-                Log.i(TAG, "通过 Broadcast 成功记录单条重定向: ${result.originalHost} -> ${result.targetHost}")
-            } catch (e: Exception) {
-                Log.e(TAG, "Broadcast 记录失败: $e")
+            val result = extractLegitimateSingle(singleJson) ?: return
+            StatsManager.recordRequests(listOf(result), context)
+            StatsManager.recordHeartbeat(context)
+            if (!resolvedSenderPkg.isNullOrBlank()) {
+                StatsManager.recordHandshake(pkg = resolvedSenderPkg, version = null, process = reportProc, context = context)
+                StatsProvider.pushConfigToPackageAsync(context, resolvedSenderPkg)
             }
+            Log.i(TAG, "通过 Broadcast 成功记录单条重定向: ${result.originalHost} -> ${result.targetHost}")
         }
     }
 }

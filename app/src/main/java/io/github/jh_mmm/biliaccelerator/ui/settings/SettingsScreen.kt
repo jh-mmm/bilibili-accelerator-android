@@ -2,8 +2,6 @@ package io.github.jh_mmm.biliaccelerator.ui.settings
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.Crossfade
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -13,8 +11,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
@@ -27,12 +23,9 @@ import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Palette
-import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Route
 import androidx.compose.material.icons.outlined.Security
-import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -41,17 +34,12 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -73,16 +61,6 @@ import io.github.jh_mmm.biliaccelerator.ui.theme.TagPcdn
 import io.github.jh_mmm.biliaccelerator.ui.theme.UiPreferences
 import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
 import io.github.jh_mmm.biliaccelerator.ui.theme.UiThemeMode
-import io.github.jh_mmm.biliaccelerator.ui.theme.isAcceleratorDarkTheme
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
-import java.net.URL
-import javax.net.ssl.HttpsURLConnection
 import kotlin.math.roundToInt
 
 enum class SettingsSubPage {
@@ -107,7 +85,6 @@ fun SettingsScreen(
     var currentSubPage by rememberSaveable { mutableStateOf(SettingsSubPage.MAIN) }
 
     var showUposDialog by rememberSaveable { mutableStateOf(false) }
-    var showSpeedTestDialog by rememberSaveable { mutableStateOf(false) }
     var showProxyHostDialog by rememberSaveable { mutableStateOf(false) }
     var showCustomCdnDialog by rememberSaveable { mutableStateOf(false) }
     var showMcdnStrategyDialog by rememberSaveable { mutableStateOf(false) }
@@ -131,20 +108,6 @@ fun SettingsScreen(
                 showUposDialog = false
             },
             onDismiss = { showUposDialog = false }
-        )
-    }
-
-    // Dialog 1.2: UPOS Speed Test
-    if (showSpeedTestDialog) {
-        UposSpeedTestDialog(
-            uposEntries = uposEntries,
-            uposValues = uposValues,
-            currentTargetHost = config.targetHost,
-            onSelectTargetHost = { newHost ->
-                onConfigChange(config.copy(targetHost = newHost))
-                showSpeedTestDialog = false
-            },
-            onDismiss = { showSpeedTestDialog = false }
         )
     }
 
@@ -280,18 +243,13 @@ fun SettingsScreen(
 
                                 PreferenceDropdownItem(
                                     title = stringResource(R.string.label_target_host),
-                                    summary = config.targetHost,
+                                    summary = if (config.enableBtr) {
+                                        "${config.targetHost}（启用 BTR 时由分片真实吞吐动态择优，不以 RTT 测速排序）"
+                                    } else {
+                                        config.targetHost
+                                    },
                                     selectedValue = currentUposLabel,
                                     onClick = { showUposDialog = true }
-                                )
-
-                                PreferenceDivider()
-
-                                PreferenceActionItem(
-                                    title = stringResource(R.string.label_speed_test),
-                                    summary = stringResource(R.string.summary_speed_test),
-                                    icon = Icons.Outlined.Speed,
-                                    onClick = { showSpeedTestDialog = true }
                                 )
 
                                 PreferenceDivider()
@@ -961,255 +919,6 @@ private fun ProxyHostDialog(
         dismissButton = {
             TextButton(onClick = onDismiss) {
                 Text("取消")
-            }
-        },
-        shape = RoundedCornerShape(20.dp)
-    )
-}
-
-data class UposTestState(
-    val host: String,
-    val latencyMs: Long? = null,
-    val isTesting: Boolean = false,
-    val error: String? = null
-)
-
-@Composable
-private fun UposSpeedTestDialog(
-    uposEntries: List<String>,
-    uposValues: List<String>,
-    currentTargetHost: String,
-    onSelectTargetHost: (String) -> Unit,
-    onDismiss: () -> Unit
-) {
-    val coroutineScope = rememberCoroutineScope()
-    var isTestingAll by remember { mutableStateOf(false) }
-    var testJob by remember { mutableStateOf<Job?>(null) }
-    var testStates by remember {
-        mutableStateOf(uposValues.associateWith { host ->
-            UposTestState(host = host, isTesting = false)
-        })
-    }
-
-    fun probeUposHostLatencyMs(host: String): Long {
-        val t0 = System.currentTimeMillis()
-        val conn = (URL("https://$host/").openConnection() as HttpsURLConnection).apply {
-            requestMethod = "HEAD"
-            connectTimeout = 2500
-            readTimeout = 2500
-            instanceFollowRedirects = false
-            useCaches = false
-            setRequestProperty("User-Agent", "Mozilla/5.0 BiliDroid/8.0.0 (bbcallen@gmail.com)")
-            setRequestProperty("Connection", "close")
-        }
-        try {
-            conn.connect()
-            val code = conn.responseCode
-            // UPOS 边缘节点通常未对根路径开放业务资源，返回 200~499 (如 403/404) 均证明 TCP+TLS 握手及网络连通正常
-            if (code !in 200..499) {
-                throw IllegalStateException("HTTP $code")
-            }
-            return (System.currentTimeMillis() - t0).coerceAtLeast(1L)
-        } finally {
-            runCatching { conn.disconnect() }
-        }
-    }
-
-    fun startSpeedTest() {
-        if (isTestingAll) return
-        testJob?.cancel()
-        isTestingAll = true
-        testStates = uposValues.associateWith { host ->
-            UposTestState(host = host, isTesting = true)
-        }
-        testJob = coroutineScope.launch {
-            try {
-                val results = withContext(Dispatchers.IO) {
-                    uposValues.map { host ->
-                        async {
-                            try {
-                                val lat = withTimeout(3000L) {
-                                    probeUposHostLatencyMs(host)
-                                }
-                                host to UposTestState(host = host, latencyMs = lat, isTesting = false)
-                            } catch (e: Exception) {
-                                val err = if (e is kotlinx.coroutines.TimeoutCancellationException) "超时" else (e.message ?: "失败")
-                                host to UposTestState(host = host, latencyMs = null, isTesting = false, error = err)
-                            }
-                        }
-                    }.awaitAll()
-                }
-                testStates = results.toMap()
-            } finally {
-                isTestingAll = false
-            }
-        }
-    }
-
-    LaunchedEffect(Unit) {
-        startSpeedTest()
-    }
-
-    val sortedHosts = remember(testStates, uposValues) {
-        uposValues.sortedWith(
-            compareBy<String> { host ->
-                val state = testStates[host]
-                when {
-                    state?.isTesting == true -> 1
-                    state?.latencyMs != null -> 0
-                    else -> 2
-                }
-            }.thenBy { host ->
-                testStates[host]?.latencyMs ?: Long.MAX_VALUE
-            }
-        )
-    }
-
-    val dark = isAcceleratorDarkTheme()
-
-    AlertDialog(
-        onDismissRequest = {
-            testJob?.cancel()
-            onDismiss()
-        },
-        title = {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(text = stringResource(R.string.speed_test_dialog_title), fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                if (isTestingAll) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(18.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-            }
-        },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-            ) {
-                Text(
-                    text = if (isTestingAll) stringResource(R.string.speed_test_testing_desc) else stringResource(R.string.speed_test_done_desc),
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
-
-                sortedHosts.forEach { host ->
-                    val state = testStates[host] ?: UposTestState(host = host)
-                    val isCurrent = host.equals(currentTargetHost, ignoreCase = true)
-                    val displayName = io.github.jh_mmm.biliaccelerator.ui.dashboard.resolveUposDisplayName(
-                        targetHost = host,
-                        uposEntries = uposEntries,
-                        uposValues = uposValues
-                    )
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .clickable {
-                                onSelectTargetHost(host)
-                            }
-                            .padding(vertical = 8.dp, horizontal = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = displayName,
-                                    fontSize = 14.sp,
-                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
-                                    color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                                )
-                                if (isCurrent) {
-                                    Spacer(Modifier.width(6.dp))
-                                    Text(
-                                        text = stringResource(R.string.speed_test_current),
-                                        fontSize = 10.sp,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(4.dp))
-                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
-                                            .padding(horizontal = 4.dp, vertical = 1.dp)
-                                    )
-                                }
-                            }
-                            Text(
-                                text = host,
-                                fontSize = 11.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f)
-                            )
-                        }
-
-                        Spacer(Modifier.width(8.dp))
-
-                        if (state.isTesting) {
-                            Text(
-                                text = stringResource(R.string.speed_test_testing),
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        } else if (state.latencyMs != null) {
-                            val latency = state.latencyMs
-                            val (badgeBg, badgeTextColor) = when {
-                                latency < 80L -> (if (dark) Color(0xFF143320) else Color(0xFFE8F8F0)) to Color(0xFF2ECC71)
-                                latency < 200L -> (if (dark) Color(0xFF112938) else Color(0xFFE3F2FD)) to Color(0xFF00AEEC)
-                                latency < 400L -> (if (dark) Color(0xFF382E11) else Color(0xFFFFF8E1)) to Color(0xFFF39C12)
-                                else -> (if (dark) Color(0xFF381818) else Color(0xFFFFEBEE)) to Color(0xFFE74C3C)
-                            }
-
-                            Text(
-                                text = "${latency} ms",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = badgeTextColor,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(badgeBg)
-                                    .padding(horizontal = 6.dp, vertical = 2.dp)
-                            )
-                        } else {
-                            Text(
-                                text = state.error ?: stringResource(R.string.speed_test_timeout),
-                                fontSize = 11.sp,
-                                color = Color(0xFFE74C3C),
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(if (dark) Color(0xFF381818) else Color(0xFFFFEBEE))
-                                    .padding(horizontal = 6.dp, vertical = 2.dp)
-                            )
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { startSpeedTest() },
-                enabled = !isTestingAll
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = Icons.Outlined.Refresh,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Text(stringResource(R.string.speed_test_retest))
-                }
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(stringResource(R.string.dialog_close))
             }
         },
         shape = RoundedCornerShape(20.dp)

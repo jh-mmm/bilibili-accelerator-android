@@ -163,7 +163,7 @@ object BtrLiveCore {
 
     private val LIVE_HOST_REGEX = Regex("""(?:\.|^)bilivideo\.(com|cn|net)$""", RegexOption.IGNORE_CASE)
     private val PROXY_WRAP_REGEX = Regex(
-        """^(https?:)//[\w.-]+\.smtcdns\.(?:net|com)/([\w.-]+\.bilivideo\.(?:com|cn|net)(?::\d{1,5})?)(/.*)$""",
+        """^(https?:)//[\w.-]+\.smtcdns\.(?:net|com)/((?:\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9]{2,59}))(?::\d{1,5})?)(/.*)$""",
         RegexOption.IGNORE_CASE
     )
 
@@ -209,10 +209,46 @@ object BtrLiveCore {
     fun unwrapProxyUrl(value: String): String {
         val match = PROXY_WRAP_REGEX.matchEntire(value.trim()) ?: return ""
         val scheme = match.groupValues[1]
-        val host = match.groupValues[2]
+        val authority = match.groupValues[2]
         val rest = match.groupValues[3]
-        return "$scheme//$host$rest"
+        if (!isValidUnwrappedAuthority(authority)) return ""
+        return "$scheme//$authority$rest"
     }
+
+    private fun isValidUnwrappedAuthority(authority: String): Boolean {
+        val hostPart: String
+        if (authority.startsWith("[")) {
+            val closeIdx = authority.indexOf(']')
+            if (closeIdx <= 1) return false
+            hostPart = authority.substring(1, closeIdx)
+            if (hostPart.count { it == ':' } < 2) return false
+            val suffix = authority.substring(closeIdx + 1)
+            if (suffix.isNotEmpty()) {
+                val port = suffix.removePrefix(":").toIntOrNull() ?: return false
+                if (port !in 1..65535) return false
+            }
+            return true
+        }
+        val colonIdx = authority.lastIndexOf(':')
+        if (colonIdx >= 0) {
+            hostPart = authority.substring(0, colonIdx)
+            val port = authority.substring(colonIdx + 1).toIntOrNull() ?: return false
+            if (port !in 1..65535) return false
+        } else {
+            hostPart = authority
+        }
+        if (hostPart.matches(IPV4_STRICT_HINT_REGEX)) {
+            val parts = hostPart.split('.')
+            if (parts.size != 4) return false
+            return parts.all { octet ->
+                val n = octet.toIntOrNull() ?: return@all false
+                n in 0..255
+            }
+        }
+        return hostPart.isNotEmpty()
+    }
+
+    private val IPV4_STRICT_HINT_REGEX = Regex("""^\d+\.\d+\.\d+\.\d+$""")
 
     fun segmentNumber(name: String): Long {
         val cleanName = name.substringBefore('?').substringBefore('#')
@@ -270,11 +306,12 @@ object BtrLiveCore {
         val normalized = unwrapProxyUrl(originalUrl).ifBlank { originalUrl }
         return try {
             val uri = URI(normalized)
+            val targetPort = if (newHost.equals(uri.host, ignoreCase = true)) uri.port else -1
             URI(
                 uri.scheme,
                 uri.userInfo,
                 newHost,
-                -1, // 移除特殊端口
+                targetPort, // 跨节点切换时移除异源特殊端口；同主机回落时保留端口
                 uri.path,
                 uri.query,
                 uri.fragment

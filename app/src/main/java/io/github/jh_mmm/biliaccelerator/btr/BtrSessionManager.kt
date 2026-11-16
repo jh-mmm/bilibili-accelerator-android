@@ -1,14 +1,27 @@
 package io.github.jh_mmm.biliaccelerator.btr
 
+import android.util.Log
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
+import io.github.jh_mmm.biliaccelerator.core.PlayinfoRefreshCallback
+import io.github.jh_mmm.biliaccelerator.core.PlayinfoRegistry
 import java.net.URLDecoder
 import java.util.Collections
 import java.util.UUID
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+
+interface PlayerConcurrencySink {
+    fun onStall(nowMs: Long = System.currentTimeMillis())
+    fun onBufferHunger(bufferedBytes: Long = 0L, nowMs: Long = System.currentTimeMillis())
+    fun onSlow(nowMs: Long = System.currentTimeMillis())
+}
 
 /**
  * 会话级拦截封禁名单（对齐 BTR cdn-resolver.js createBanList）：
@@ -200,16 +213,36 @@ data class BtrMediaSession(
     val config: AcceleratorConfig? = null,
     @Volatile var synthesizedMirrors: List<String> = emptyList(),
     @Volatile var urlDeadlineEpochSec: Long = 0L,
-    @Volatile var concurrencyController: Any? = null
+    @Volatile var concurrencyController: Any? = null,
+    @Volatile var proactiveRefreshTask: ScheduledFuture<*>? = null,
+    val refreshInFlight: AtomicBoolean = AtomicBoolean(false),
+    @Volatile var nextRefreshAllowedAtMs: Long = 0L,
+    val refreshConsecutiveFailures: AtomicInteger = AtomicInteger(0),
+    @Volatile var refreshProvider: PlayinfoRefreshCallback? = null
 )
 
 object BtrSessionManager {
 
+    private const val TAG = "BiliAccelerator-Session"
     private const val MAX_SESSIONS = 50
     private const val SESSION_TTL_MS = 30 * 60 * 1000L // 30 分钟无访问自动清理
+    internal const val PROACTIVE_REFRESH_LEAD_SEC = 120L
+    internal const val REFRESH_BASE_COOLDOWN_MS = 45_000L
+    internal const val REFRESH_MAX_COOLDOWN_MS = 300_000L
 
     private val sessions = ConcurrentHashMap<String, BtrMediaSession>()
     private val builderSessionMap = Collections.synchronizedMap(WeakHashMap<Any, String>())
+
+    private val refreshScheduler = ScheduledThreadPoolExecutor(1) { r ->
+        Thread(r, "BTR-SigRefresh").apply { isDaemon = true }
+    }.apply {
+        setKeepAliveTime(45L, TimeUnit.SECONDS)
+        allowCoreThreadTimeOut(true)
+        removeOnCancelPolicy = true
+    }
+
+    @Volatile
+    var defaultRefreshProvider: ((BtrMediaSession) -> Boolean)? = null
 
     @Volatile
     private var latestSessionId: String? = null
@@ -306,6 +339,7 @@ object BtrSessionManager {
         }
 
         val deadlineSec = BiliAcceleratorCore.extractUrlDeadlineSeconds(cleanPrimaryLiveUrl)
+        val refreshCb = if (!isLive) PlayinfoRegistry.findRefreshCallback(cleanPrimaryLiveUrl) else null
         val session = BtrMediaSession(
             sessionId = id,
             primaryUrl = cleanPrimaryLiveUrl,
@@ -318,10 +352,14 @@ object BtrSessionManager {
             liveHostPool = pool,
             config = config,
             synthesizedMirrors = synthesizedList,
-            urlDeadlineEpochSec = deadlineSec
+            urlDeadlineEpochSec = deadlineSec,
+            refreshProvider = refreshCb
         )
         sessions[id] = session
         latestSessionId = id
+        if (!isLive && deadlineSec > 0L) {
+            scheduleProactiveRefresh(session)
+        }
         return id
     }
 
@@ -329,6 +367,121 @@ object BtrSessionManager {
         val removed = sessions.remove(sessionId)
         if (removed != null) {
             onSessionEvicted(sessionId, removed)
+        }
+    }
+
+    fun attachRefreshProvider(sessionId: String, provider: PlayinfoRefreshCallback) {
+        val session = sessions[sessionId] ?: return
+        session.refreshProvider = provider
+        if (!session.isLive && session.urlDeadlineEpochSec > 0L) {
+            scheduleProactiveRefresh(session)
+        }
+    }
+
+    fun scheduleProactiveRefresh(session: BtrMediaSession, nowMs: Long = System.currentTimeMillis()) {
+        session.proactiveRefreshTask?.cancel(false)
+        session.proactiveRefreshTask = null
+        val deadlineSec = session.urlDeadlineEpochSec
+        if (session.isLive || deadlineSec <= 0L) return
+        if (sessions[session.sessionId] !== session) return
+
+        val triggerAtMs = (deadlineSec - PROACTIVE_REFRESH_LEAD_SEC) * 1000L
+        val delayMs = maxOf(0L, triggerAtMs - nowMs, session.nextRefreshAllowedAtMs - nowMs)
+        try {
+            session.proactiveRefreshTask = refreshScheduler.schedule(
+                {
+                    if (sessions[session.sessionId] === session) {
+                        runCatching { maybeTriggerProactiveRefresh(session) }
+                    }
+                },
+                delayMs,
+                TimeUnit.MILLISECONDS
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun maybeTriggerProactiveRefresh(
+        session: BtrMediaSession,
+        forceOnAuthFailure: Boolean = false,
+        nowMs: Long = System.currentTimeMillis()
+    ): Boolean {
+        if (session.isLive) return false
+        val currentDeadlineSec = session.urlDeadlineEpochSec
+
+        val cachedFresher = PlayinfoRegistry.findFresherTrack(session.primaryUrl, currentDeadlineSec)
+        if (cachedFresher != null && cachedFresher.deadlineEpochSec > currentDeadlineSec) {
+            refreshSignatureIfSamePath(cachedFresher.primaryUrl, cachedFresher.backupUrls)
+            if (session.urlDeadlineEpochSec > currentDeadlineSec) {
+                return true
+            }
+        }
+
+        val nowSec = nowMs / 1000L
+        val withinLeadWindow = currentDeadlineSec > 0L && nowSec >= (currentDeadlineSec - PROACTIVE_REFRESH_LEAD_SEC)
+        if (!forceOnAuthFailure && !withinLeadWindow) return false
+        if (nowMs < session.nextRefreshAllowedAtMs) return false
+
+        val provider = session.refreshProvider ?: PlayinfoRegistry.findRefreshCallback(session.primaryUrl)
+        val fallbackProvider = defaultRefreshProvider
+        if (provider == null && fallbackProvider == null) return false
+
+        if (!session.refreshInFlight.compareAndSet(false, true)) return false
+        return try {
+            val invokedOk = try {
+                if (provider != null) provider.refresh() else fallbackProvider!!.invoke(session)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Proactive signature refresh failed: ${t.message}")
+                false
+            }
+            val updatedTrack = PlayinfoRegistry.findFresherTrack(session.primaryUrl, currentDeadlineSec)
+            if (updatedTrack != null && updatedTrack.deadlineEpochSec > currentDeadlineSec) {
+                refreshSignatureIfSamePath(updatedTrack.primaryUrl, updatedTrack.backupUrls)
+            }
+            val advanced = session.urlDeadlineEpochSec > currentDeadlineSec || (forceOnAuthFailure && invokedOk)
+            if (advanced) {
+                session.refreshConsecutiveFailures.set(0)
+                session.nextRefreshAllowedAtMs = 0L
+                true
+            } else {
+                val failures = session.refreshConsecutiveFailures.incrementAndGet()
+                val cooldownMs = minOf(REFRESH_MAX_COOLDOWN_MS, REFRESH_BASE_COOLDOWN_MS * (1L shl minOf(failures - 1, 4)))
+                session.nextRefreshAllowedAtMs = nowMs + cooldownMs
+                scheduleProactiveRefresh(session, nowMs)
+                false
+            }
+        } finally {
+            session.refreshInFlight.set(false)
+        }
+    }
+
+    fun notifyPlayerStall(sessionId: String? = null, nowMs: Long = System.currentTimeMillis()) {
+        if (!sessionId.isNullOrBlank()) {
+            (sessions[sessionId]?.concurrencyController as? PlayerConcurrencySink)?.onStall(nowMs)
+            return
+        }
+        val cutoff = nowMs - 60_000L
+        for (s in sessions.values) {
+            if (!s.isLive && s.lastAccessed.get() >= cutoff) {
+                (s.concurrencyController as? PlayerConcurrencySink)?.onStall(nowMs)
+            }
+        }
+    }
+
+    fun notifyPlayerBufferHunger(
+        sessionId: String? = null,
+        bufferedBytes: Long = 0L,
+        nowMs: Long = System.currentTimeMillis()
+    ) {
+        if (!sessionId.isNullOrBlank()) {
+            (sessions[sessionId]?.concurrencyController as? PlayerConcurrencySink)?.onBufferHunger(bufferedBytes, nowMs)
+            return
+        }
+        val cutoff = nowMs - 60_000L
+        for (s in sessions.values) {
+            if (!s.isLive && s.lastAccessed.get() >= cutoff) {
+                (s.concurrencyController as? PlayerConcurrencySink)?.onBufferHunger(bufferedBytes, nowMs)
+            }
         }
     }
 
@@ -343,16 +496,37 @@ object BtrSessionManager {
             if (existingPath == newPath && newDeadline > session.urlDeadlineEpochSec) {
                 session.primaryUrl = primaryUrl
                 session.urlDeadlineEpochSec = newDeadline
+                session.refreshConsecutiveFailures.set(0)
+                session.nextRefreshAllowedAtMs = 0L
                 val donor = listOf(primaryUrl).plus(backupUrls).firstOrNull { !BiliAcceleratorCore.isRelayUrl(it) && !BiliAcceleratorCore.isAkamaiHost(it) } ?: primaryUrl
-                if (session.config != null) {
+                if (session.config != null || session.synthesizedMirrors.isNotEmpty()) {
                     session.synthesizedMirrors = synthesizeCompatibleBackups(donor, session.config, isEpisode = session.isEpisode)
                 }
-                updateBackups(session.sessionId, backupUrls)
+                val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(primaryUrl)
+                val validBackups = backupUrls.filter { it.isNotBlank() && it != primaryUrl }.distinct()
+                val isolatedBackups = if (isPrimaryRelay) {
+                    validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
+                } else {
+                    validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
+                }
+                session.backupUrls = if (!isPrimaryRelay && (session.config != null || session.synthesizedMirrors.isNotEmpty())) {
+                    (isolatedBackups + session.synthesizedMirrors).distinct().filter { it != primaryUrl }
+                } else if (isolatedBackups.isNotEmpty()) {
+                    isolatedBackups
+                } else {
+                    session.backupUrls.filter { url ->
+                        val d = BiliAcceleratorCore.extractUrlDeadlineSeconds(url)
+                        d <= 0L || d >= newDeadline
+                    }
+                }
+                scheduleProactiveRefresh(session)
             }
         }
     }
 
     private fun onSessionEvicted(sessionId: String, session: BtrMediaSession) {
+        session.proactiveRefreshTask?.cancel(false)
+        session.proactiveRefreshTask = null
         runCatching { BtrChunkEngine.cancelSessionCalls(sessionId) }
         if (session.isLive) {
             runCatching { BtrLiveEngine.onSessionEvicted(session) }
@@ -361,6 +535,10 @@ object BtrSessionManager {
 
     fun bindBuilderSession(builder: Any, sessionId: String) {
         builderSessionMap[builder] = sessionId
+    }
+
+    fun unbindBuilderSession(builder: Any) {
+        builderSessionMap.remove(builder)
     }
 
     fun getSessionForBuilder(builder: Any): String? {
@@ -383,7 +561,11 @@ object BtrSessionManager {
             validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
         }
         if (isolatedBackups.isNotEmpty()) {
-            current.backupUrls = if (current.config != null && !current.isLive && !isPrimaryRelay) {
+            val shouldKeepSynthesized = !current.isLive && !isPrimaryRelay && (
+                current.config != null ||
+                    (current.synthesizedMirrors.isNotEmpty() && isolatedBackups.none { !BiliAcceleratorCore.isAkamaiHost(it) })
+                )
+            current.backupUrls = if (shouldKeepSynthesized) {
                 val preservedAkamai = current.backupUrls.filter { BiliAcceleratorCore.isAkamaiHost(it) }
                 (isolatedBackups + preservedAkamai + current.synthesizedMirrors)
                     .distinct()
@@ -499,10 +681,8 @@ object BtrSessionManager {
 
         val candidateList = when {
             isCustom -> BiliAcceleratorCore.getEffectiveCdnPool(config!!)
-            isHkRegional -> BiliAcceleratorCore.HK_REGIONAL_CANDIDATE_POOL + BiliAcceleratorCore.OVERSEAS_CANDIDATE_POOL
-            host.contains("ov.bilivideo.com") || isAkamai || BiliAcceleratorCore.isOverseasEnvironment() ->
-                BiliAcceleratorCore.OVERSEAS_CANDIDATE_POOL
-            else -> BiliAcceleratorCore.MAINLAND_CANDIDATE_POOL
+            isHkRegional -> BiliAcceleratorCore.HK_REGIONAL_CANDIDATE_POOL + BiliAcceleratorCore.CANDIDATE_POOL
+            else -> BiliAcceleratorCore.CANDIDATE_POOL
         }
 
         val maxBackups = if (config != null) config.btrCdnPoolSize.coerceIn(1, candidateList.size) else minOf(8, candidateList.size)

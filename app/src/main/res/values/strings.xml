@@ -12,8 +12,6 @@
     <string name="label_module_enabled">启用视频加速与防卡顿</string>
     <string name="summary_module_enabled">控制全局 Hook 重定向与加速核心</string>
     <string name="label_target_host">首选 UPOS 镜像</string>
-    <string name="label_speed_test">测试 UPOS 节点延迟</string>
-    <string name="summary_speed_test">探测各镜像连接握手延迟（实际播放吞吐由 BTR 动态测算）</string>
     <string name="label_enable_pcdn_block">拦截 PCDN 调度节点</string>
     <string name="summary_enable_pcdn_block">阻断低质 P2P/CDN 调度，回退至官方高质量骨干网</string>
     <string name="label_enable_mcdn_proxy">MCDN 官方代理中继</string>
@@ -53,11 +51,4 @@
     <string name="toast_stats_cleared">统计数据已清空</string>
     <string name="toast_diag_copied">诊断报告已复制到剪贴板！</string>
     <string name="toast_log_copied">日志信息已复制到剪贴板</string>
-    <string name="speed_test_dialog_title">UPOS 镜像延迟探测</string>
-    <string name="speed_test_testing_desc">正在并发探测各节点 HTTPS 握手与首包响应时延...</string>
-    <string name="speed_test_done_desc">探测完成（仅反映握手 RTT，实际吞吐由 BTR 动态测算）。点击可直接切换：</string>
-    <string name="speed_test_retest">重新测速</string>
-    <string name="speed_test_testing">测试中…</string>
-    <string name="speed_test_timeout">超时/失败</string>
-    <string name="speed_test_current">当前使用</string>
 </resources>

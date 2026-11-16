@@ -19,6 +19,8 @@
 -keep class io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig { *; }
 -keep class io.github.jh_mmm.biliaccelerator.core.RewriteLogEntry { *; }
 -keep class io.github.jh_mmm.biliaccelerator.core.StatsSnapshot { *; }
+-keep class io.github.jh_mmm.biliaccelerator.core.SharedConcurrencyState { *; }
+-keep class io.github.jh_mmm.biliaccelerator.core.SharedTrackSummary { *; }
 -keep class io.github.jh_mmm.biliaccelerator.provider.RewriteResultDto { *; }
 
 # Keep LibXposed API 101 entry point and module rules

@@ -1,6 +1,8 @@
 package io.github.jh_mmm.biliaccelerator.btr
 
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.PlayinfoRefreshCallback
+import io.github.jh_mmm.biliaccelerator.core.PlayinfoRegistry
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
 import org.junit.Assert.assertEquals
@@ -8,6 +10,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.ByteArrayOutputStream
+import java.net.ServerSocket
+import java.util.concurrent.atomic.AtomicInteger
 
 class BtrEngineTest {
 
@@ -894,6 +899,614 @@ class BtrEngineTest {
         } finally {
             runCatching { mockCdn.close() }
             cdnThread.interrupt()
+        }
+    }
+
+    @Test
+    fun testDynamicConcurrencyMidStreamStepDownStallPushbackAndCrossProcessPersistence() {
+        val tempDir = java.nio.file.Files.createTempDirectory("btr_conc_persist").toFile()
+        try {
+            PlayinfoRegistry.resetForTesting(clearDir = true)
+            PlayinfoRegistry.configureSharedStateDir(tempDir)
+            BtrChunkEngine.resetConcurrencyPersistenceForTesting(clearDisk = true)
+
+            var now = 1_000_000L
+            val c1 = BtrChunkEngine.DynamicConcurrencyController(
+                initialConcurrency = 8,
+                autoScale = true,
+                minConcurrency = 2,
+                maxConcurrency = 16,
+                initialNowMs = now,
+                enablePersistence = true
+            )
+            assertEquals(8, c1.currentConcurrency)
+
+            // Buffer window full / partial active without queued work (even active = limit - 1, queued = 0) -> after >= 8s must step down mid-stream
+            c1.recordDemand(active = 7, limit = 8, queued = 0, nowMs = now)
+            now += 8_500L
+            c1.recordDemand(active = 1, limit = 8, queued = 0, nowMs = now)
+            assertEquals("Idle buffer window with queued=0 must step down concurrency mid-stream", 6, c1.currentConcurrency)
+
+            // Player stall must step UP concurrency (per idm-downloader.js) to rescue buffering
+            now += 3_000L
+            c1.onStall(nowMs = now)
+            assertEquals("Player stall must step up concurrency", 8, c1.currentConcurrency)
+
+            // Buffer hunger also steps UP after cooldown
+            now += 3_000L
+            c1.onBufferHunger(0L, nowMs = now)
+            assertEquals("Buffer hunger must step up concurrency", 12, c1.currentConcurrency)
+
+            // Hard 412/429 pushback drops concurrency and imposes hard cap that blocks even onStall
+            now += 1_000L
+            c1.onPushback(nowMs = now, isHard = true)
+            assertEquals(8, c1.currentConcurrency)
+            now += 4_000L
+            c1.onStall(nowMs = now)
+            assertEquals("Hard pushback resting cap must block stall step-up", 8, c1.currentConcurrency)
+
+            // Drop further via second hard pushback to 6 and verify cross-process persistence
+            now += 1_000L
+            c1.onPushback(nowMs = now, isHard = true)
+            assertEquals(6, c1.currentConcurrency)
+
+            // Simulate second process: clear in-memory cache but preserve concurrency_state.json on disk
+            BtrChunkEngine.resetConcurrencyPersistenceForTesting(clearDisk = false)
+            val c2 = BtrChunkEngine.DynamicConcurrencyController(
+                initialConcurrency = 12,
+                autoScale = true,
+                minConcurrency = 2,
+                maxConcurrency = 16,
+                initialNowMs = now + 2_000L,
+                enablePersistence = true
+            )
+            assertEquals("New process/session must honor persisted hardCap ceiling", 6, c2.currentConcurrency)
+
+            // Verify active=1, limit=2, queued=0 does NOT prevent idle step-down from 4 -> 2
+            BtrChunkEngine.resetConcurrencyPersistenceForTesting(clearDisk = true)
+            var t2 = 5_000_000L
+            val c3 = BtrChunkEngine.DynamicConcurrencyController(
+                initialConcurrency = 4,
+                autoScale = true,
+                minConcurrency = 2,
+                maxConcurrency = 8,
+                initialNowMs = t2,
+                enablePersistence = true
+            )
+            c3.recordDemand(active = 3, limit = 4, queued = 0, nowMs = t2)
+            t2 += 8_500L
+            c3.recordDemand(active = 1, limit = 4, queued = 0, nowMs = t2)
+            assertEquals("active < limit with queued=0 must step down 4 -> 2", 2, c3.currentConcurrency)
+            // Idle step-down must NOT poison next session's learned baseline down to 2
+            BtrChunkEngine.resetConcurrencyPersistenceForTesting(clearDisk = false)
+            val c4 = BtrChunkEngine.DynamicConcurrencyController(
+                initialConcurrency = 6,
+                autoScale = true,
+                minConcurrency = 2,
+                maxConcurrency = 16,
+                initialNowMs = t2 + 1_000L,
+                enablePersistence = true
+            )
+            assertEquals("Idle step-down must not drag next session startup below initial", 6, c4.currentConcurrency)
+        } finally {
+            BtrChunkEngine.resetConcurrencyPersistenceForTesting(clearDisk = true)
+            PlayinfoRegistry.resetForTesting(clearDir = true)
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun testProactiveSignatureRefreshWindowBackoffAnd403Recovery() {
+        val nowMs = System.currentTimeMillis()
+        val nowSec = nowMs / 1000L
+        val nearExpiryUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/00/sigtest.m4s?deadline=${nowSec + 60}&token=old"
+        val attempts = AtomicInteger(0)
+
+        val sid = BtrSessionManager.register(primaryUrl = nearExpiryUrl, config = null)
+        try {
+            BtrSessionManager.attachRefreshProvider(sid) {
+                attempts.incrementAndGet()
+                false
+            }
+            val session = BtrSessionManager.get(sid)!!
+            // Cancel any async timer race before deterministic calls
+            session.proactiveRefreshTask?.cancel(false)
+
+            val firstFail = BtrSessionManager.maybeTriggerProactiveRefresh(session, nowMs = nowMs)
+            assertFalse(firstFail)
+            assertEquals(1, attempts.get())
+
+            // Within 45s exponential backoff cooldown: must NOT invoke provider again
+            val duringCooldown = BtrSessionManager.maybeTriggerProactiveRefresh(session, nowMs = nowMs + 10_000L)
+            assertFalse(duringCooldown)
+            assertEquals("Backoff must suppress repeated refreshes during cooldown", 1, attempts.get())
+
+            // After cooldown, return a fresh signed URL with deadline + 3600s
+            val freshUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/00/sigtest.m4s?deadline=${nowSec + 3600}&token=fresh"
+            BtrSessionManager.attachRefreshProvider(sid) {
+                attempts.incrementAndGet()
+                BtrSessionManager.refreshSignatureIfSamePath(freshUrl, emptyList())
+                true
+            }
+            val recovered = BtrSessionManager.maybeTriggerProactiveRefresh(session, nowMs = nowMs + 50_000L)
+            assertTrue("Proactive refresh must succeed once cooldown passes", recovered)
+            assertEquals(freshUrl, session.primaryUrl)
+            assertEquals(nowSec + 3600L, session.urlDeadlineEpochSec)
+        } finally {
+            BtrSessionManager.remove(sid)
+        }
+
+        // End-to-end BtrChunkEngine 403 -> forced refresh -> 200 recovery
+        val payload = ByteArray(1024) { (it % 131).toByte() }
+        val mockCdn = ServerSocket(0)
+        val thread = Thread {
+            while (!mockCdn.isClosed) {
+                val sock = try { mockCdn.accept() } catch (_: Throwable) { break }
+                sock.use { s ->
+                    val reader = s.getInputStream().bufferedReader()
+                    val reqLine = reader.readLine() ?: return@use
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (line.isEmpty()) break
+                    }
+                    val out = s.getOutputStream()
+                    if (!reqLine.contains("fresh=1")) {
+                        out.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                    } else {
+                        val hdr = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes 0-${payload.size - 1}/${payload.size}\r\nContent-Length: ${payload.size}\r\nConnection: close\r\n\r\n"
+                        out.write(hdr.toByteArray())
+                        out.write(payload)
+                    }
+                    out.flush()
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        var sid403 = ""
+        try {
+            BtrLocalProxyServer.start()
+            val port = BtrLocalProxyServer.port
+            val expiredUrl = "http://127.0.0.1:${mockCdn.localPort}/upgcxcode/88/77/403recover.m4s?deadline=100"
+            val freshUrl = "http://127.0.0.1:${mockCdn.localPort}/upgcxcode/88/77/403recover.m4s?deadline=${(System.currentTimeMillis() / 1000L) + 3600}&fresh=1"
+            sid403 = BtrSessionManager.register(expiredUrl)
+            BtrSessionManager.attachRefreshProvider(sid403) {
+                BtrSessionManager.refreshSignatureIfSamePath(freshUrl, emptyList())
+                true
+            }
+            val conn = java.net.URL("http://127.0.0.1:$port/stream/$sid403/video.m4s").openConnection() as java.net.HttpURLConnection
+            assertEquals(200, conn.responseCode)
+            val body = conn.inputStream.use { it.readBytes() }
+            assertTrue("Client must receive full recovered payload after 403 refresh", payload.contentEquals(body))
+        } finally {
+            if (sid403.isNotBlank()) BtrSessionManager.remove(sid403)
+            runCatching { mockCdn.close() }
+            thread.interrupt()
+        }
+
+        // End-to-end mid-stream/seek 403 recovery inside fetchChunkWithFailover (when cached totalLength skips probe)
+        val fullVideo = ByteArray(150_000) { (it % 223).toByte() }
+        val seekExpired = AtomicInteger(0)
+        val mockSeekCdn = ServerSocket(0)
+        val seekThread = Thread {
+            while (!mockSeekCdn.isClosed) {
+                val sock = try { mockSeekCdn.accept() } catch (_: Throwable) { break }
+                Thread {
+                    sock.use { s ->
+                        val reader = s.getInputStream().bufferedReader()
+                        val reqLine = reader.readLine() ?: return@use
+                        var rangeHdr = ""
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                            if (line.startsWith("Range:", ignoreCase = true)) {
+                                rangeHdr = line.substringAfter(':').trim()
+                            }
+                        }
+                        val out = s.getOutputStream()
+                        if (seekExpired.get() == 1 && !reqLine.contains("fresh=2")) {
+                            out.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                            out.flush()
+                            return@use
+                        }
+                        val parts = rangeHdr.removePrefix("bytes=").split("-")
+                        val start = parts.getOrNull(0)?.toIntOrNull() ?: 0
+                        val end = minOf(parts.getOrNull(1)?.toIntOrNull() ?: (fullVideo.size - 1), fullVideo.size - 1)
+                        val len = (end - start + 1).coerceAtLeast(0)
+                        val hdr = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes $start-$end/${fullVideo.size}\r\nContent-Length: $len\r\nConnection: close\r\n\r\n"
+                        out.write(hdr.toByteArray())
+                        out.write(fullVideo, start, len)
+                        out.flush()
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+        }.apply { isDaemon = true; start() }
+
+        var sidSeek = ""
+        try {
+            BtrLocalProxyServer.start()
+            val port = BtrLocalProxyServer.port
+            val initialUrl = "http://127.0.0.1:${mockSeekCdn.localPort}/upgcxcode/88/77/seek403.m4s?deadline=${(System.currentTimeMillis() / 1000L) + 600}"
+            val refreshedUrl = "http://127.0.0.1:${mockSeekCdn.localPort}/upgcxcode/88/77/seek403.m4s?deadline=${(System.currentTimeMillis() / 1000L) + 3600}&fresh=2"
+            sidSeek = BtrSessionManager.register(initialUrl)
+            BtrSessionManager.attachRefreshProvider(sidSeek) {
+                BtrSessionManager.refreshSignatureIfSamePath(refreshedUrl, emptyList())
+                true
+            }
+            // Request 1 caches totalLength metadata
+            val cInit = java.net.URL("http://127.0.0.1:$port/stream/$sidSeek/seek.m4s").openConnection() as java.net.HttpURLConnection
+            cInit.setRequestProperty("Range", "bytes=0-1023")
+            assertEquals(206, cInit.responseCode)
+            assertEquals(1024, cInit.inputStream.use { it.readBytes() }.size)
+
+            // Now expire signature on CDN and seek (>0 offset, skips probe!) -> fetchChunkWithFailover must refresh on 403 and deliver exact slice
+            seekExpired.set(1)
+            val cSeek = java.net.URL("http://127.0.0.1:$port/stream/$sidSeek/seek.m4s").openConnection() as java.net.HttpURLConnection
+            cSeek.setRequestProperty("Range", "bytes=70000-120000")
+            assertEquals(206, cSeek.responseCode)
+            val seekBytes = cSeek.inputStream.use { it.readBytes() }
+            assertEquals(50_001, seekBytes.size)
+            assertTrue(fullVideo.copyOfRange(70_000, 120_001).contentEquals(seekBytes))
+        } finally {
+            if (sidSeek.isNotBlank()) BtrSessionManager.remove(sidSeek)
+            runCatching { mockSeekCdn.close() }
+            seekThread.interrupt()
+        }
+    }
+
+    @Test
+    fun testLiveFlvStream404NoPenalty500SinglePenaltyAndTimeoutClosesResponse() {
+        val mode = AtomicInteger(404)
+        val mockFlv = ServerSocket(0)
+        val serverThread = Thread {
+            while (!mockFlv.isClosed) {
+                val sock = try { mockFlv.accept() } catch (_: Throwable) { break }
+                Thread {
+                    sock.use { s ->
+                        val reader = s.getInputStream().bufferedReader()
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                        }
+                        val out = s.getOutputStream()
+                        when (mode.get()) {
+                            404 -> {
+                                out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                                out.flush()
+                            }
+                            500 -> {
+                                out.write("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                                out.flush()
+                            }
+                            else -> {
+                                // Stall past FLV race timeout then send 200 OK
+                                runCatching { Thread.sleep(220L) }
+                                runCatching {
+                                    out.write("HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\n\r\nFLVDATA".toByteArray())
+                                    out.flush()
+                                }
+                            }
+                        }
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val banEvents = AtomicInteger(0)
+        var sid = ""
+        try {
+            val url = "http://127.0.0.1:${mockFlv.localPort}/live-bvc/room1.flv"
+            sid = BtrSessionManager.register(url, isLive = true)
+            val session = BtrSessionManager.get(sid)!!
+            val pool = BtrLiveHostPool { banEvents.incrementAndGet() }.apply {
+                add("127.0.0.1", proven = false)
+            }
+            session.liveHostPool = pool
+
+            // 1. 404 must NOT penalize host (state stays untested, emptyReplies/failures stay 0)
+            mode.set(404)
+            val out404 = ByteArrayOutputStream()
+            assertFalse(BtrLiveEngine.pipeLiveFlvStream(session, emptyMap(), out404, timeoutMs = 1500L))
+            val statusAfter404 = pool.status().first { it.host == "127.0.0.1" }
+            assertEquals("FLV 404 must not block/penalize host", "untested", statusAfter404.state)
+            assertEquals(0, banEvents.get())
+
+            // 2. Single 500 must record at most ONE failure (emptyReplies < 2 -> NOT banned yet)
+            mode.set(500)
+            val out500 = ByteArrayOutputStream()
+            assertFalse(BtrLiveEngine.pipeLiveFlvStream(session, emptyMap(), out500, timeoutMs = 1500L))
+            val statusAfter500 = pool.status().first { it.host == "127.0.0.1" }
+            assertEquals("Single FLV 500 must block host once, NOT double-penalize to banned", "blocked", statusAfter500.state)
+            assertEquals(0, banEvents.get())
+
+            // 3. Timeout race must complete cleanly and seal winnerFuture without leaking Response
+            mode.set(999)
+            val outTimeout = ByteArrayOutputStream()
+            assertFalse(BtrLiveEngine.pipeLiveFlvStream(session, emptyMap(), outTimeout, timeoutMs = 90L))
+            assertTrue(outTimeout.toString("UTF-8").contains("502"))
+        } finally {
+            if (sid.isNotBlank()) BtrSessionManager.remove(sid)
+            runCatching { mockFlv.close() }
+            serverThread.interrupt()
+        }
+    }
+
+    @Test
+    fun testBtrChunkEngineUncached416Malformed200SequentialFailoverTrialAndChunkTaskPrefix() {
+        // 1. shouldAllowUnmeasuredTrial periodic exploration
+        assertFalse(BtrChunkEngine.shouldAllowUnmeasuredTrial(0L, 1000L))
+        assertFalse(BtrChunkEngine.shouldAllowUnmeasuredTrial(1L, 1000L))
+        assertTrue(BtrChunkEngine.shouldAllowUnmeasuredTrial(2L, 1000L))
+        assertTrue(BtrChunkEngine.shouldAllowUnmeasuredTrial(8L, 1000L))
+        assertFalse(BtrChunkEngine.shouldAllowUnmeasuredTrial(3L, 1000L))
+        assertTrue(BtrChunkEngine.shouldAllowUnmeasuredTrial(997L, 1000L))
+
+        // 2. HTTP 200 with Content-Range rejected by isValidContentRange
+        val dummySession = BtrMediaSession("s1", "https://upos-sz-mirrorcos.bilivideo.com/a.m4s", emptyList(), null)
+        assertFalse(BtrChunkEngine.isValidContentRange(200, "bytes 0-9/10", 0L, dummySession))
+        assertTrue(BtrChunkEngine.isValidContentRange(200, null, 0L, dummySession))
+
+        // 3. ChunkTask prefix contention: primary stalled <32KB, hedge saved 40KB, primary writes 2KB more then fails
+        val task = BtrChunkEngine.ChunkTask(0L, 0L, 128 * 1024L - 1L)
+        assertTrue(task.tryClaimPrefixProducer(1L))
+        task.appendLivePrefix(1L, ByteArray(10 * 1024) { 1 }, 10 * 1024, 128 * 1024)
+        val fallback40k = ByteArray(40 * 1024) { 7 }
+        task.saveFallbackPrefixIfBetter(fallback40k, fallback40k.size)
+        task.appendLivePrefix(1L, ByteArray(2 * 1024) { 1 }, 2 * 1024, 128 * 1024)
+        task.releasePrefixProducer(1L, keepPartial = true)
+        val snap = task.takePrefixSnapshot(32 * 1024, 128 * 1024)
+        assertNotNull("Fallback 40KB prefix must NOT be hidden when primary releases <32KB buffer", snap)
+        assertEquals(40 * 1024, snap!!.size)
+
+        // 4. Mock servers for uncached 416 + malformed 200 + sequential IOException / clean-truncation failover
+        val totalSeqPayload = ByteArray(150 * 1024) { (it % 241).toByte() }
+        val scenarioMode = AtomicInteger(0) // 0=416, 1=malformed200, 2=seqPrimaryDropPartial, 3=seqPrimaryCleanTruncate
+        val mockCdn1 = ServerSocket(0)
+        val mockCdn2 = ServerSocket(0)
+
+        fun serveCdn(ss: ServerSocket, isPrimary: Boolean): Thread = Thread {
+            while (!ss.isClosed) {
+                val sock = try { ss.accept() } catch (_: Throwable) { break }
+                Thread {
+                    sock.use { s ->
+                        val reader = s.getInputStream().bufferedReader()
+                        var rangeHeader = ""
+                        reader.readLine() ?: return@use
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                            if (line.startsWith("Range:", ignoreCase = true)) {
+                                rangeHeader = line.substringAfter(':').trim()
+                            }
+                        }
+                        val (start, end) = if (rangeHeader.startsWith("bytes=")) {
+                            val parts = rangeHeader.removePrefix("bytes=").split("-")
+                            (parts.getOrNull(0)?.toLongOrNull() ?: 0L).toInt() to (parts.getOrNull(1)?.toLongOrNull()?.toInt() ?: (totalSeqPayload.size - 1))
+                        } else {
+                            0 to (totalSeqPayload.size - 1)
+                        }
+                        val out = s.getOutputStream()
+                        when (scenarioMode.get()) {
+                            0 -> {
+                                out.write("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */10240\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                                out.flush()
+                            }
+                            1 -> {
+                                val fakeBody = ByteArray(1024) { 9 }
+                                out.write("HTTP/1.1 200 OK\r\nContent-Range: bytes 0-1023/1024\r\nContent-Length: ${fakeBody.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                                out.write(fakeBody)
+                                out.flush()
+                            }
+                            2 -> {
+                                val cappedEnd = minOf(end, totalSeqPayload.size - 1)
+                                val len = (cappedEnd - start + 1).coerceAtLeast(0)
+                                val hdr = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes $start-$cappedEnd/*\r\nContent-Length: $len\r\nConnection: close\r\n\r\n"
+                                out.write(hdr.toByteArray())
+                                if (isPrimary && start > 0) {
+                                    // Write partial 16KB then drop TCP abruptly (IOException) to trigger failover to mockCdn2
+                                    val partial = minOf(len, 16 * 1024)
+                                    out.write(totalSeqPayload, start, partial)
+                                    out.flush()
+                                    runCatching { s.setSoLinger(true, 0) }
+                                } else {
+                                    out.write(totalSeqPayload, start, len)
+                                    out.flush()
+                                }
+                            }
+                            else -> {
+                                // Clean premature EOF (declared Content-Length larger than bytes sent, or 0 bytes) without RST
+                                val cappedEnd = minOf(end, totalSeqPayload.size - 1)
+                                val len = (cappedEnd - start + 1).coerceAtLeast(0)
+                                if (isPrimary && start > 0) {
+                                    val hdr = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes $start-$cappedEnd/*\r\nContent-Length: $len\r\nConnection: close\r\n\r\n"
+                                    out.write(hdr.toByteArray())
+                                    out.write(totalSeqPayload, start, minOf(len, 8192))
+                                    out.flush()
+                                } else {
+                                    val hdr = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes $start-$cappedEnd/*\r\nContent-Length: $len\r\nConnection: close\r\n\r\n"
+                                    out.write(hdr.toByteArray())
+                                    out.write(totalSeqPayload, start, len)
+                                    out.flush()
+                                }
+                            }
+                        }
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val t1 = serveCdn(mockCdn1, true)
+        val t2 = serveCdn(mockCdn2, false)
+
+        try {
+            BtrLocalProxyServer.start()
+            val port = BtrLocalProxyServer.port
+
+            // (a) Uncached 416 propagates 416 instead of 502 without banning host
+            scenarioMode.set(0)
+            val url416 = "http://127.0.0.1:${mockCdn1.localPort}/test/oob.m4s"
+            val sid416 = BtrSessionManager.register(url416)
+            val conn416 = java.net.URL("http://127.0.0.1:$port/stream/$sid416/oob.m4s").openConnection() as java.net.HttpURLConnection
+            conn416.setRequestProperty("Range", "bytes=50000-51000")
+            assertEquals("Uncached upstream 416 must return 416 not 502", 416, conn416.responseCode)
+            assertFalse("416 must not ban CDN host", BtrSessionManager.get(sid416)!!.banList.isBanned(url416, "127.0.0.1"))
+            BtrSessionManager.remove(sid416)
+
+            // (b) Malformed 200 with Content-Range is rejected with 502
+            scenarioMode.set(1)
+            val urlMalformed = "http://127.0.0.1:${mockCdn1.localPort}/test/bad200.m4s"
+            val sidMalformed = BtrSessionManager.register(urlMalformed)
+            val connMalformed = java.net.URL("http://127.0.0.1:$port/stream/$sidMalformed/bad200.m4s").openConnection() as java.net.HttpURLConnection
+            connMalformed.setRequestProperty("Range", "bytes=0-1023")
+            assertEquals("Malformed HTTP 200 with Content-Range must be rejected", 502, connMalformed.responseCode)
+            BtrSessionManager.remove(sidMalformed)
+
+            // (d) pipeRemainingSequential mid-transfer upstream IOException fails over to backup CDN2
+            scenarioMode.set(2)
+            val urlSeq1 = "http://127.0.0.1:${mockCdn1.localPort}/test/seq.m4s"
+            val urlSeq2 = "http://127.0.0.1:${mockCdn2.localPort}/test/seq.m4s"
+            val sidSeq = BtrSessionManager.register(urlSeq1, listOf(urlSeq2))
+            val connSeq = java.net.URL("http://127.0.0.1:$port/stream/$sidSeq/seq.m4s").openConnection() as java.net.HttpURLConnection
+            assertEquals(200, connSeq.responseCode)
+            val receivedSeq = connSeq.inputStream.use { it.readBytes() }
+            assertEquals("Sequential failover must deliver exact total bytes", totalSeqPayload.size, receivedSeq.size)
+            assertTrue("Sequential failover bytes must match payload identically", totalSeqPayload.contentEquals(receivedSeq))
+            BtrSessionManager.remove(sidSeq)
+
+            // (d2) pipeRemainingSequential clean premature truncation (below Content-Length) must fail over, not stop as EOF
+            scenarioMode.set(3)
+            val sidSeqTrunc = BtrSessionManager.register(urlSeq1, listOf(urlSeq2))
+            val connSeqTrunc = java.net.URL("http://127.0.0.1:$port/stream/$sidSeqTrunc/seq.m4s").openConnection() as java.net.HttpURLConnection
+            assertEquals(200, connSeqTrunc.responseCode)
+            val receivedSeqTrunc = connSeqTrunc.inputStream.use { it.readBytes() }
+            assertEquals("Clean premature truncation must fail over to CDN2", totalSeqPayload.size, receivedSeqTrunc.size)
+            assertTrue(totalSeqPayload.contentEquals(receivedSeqTrunc))
+            BtrSessionManager.remove(sidSeqTrunc)
+        } finally {
+            runCatching { mockCdn1.close() }
+            runCatching { mockCdn2.close() }
+            t1.interrupt()
+            t2.interrupt()
+        }
+    }
+
+    @Test
+    fun testLiveUnwrapGenericHostsRedirectBaseUrlIframeKeyAndDynamicHostProbe() {
+        // 1. Generic unwrapProxyUrl (hostname, IPv4, IPv6, rejects version paths / invalid ports)
+        assertEquals(
+            "https://cdn.example.org:8443/live-bvc/room.flv?token=1",
+            BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/cdn.example.org:8443/live-bvc/room.flv?token=1")
+        )
+        assertEquals(
+            "http://1.2.3.4:8080/live-bvc/room.m4s",
+            BtrLiveCore.unwrapProxyUrl("http://proxy.smtcdns.com/1.2.3.4:8080/live-bvc/room.m4s")
+        )
+        assertEquals(
+            "https://[2408:871a:10::1]:443/live-bvc/room.m4s",
+            BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/[2408:871a:10::1]:443/live-bvc/room.m4s")
+        )
+        assertEquals("", BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/v1.0/live/room.m4s"))
+        assertEquals("", BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/api.v2/live/room.m4s"))
+        assertEquals("", BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/999.0.0.1/live/room.m4s"))
+        assertEquals("", BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/cdn.example.org:99999/live.m4s"))
+
+        // 2. #EXT-X-I-FRAME-STREAM-INF in master playlist & #EXT-X-KEY in media playlist
+        val master = """
+            #EXTM3U
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="aud",URI="audio/a.m3u8"
+            #EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=80000,URI="iframe/i.m3u8"
+            #EXT-X-STREAM-INF:BANDWIDTH=1200000
+            video/v.m3u8
+        """.trimIndent()
+        val rewrittenMaster = BtrLiveEngine.rewriteMasterPlaylistContent(
+            master,
+            "https://live.example.com/root/master.m3u8",
+            "sidM",
+            45678
+        )
+        assertTrue(rewrittenMaster.contains("http://127.0.0.1:45678/stream/sidM/playlist.m3u8?url=https%3A%2F%2Flive.example.com%2Froot%2Fiframe%2Fi.m3u8"))
+
+        val mediaPlaylist = """
+            #EXTM3U
+            #EXT-X-MAP:URI="init.mp4"
+            #EXT-X-KEY:METHOD=AES-128,URI="keys/k.key"
+            #EXTINF:1.0,
+            101.m4s
+        """.trimIndent()
+        val rewrittenMedia = BtrLiveEngine.rewritePlaylistContent(
+            mediaPlaylist,
+            "https://live.example.com/sub/dir/live.m3u8",
+            "sidM",
+            45678
+        )
+        assertTrue(rewrittenMedia.contains("""URI="https://live.example.com/sub/dir/keys/k.key""""))
+
+        // 3. pipePlaylist uses post-redirect resp.request.url + probeCandidates probes dynamically added hosts
+        BtrLiveEngine.clearCache()
+        val mockLive = ServerSocket(0)
+        val liveThread = Thread {
+            while (!mockLive.isClosed) {
+                val sock = try { mockLive.accept() } catch (_: Throwable) { break }
+                Thread {
+                    sock.use { s ->
+                        val reader = s.getInputStream().bufferedReader()
+                        val reqLine = reader.readLine() ?: return@use
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                        }
+                        val out = s.getOutputStream()
+                        when {
+                            reqLine.contains("/entry.m3u8") -> {
+                                out.write("HTTP/1.1 302 Found\r\nLocation: /cdn/edge/sub/live.m3u8\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                            }
+                            reqLine.contains("/cdn/edge/sub/live.m3u8") -> {
+                                val m3u8 = "#EXTM3U\n#EXT-X-MAP:URI=\"h.mp4\"\n#EXTINF:1.0,\nseg100.m4s\n"
+                                out.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: ${m3u8.length}\r\nConnection: close\r\n\r\n$m3u8".toByteArray())
+                            }
+                            else -> {
+                                val seg = ByteArray(1024) { 4 }
+                                out.write("HTTP/1.1 200 OK\r\nContent-Length: ${seg.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                                out.write(seg)
+                            }
+                        }
+                        out.flush()
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+        }.apply { isDaemon = true; start() }
+
+        var liveSid = ""
+        try {
+            val entryUrl = "http://127.0.0.1:${mockLive.localPort}/entry.m3u8"
+            liveSid = BtrSessionManager.register(entryUrl, isLive = true)
+            val liveSession = BtrSessionManager.get(liveSid)!!
+            liveSession.liveHostPool = BtrLiveHostPool().apply { add("127.0.0.1", proven = false) }
+            val outBuf = ByteArrayOutputStream()
+            assertTrue(BtrLiveEngine.pipePlaylist(liveSession, "/stream/$liveSid/playlist.m3u8", emptyMap(), outBuf, 45678, keepAlive = true))
+            val responseText = outBuf.toString("UTF-8")
+            assertTrue("Response must be 200 OK", responseText.startsWith("HTTP/1.1 200 OK"))
+            assertTrue(
+                "Relative segments must resolve against post-redirect URL /cdn/edge/sub/",
+                responseText.contains("http%3A%2F%2F127.0.0.1%3A${mockLive.localPort}%2Fcdn%2Fedge%2Fsub%2Fseg100.m4s")
+            )
+
+            // Add new unproven host dynamically later via updateBackups and verify probeCandidates probes it
+            val pool = liveSession.liveHostPool!!
+            BtrSessionManager.updateBackups(liveSid, listOf("https://nonexistent.invalid/cdn/edge/sub/seg100.m4s"))
+            BtrLiveEngine.probeCandidates(liveSession, "http://127.0.0.1:${mockLive.localPort}/cdn/edge/sub/seg100.m4s")
+            val deadline = System.currentTimeMillis() + 3000L
+            while (System.currentTimeMillis() < deadline) {
+                val st = pool.status().firstOrNull { it.host == "nonexistent.invalid" }?.state
+                if (st != null && st != "untested") break
+                Thread.sleep(20L)
+            }
+            val lateHostState = pool.status().firstOrNull { it.host == "nonexistent.invalid" }?.state
+            assertTrue("Dynamically added backup host must be probed instead of skipped (state=$lateHostState)", lateHostState != "untested")
+        } finally {
+            if (liveSid.isNotBlank()) BtrSessionManager.remove(liveSid)
+            BtrLiveEngine.clearCache()
+            runCatching { mockLive.close() }
+            liveThread.interrupt()
         }
     }
 }
