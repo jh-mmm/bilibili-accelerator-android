@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "io.github.jh_mmm.biliaccelerator"
-    compileSdk = 35
+    compileSdk = 36
 
     val appVersionCode = 200
     val appVersionName = "2.0.0-preview.2"
@@ -103,6 +103,12 @@ android {
 dependencies {
     implementation(platform("org.jetbrains.kotlin:kotlin-bom:2.0.21"))
     compileOnly("io.github.libxposed:api:101.0.0")
+    implementation("io.github.libxposed:interface:101.0.0") {
+        exclude(group = "org.jetbrains.kotlin")
+    }
+    implementation("io.github.libxposed:service:101.0.0") {
+        exclude(group = "org.jetbrains.kotlin")
+    }
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("com.google.code.gson:gson:2.11.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

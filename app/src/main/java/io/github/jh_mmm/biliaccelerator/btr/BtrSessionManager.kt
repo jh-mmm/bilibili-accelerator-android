@@ -11,24 +11,76 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * 会话级拦截封禁名单（对齐 BTR createBanList）：
- * 区分单条 URL 地址鉴权失败 (address: 403/404/410) 与节点级限流/宕机 (node: 412/429/5xx/超时)，
- * 避免某一视频的签名地址被单节点拒收时全局拉黑健康的 CDN 节点，影响其他正常播放。
+ * 会话级拦截封禁名单（对齐 BTR cdn-resolver.js createBanList）：
+ * - 基于 goodNodes 与 goodAddresses 交叉归因的三元责任判定 (node / address / pair)，
+ *   避免冷启动首次 403/410 在未知过错方时误杀无辜节点或全池清空；
+ * - 叠加单 URL / 单主机短时指数退避 (blockedUntil)，兼顾快速隔离与可恢复重试。
  */
 class SessionBanList {
     private val goodHosts = ConcurrentHashMap.newKeySet<String>()
-    private val goodUrls = ConcurrentHashMap.newKeySet<String>()
-    private val bannedUrls = ConcurrentHashMap<String, Long>()
-    private val bannedHosts = ConcurrentHashMap<String, Long>()
+    private val goodAddresses = ConcurrentHashMap.newKeySet<String>()
+    private val emptyReplies = ConcurrentHashMap<String, Int>()
+    private val permanentBans = ConcurrentHashMap.newKeySet<String>()
+    private val urlBlockedUntil = ConcurrentHashMap<String, Long>()
+    private val urlFailures = ConcurrentHashMap<String, Int>()
+    private val hostBlockedUntil = ConcurrentHashMap<String, Long>()
+    private val hostFailures = ConcurrentHashMap<String, Int>()
+
+    private fun addressOf(url: String): String {
+        if (url.isBlank()) return ""
+        return runCatching {
+            val uri = java.net.URI(url)
+            val path = uri.rawPath.orEmpty()
+            val q = uri.rawQuery
+            if (!q.isNullOrEmpty()) "$path?$q" else path
+        }.getOrElse { url }
+    }
+
+    private fun judge() {
+        val strikes = HashMap<String, Int>()
+        for ((key, count) in emptyReplies) {
+            val parts = key.split('\n')
+            if (parts.size < 3) continue
+            val node = parts[0]
+            val address = parts[1]
+            val refused = parts[2].isNotEmpty()
+            val blamed = when {
+                !refused -> "node:$node"
+                goodHosts.contains(node) -> if (goodAddresses.contains(address)) "pair:$node $address" else "address:$address"
+                goodAddresses.contains(address) -> "node:$node"
+                else -> ""
+            }
+            if (blamed.isNotEmpty()) {
+                strikes[blamed] = (strikes[blamed] ?: 0) + count
+            }
+        }
+        permanentBans.clear()
+        for ((blamedKey, strikeCount) in strikes) {
+            if (strikeCount >= 2) {
+                permanentBans.add(blamedKey)
+            }
+        }
+    }
 
     fun recordSuccess(url: String, host: String) {
+        val address = addressOf(url)
+        var changed = false
         if (url.isNotBlank()) {
-            goodUrls.add(url)
-            bannedUrls.remove(url)
+            urlBlockedUntil.remove(url)
+            urlFailures.remove(url)
+        }
+        if (address.isNotBlank() && goodAddresses.add(address)) {
+            changed = true
         }
         if (host.isNotBlank()) {
-            goodHosts.add(host)
-            bannedHosts.remove(host)
+            hostBlockedUntil.remove(host)
+            hostFailures.remove(host)
+            if (goodHosts.add(host)) {
+                changed = true
+            }
+        }
+        if (changed) {
+            judge()
         }
     }
 
@@ -36,43 +88,90 @@ class SessionBanList {
      * 记录 HTTP 状态码故障。
      * @return true 表示属于节点限流或服务端故障，可额外施加全局短时冷却；false 表示仅当前地址或单会话鉴权隔离。
      */
-    fun recordHttpFailure(url: String, host: String, code: Int, now: Long = System.currentTimeMillis()): Boolean {
+    fun recordHttpFailure(
+        url: String,
+        host: String,
+        code: Int,
+        now: Long = System.currentTimeMillis(),
+        receivedBytes: Long = 0L
+    ): Boolean {
+        val address = addressOf(url)
         return when {
             code == 403 || code == 404 || code == 410 -> {
                 if (url.isNotBlank()) {
-                    bannedUrls[url] = Long.MAX_VALUE
+                    val f = (urlFailures[url] ?: 0) + 1
+                    urlFailures[url] = f
+                    val backoffMs = minOf(60_000L, 3_000L * (1 shl minOf(f - 1, 4)))
+                    urlBlockedUntil[url] = now + backoffMs
                 }
-                if (host.isNotBlank() && !goodHosts.contains(host)) {
-                    bannedHosts[host] = now + 30_000L
+                if (receivedBytes <= 0L && host.isNotBlank() && address.isNotBlank()) {
+                    val key = "$host\n$address\nrefused"
+                    emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
+                    judge()
                 }
                 false
             }
             code == 412 || code == 429 -> {
                 if (host.isNotBlank()) {
                     val ttl = if (code == 429) 45_000L else 30_000L
-                    bannedHosts[host] = now + ttl
+                    hostBlockedUntil[host] = now + ttl
+                    if (receivedBytes <= 0L && address.isNotBlank()) {
+                        val key = "$host\n$address\n"
+                        emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
+                        judge()
+                    }
                 }
                 true
             }
             else -> {
                 if (host.isNotBlank()) {
-                    bannedHosts[host] = now + 20_000L
+                    val f = (hostFailures[host] ?: 0) + 1
+                    hostFailures[host] = f
+                    val backoffMs = minOf(30_000L, 3_000L * (1 shl minOf(f - 1, 3)))
+                    hostBlockedUntil[host] = now + backoffMs
+                    if (receivedBytes <= 0L && address.isNotBlank()) {
+                        val key = "$host\n$address\n"
+                        emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
+                        judge()
+                    }
                 }
                 true
             }
         }
     }
 
-    fun recordTransportFailure(host: String, durationMs: Long = 15_000L, now: Long = System.currentTimeMillis()) {
+    fun recordTransportFailure(
+        host: String,
+        durationMs: Long = 15_000L,
+        now: Long = System.currentTimeMillis(),
+        url: String = "",
+        receivedBytes: Long = 0L
+    ) {
         if (host.isNotBlank()) {
-            bannedHosts[host] = now + durationMs
+            val f = (hostFailures[host] ?: 0) + 1
+            hostFailures[host] = f
+            val backoffMs = maxOf(durationMs, minOf(60_000L, 3_000L * (1 shl minOf(f - 1, 4))))
+            hostBlockedUntil[host] = now + backoffMs
+            if (receivedBytes <= 0L && url.isNotBlank()) {
+                val key = "$host\n${addressOf(url)}\n"
+                emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
+                judge()
+            }
         }
     }
 
+    fun isPermanentlyBanned(url: String, host: String): Boolean {
+        val address = addressOf(url)
+        return permanentBans.contains("node:$host") ||
+                permanentBans.contains("address:$address") ||
+                permanentBans.contains("pair:$host $address")
+    }
+
     fun isBanned(url: String, host: String, now: Long = System.currentTimeMillis()): Boolean {
-        val urlUntil = bannedUrls[url]
+        if (isPermanentlyBanned(url, host)) return true
+        val urlUntil = urlBlockedUntil[url]
         if (urlUntil != null && urlUntil > now) return true
-        val hostUntil = bannedHosts[host]
+        val hostUntil = hostBlockedUntil[host]
         if (hostUntil != null && hostUntil > now) return true
         return false
     }
@@ -82,7 +181,7 @@ class SessionBanList {
 
 data class BtrMediaSession(
     val sessionId: String,
-    val primaryUrl: String,
+    @Volatile var primaryUrl: String,
     @Volatile var backupUrls: List<String>,
     @Volatile var userAgent: String?,
     @Volatile var referer: String = "https://www.bilibili.com/",
@@ -97,7 +196,11 @@ data class BtrMediaSession(
     val banList: SessionBanList = SessionBanList(),
     @Volatile var liveMapUrl: String? = null,
     val liveLastNum: AtomicLong = AtomicLong(0L),
-    val liveSpeculativeMisses: AtomicInteger = AtomicInteger(0)
+    val liveSpeculativeMisses: AtomicInteger = AtomicInteger(0),
+    val config: AcceleratorConfig? = null,
+    @Volatile var synthesizedMirrors: List<String> = emptyList(),
+    @Volatile var urlDeadlineEpochSec: Long = 0L,
+    @Volatile var concurrencyController: Any? = null
 )
 
 object BtrSessionManager {
@@ -134,6 +237,7 @@ object BtrSessionManager {
         }
 
         val cleanPrimaryLiveUrl = if (isLive) BtrLiveCore.unwrapProxyUrl(primaryUrl).ifBlank { primaryUrl } else primaryUrl
+        val isFlvLive = isLive && cleanPrimaryLiveUrl.substringBefore('?').substringBefore('#').endsWith(".flv", ignoreCase = true)
 
         val pool: BtrLiveHostPool? = if (isLive) {
             val livePool = BtrLiveHostPool()
@@ -141,10 +245,12 @@ object BtrSessionManager {
             if (primaryHost.isNotBlank() && !BtrLiveCore.isP2pUrl(cleanPrimaryLiveUrl)) {
                 livePool.add(primaryHost, proven = true)
             }
-            // 注入已知官方 fMP4 集群
-            for (knownHost in BtrLiveCore.KNOWN_FMP4_HOSTS) {
-                if (knownHost != primaryHost) {
-                    livePool.add(knownHost, proven = false)
+            // 仅对 fMP4 HLS 直播注入 KNOWN_FMP4_HOSTS；FLV 直播节点鉴权互不兼容，严禁混入（否则 403）
+            if (!isFlvLive) {
+                for (knownHost in BtrLiveCore.KNOWN_FMP4_HOSTS) {
+                    if (knownHost != primaryHost) {
+                        livePool.add(knownHost, proven = false)
+                    }
                 }
             }
             // 注入备用节点中包含的候选官方直播域名
@@ -169,31 +275,37 @@ object BtrSessionManager {
             null
         }
 
-        // 若宿主未传入备用地址或仅传入了 Akamai 兜底原链，自动补充兼容的官方同源 UPOS 镜像（优先支持用户自定义 CDN 白名单）
+        // 若宿主未传入完整多源池，合成兼容的跨区 UPOS 镜像池（对齐 realzza V5 与 BTR：跨区共同竞速）
+        var synthesizedList: List<String> = emptyList()
         val finalBackups = if (isLive) {
             validBackups
         } else {
-            // 隔离检查（对齐 BTR 规范）：
-            // 若当前主地址是中继流，严禁混入普通 UPOS 镜像；
-            // 若当前主地址是普通 UPOS 流，严禁混入中继地址（避免触发普通节点 403）
             val isolated = if (isPrimaryRelay) {
                 validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
             } else {
                 validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
             }
-            if (!isPrimaryRelay && isolated.none { !BiliAcceleratorCore.isAkamaiHost(it) }) {
-                val donor = listOf(primaryUrl).plus(isolated).firstOrNull {
-                    !BiliAcceleratorCore.isRelayUrl(it) &&
-                        !BiliAcceleratorCore.isAkamaiHost(it) &&
-                        !BiliAcceleratorCore.hasDrmSignal(it)
+            val primaryHostLower = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(primaryUrl)?.host).lowercase()
+            val isPrimaryBstar = primaryHostLower.endsWith(".bstarstatic.com")
+            val shouldSynthesize = !isPrimaryRelay && !isPrimaryBstar && (
+                config != null || isolated.none { !BiliAcceleratorCore.isAkamaiHost(it) }
+            )
+            if (shouldSynthesize) {
+                val donor = listOf(primaryUrl).plus(isolated).firstOrNull { candidate ->
+                    val ch = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(candidate)?.host).lowercase()
+                    !BiliAcceleratorCore.isRelayUrl(candidate) &&
+                        !BiliAcceleratorCore.isAkamaiHost(candidate) &&
+                        !BiliAcceleratorCore.hasDrmSignal(candidate) &&
+                        !ch.endsWith(".bstarstatic.com")
                 } ?: primaryUrl
-                val synthesized = synthesizeCompatibleBackups(donor, config, isEpisode = isEpisode)
-                (synthesized + isolated).distinct().filter { it != primaryUrl }
+                synthesizedList = synthesizeCompatibleBackups(donor, config, isEpisode = isEpisode)
+                (isolated + synthesizedList).distinct().filter { it != primaryUrl }
             } else {
                 isolated
             }
         }
 
+        val deadlineSec = BiliAcceleratorCore.extractUrlDeadlineSeconds(cleanPrimaryLiveUrl)
         val session = BtrMediaSession(
             sessionId = id,
             primaryUrl = cleanPrimaryLiveUrl,
@@ -203,11 +315,48 @@ object BtrSessionManager {
             isAudio = isAudio,
             isEpisode = isEpisode,
             isLive = isLive,
-            liveHostPool = pool
+            liveHostPool = pool,
+            config = config,
+            synthesizedMirrors = synthesizedList,
+            urlDeadlineEpochSec = deadlineSec
         )
         sessions[id] = session
         latestSessionId = id
         return id
+    }
+
+    fun remove(sessionId: String) {
+        val removed = sessions.remove(sessionId)
+        if (removed != null) {
+            onSessionEvicted(sessionId, removed)
+        }
+    }
+
+    fun refreshSignatureIfSamePath(primaryUrl: String, backupUrls: List<String>) {
+        val newDeadline = BiliAcceleratorCore.extractUrlDeadlineSeconds(primaryUrl)
+        if (newDeadline <= 0L) return
+        val newPath = extractNormalizedPathAndKey(primaryUrl).first
+        if (newPath.isBlank()) return
+        for (session in sessions.values) {
+            if (session.isLive) continue
+            val existingPath = extractNormalizedPathAndKey(session.primaryUrl).first
+            if (existingPath == newPath && newDeadline > session.urlDeadlineEpochSec) {
+                session.primaryUrl = primaryUrl
+                session.urlDeadlineEpochSec = newDeadline
+                val donor = listOf(primaryUrl).plus(backupUrls).firstOrNull { !BiliAcceleratorCore.isRelayUrl(it) && !BiliAcceleratorCore.isAkamaiHost(it) } ?: primaryUrl
+                if (session.config != null) {
+                    session.synthesizedMirrors = synthesizeCompatibleBackups(donor, session.config, isEpisode = session.isEpisode)
+                }
+                updateBackups(session.sessionId, backupUrls)
+            }
+        }
+    }
+
+    private fun onSessionEvicted(sessionId: String, session: BtrMediaSession) {
+        runCatching { BtrChunkEngine.cancelSessionCalls(sessionId) }
+        if (session.isLive) {
+            runCatching { BtrLiveEngine.onSessionEvicted(session) }
+        }
     }
 
     fun bindBuilderSession(builder: Any, sessionId: String) {
@@ -234,7 +383,14 @@ object BtrSessionManager {
             validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
         }
         if (isolatedBackups.isNotEmpty()) {
-            current.backupUrls = isolatedBackups
+            current.backupUrls = if (current.config != null && !current.isLive && !isPrimaryRelay) {
+                val preservedAkamai = current.backupUrls.filter { BiliAcceleratorCore.isAkamaiHost(it) }
+                (isolatedBackups + preservedAkamai + current.synthesizedMirrors)
+                    .distinct()
+                    .filter { it != current.primaryUrl }
+            } else {
+                isolatedBackups
+            }
         }
 
         // 若为直播会话，同时同步至直播节点池
@@ -276,7 +432,7 @@ object BtrSessionManager {
             }
         }
 
-        // 2. 次级回退：同轨道类型 (isAudio/isLive 一致) + 文件名片段关键帧一致，严禁音视频串台
+        // 2. 次级回退：同轨道类型 (isAudio/isLive 一致) + 文件名片段关键帧一致，严禁跨视频/跨轨道串台
         if (incomingKeys.isNotEmpty()) {
             val keyMatch = orderedSessions.firstOrNull { session ->
                 session.isAudio == incomingIsAudio &&
@@ -287,14 +443,6 @@ object BtrSessionManager {
                 updateBackups(keyMatch.sessionId, backups)
                 return
             }
-        }
-
-        // 3. 兜底匹配：仅限同轨道类型（音视频、点直播严格隔离）的最近访问会话
-        val sameTrackLatest = orderedSessions.firstOrNull { session ->
-            session.isAudio == incomingIsAudio && session.isLive == incomingIsLive
-        }
-        if (sameTrackLatest != null) {
-            updateBackups(sameTrackLatest.sessionId, backups)
         }
     }
 
@@ -320,13 +468,10 @@ object BtrSessionManager {
     }
 
     /**
-     * 安全合成同源通用 UPOS 备用节点：
-     * 当宿主未提供 backupUrls 时，在同组通用 UPOS 节点之间安全互换，
-     * 解决海外/大陆多源并发拉取，彻底杜绝 403 熔断。
-     *
-     * 针对剧集（isEpisode）：
-     * 严格执行区域版权限流保护，若是港澳台或海外限定剧集（bstarstatic, cn-hk-eq, ov.bilivideo.com 等），
-     * 严禁混入大陆普通 UPOS 节点，避免触发版权鉴权 403。
+     * 安全合成同源通用 UPOS 备用节点（对齐 realzza V5 与 BTR）：
+     * - 允许大陆 UPOS 与海外 *ov.bilivideo.com 跨区共同竞速（不硬隔离，由测速决定最优节点）；
+     * - 严格排除 bstarstatic.com（区域专属签名与 bilivideo 不互通）；
+     * - 港澳台专属专线 cn-hk-eq-* 仅在主地址本身为 cn-hk-eq-* 时合成，严禁混入常规流导致 403。
      */
     fun synthesizeCompatibleBackups(
         primaryUrl: String,
@@ -338,43 +483,34 @@ object BtrSessionManager {
         val path = uri.path
         if (!path.contains("/upgcxcode/")) return emptyList()
 
-        // 对齐 BTR Issue #47：中继地址（Relay/MCDN）与 DRM 版权流严禁作为 Donor 母本合成普通镜像
-        if (BiliAcceleratorCore.isRelayUrl(primaryUrl) || path.startsWith("/v1/resource/") || BiliAcceleratorCore.hasDrmSignal(primaryUrl)) {
+        val host = uri.host.lowercase().substringBefore(':')
+        // 中继地址、DRM 加密流与 bstarstatic.com 区域专属流严禁合成普通 UPOS 镜像
+        if (BiliAcceleratorCore.isRelayUrl(primaryUrl) ||
+            path.startsWith("/v1/resource/") ||
+            BiliAcceleratorCore.hasDrmSignal(primaryUrl) ||
+            host.endsWith(".bstarstatic.com")
+        ) {
             return emptyList()
         }
 
-        val host = uri.host.lowercase()
-        val isAkamai = host.endsWith(".akamaized.net")
-        val isRegionalPgcHost = host.contains("bstar") ||
-                host.contains("cn-hk-eq") ||
-                host.contains("ov.bilivideo.com") ||
-                isAkamai
-
-        // 对齐 BTR：当海外账号仅分发 akamaized.net 节点或播放港澳台/海外专属剧集时，提取签名合成海外专属镜像
-        val isOverseasStream = host.contains("ov.bilivideo.com") ||
-                host.contains("cn-hk-eq") ||
-                isAkamai ||
-                (isEpisode && isRegionalPgcHost)
-
-        val candidateList = if (config != null && config.customCdnPool.isNotEmpty()) {
-            BiliAcceleratorCore.getEffectiveCdnPool(config)
-        } else if (isOverseasStream) {
-            BiliAcceleratorCore.OVERSEAS_CANDIDATE_POOL
-        } else {
-            BiliAcceleratorCore.MAINLAND_CANDIDATE_POOL
-        }
-
-        val maxBackups = if (config != null) config.btrCdnPoolSize.coerceIn(1, candidateList.size) else minOf(5, candidateList.size)
+        val isAkamai = BiliAcceleratorCore.isAkamaiHost(host)
+        val isHkRegional = host.contains("cn-hk-eq")
         val isCustom = config != null && config.customCdnPool.isNotEmpty()
 
+        val candidateList = when {
+            isCustom -> BiliAcceleratorCore.getEffectiveCdnPool(config!!)
+            isHkRegional -> BiliAcceleratorCore.HK_REGIONAL_CANDIDATE_POOL + BiliAcceleratorCore.OVERSEAS_CANDIDATE_POOL
+            host.contains("ov.bilivideo.com") || isAkamai || BiliAcceleratorCore.isOverseasEnvironment() ->
+                BiliAcceleratorCore.OVERSEAS_CANDIDATE_POOL
+            else -> BiliAcceleratorCore.MAINLAND_CANDIDATE_POOL
+        }
+
+        val maxBackups = if (config != null) config.btrCdnPoolSize.coerceIn(1, candidateList.size) else minOf(8, candidateList.size)
+
         for (m in candidateList) {
-            val cleanM = BiliAcceleratorCore.cleanHost(m).lowercase()
-            if (cleanM == host || cleanM.endsWith(".akamaized.net")) continue
-            // 严格隔离：非自定义 CDN 池时，海外 ov 节点仅在海外主地址时合成，大陆节点仅在大陆主地址时合成，防止区域鉴权 403
-            if (!isCustom) {
-                val candidateIsOverseas = cleanM.contains("ov.bilivideo.com") || cleanM.contains("cn-hk-eq") || cleanM.contains("bstar")
-                if (isOverseasStream != candidateIsOverseas) continue
-            }
+            val cleanM = BiliAcceleratorCore.cleanHost(m).lowercase().substringBefore(':')
+            if (cleanM == host || BiliAcceleratorCore.isAkamaiHost(cleanM) || cleanM.endsWith(".bstarstatic.com")) continue
+            if (!isCustom && !isHkRegional && cleanM.contains("cn-hk-eq")) continue
 
             results.add(uri.replaceAuthority(cleanM))
             if (results.size >= maxBackups) break
@@ -384,12 +520,22 @@ object BtrSessionManager {
 
     private fun cleanupStaleSessions() {
         val now = System.currentTimeMillis()
-        if (sessions.size > MAX_SESSIONS) {
-            val iterator = sessions.entries.iterator()
-            while (iterator.hasNext()) {
-                val entry = iterator.next()
-                if (now - entry.value.lastAccessed.get() > SESSION_TTL_MS) {
-                    iterator.remove()
+        val iterator = sessions.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (now - entry.value.lastAccessed.get() > SESSION_TTL_MS) {
+                iterator.remove()
+                onSessionEvicted(entry.key, entry.value)
+            }
+        }
+        if (sessions.size >= MAX_SESSIONS) {
+            val overflow = sessions.size - MAX_SESSIONS + 1
+            val victims = sessions.entries
+                .sortedBy { it.value.lastAccessed.get() }
+                .take(overflow)
+            for (victim in victims) {
+                if (sessions.remove(victim.key, victim.value)) {
+                    onSessionEvicted(victim.key, victim.value)
                 }
             }
         }

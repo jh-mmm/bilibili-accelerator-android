@@ -1,12 +1,19 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
+import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
+import java.util.concurrent.atomic.AtomicBoolean
 
 class HookEntry : XposedModule() {
+
+    private val selfHooked = AtomicBoolean(false)
+    private val appContextHooked = AtomicBoolean(false)
+    private val targetInitialized = AtomicBoolean(false)
 
     companion object {
         private const val TAG = "BiliAccelerator"
@@ -48,15 +55,10 @@ class HookEntry : XposedModule() {
         }
     }
 
-    private fun handleModuleSelfLoaded(param: PackageLoadedParam) {
+    private fun handleModuleSelfLoaded(packageName: String, classLoader: ClassLoader) {
+        if (!selfHooked.compareAndSet(false, true)) return
         isSelfHookInjected = true
-        Log.i(TAG, "LSPosed injected into module self package (${param.packageName}), module is active")
-
-        val classLoader = try {
-            param.defaultClassLoader
-        } catch (_: Throwable) {
-            null
-        } ?: Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader()
+        Log.i(TAG, "LSPosed injected into module self package ($packageName), module is active")
 
         try {
             val mainActivityClass = classLoader.loadClass("io.github.jh_mmm.biliaccelerator.ui.MainActivity")
@@ -66,6 +68,7 @@ class HookEntry : XposedModule() {
             }
             Log.i(TAG, "Successfully hooked MainActivity.isModuleActive -> true")
         } catch (t: Throwable) {
+            selfHooked.set(false)
             Log.d(TAG, "Self-hook MainActivity.isModuleActive fallback: ${t.message}")
         }
 
@@ -76,44 +79,70 @@ class HookEntry : XposedModule() {
         } catch (_: Throwable) {}
     }
 
-    override fun onPackageLoaded(param: PackageLoadedParam) {
-        val packageName = param.packageName
-        val classLoader = try {
-            param.defaultClassLoader
-        } catch (_: Throwable) {
-            null
-        } ?: Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader()
+    private fun resolveClassLoader(candidate: ClassLoader?): ClassLoader {
+        return candidate ?: Thread.currentThread().contextClassLoader ?: ClassLoader.getSystemClassLoader()
+    }
 
-        // 1. 模块自身包名：若框架将本模块加入注入作用域，标记激活状态
+    override fun onPackageLoaded(param: PackageLoadedParam) {
+        if (!param.isFirstPackage) return
+        val packageName = param.packageName
+        val loaderCandidate = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching { param.defaultClassLoader }.getOrNull()
+        } else null
+        val classLoader = resolveClassLoader(loaderCandidate)
+
         if (packageName == BiliAcceleratorCore.MODULE_PACKAGE) {
-            handleModuleSelfLoaded(param)
+            handleModuleSelfLoaded(packageName, classLoader)
             return
         }
 
-        // 2. 目标应用：B站国内版、国际版、Bstar 等
         if (BiliAcceleratorCore.isTargetPackage(packageName)) {
-            val processName = RemoteClient.resolveProcessName()
-            if (!isRelevantProcess(packageName, processName)) {
-                Log.d(TAG, "Skipping non-player background process: $processName")
-                return
-            }
-
-            Log.i(TAG, "Injecting into $packageName (process=${processName ?: "main"}) via LibXposed API 101")
-
-            // 尽早捕获 Application 实例，供统计上报（跨进程 ContentProvider 调用）使用
-            captureApplicationContext(packageName, classLoader)
-
-            // 放行 Android 9+ 本地回环 127.0.0.1 明文 HTTP 流量限制
-            NetworkSecurityHook.init(this, classLoader)
-
-
-            // 同步初始化业务 Hook（1.0.5 经典逻辑，杜绝异步线程导致播放器早期实例漏 Hook）
-            PlayerHook.init(this, classLoader)
-            MossGrpcHook.init(this, classLoader)
+            injectTargetPackage(packageName, classLoader, phase = "onPackageLoaded")
         }
     }
 
+    override fun onPackageReady(param: PackageReadyParam) {
+        if (!param.isFirstPackage) return
+        val packageName = param.packageName
+        val classLoader = resolveClassLoader(runCatching { param.classLoader }.getOrNull())
+
+        if (packageName == BiliAcceleratorCore.MODULE_PACKAGE) {
+            handleModuleSelfLoaded(packageName, classLoader)
+            return
+        }
+
+        if (BiliAcceleratorCore.isTargetPackage(packageName)) {
+            injectTargetPackage(packageName, classLoader, phase = "onPackageReady")
+        }
+    }
+
+    private fun injectTargetPackage(packageName: String, classLoader: ClassLoader, phase: String) {
+        val processName = RemoteClient.resolveProcessName()
+        if (!isRelevantProcess(packageName, processName)) {
+            if (targetInitialized.compareAndSet(false, true)) {
+                Log.d(TAG, "Skipping non-player background process: $processName")
+            }
+            return
+        }
+
+        if (targetInitialized.compareAndSet(false, true)) {
+            Log.i(TAG, "Injecting into $packageName (process=${processName ?: "main"}, phase=$phase) via LibXposed API 101")
+            RemoteClient.attachXposedModule(this)
+        }
+
+        // 尽早捕获 Application 实例，供统计上报与双向配置同步使用（内部防重入）
+        captureApplicationContext(packageName, classLoader)
+
+        // 放行 Android 9+ 本地回环 127.0.0.1 明文 HTTP 流量限制（幂等防重入）
+        NetworkSecurityHook.init(this, classLoader)
+
+        // 在 onPackageLoaded 与 onPackageReady 均尝试挂载播放器与 Moss Hook（内部按 Class 去重），兼顾自定义 AppComponentFactory / 插件化 ClassLoader
+        PlayerHook.init(this, classLoader)
+        MossGrpcHook.init(this, classLoader)
+    }
+
     private fun captureApplicationContext(packageName: String, classLoader: ClassLoader) {
+        if (!appContextHooked.compareAndSet(false, true)) return
         var attachHooked = false
         try {
             val appClass = classLoader.loadClass("android.app.Application")
@@ -133,22 +162,23 @@ class HookEntry : XposedModule() {
             Log.w(TAG, "Failed to hook Application.attach (ROM compatibility): ${t.message}")
         }
 
-        try {
-            val appClass = classLoader.loadClass("android.app.Application")
-            val onCreateMethod = appClass.getDeclaredMethod("onCreate")
-            hook(onCreateMethod).intercept { chain ->
-                val result = chain.proceed()
-                (chain.thisObject as? Context)?.let { ctx ->
-                    RemoteClient.setAppContext(ctx)
-                    if (!attachHooked) {
+        if (!attachHooked) {
+            try {
+                val appClass = classLoader.loadClass("android.app.Application")
+                val onCreateMethod = appClass.getDeclaredMethod("onCreate")
+                hook(onCreateMethod).intercept { chain ->
+                    val result = chain.proceed()
+                    (chain.thisObject as? Context)?.let { ctx ->
+                        RemoteClient.setAppContext(ctx)
                         HookStatusTracker.recordStatus("app_context", "Application.onCreate ($packageName)")
                     }
+                    result
                 }
-                result
+                Log.i(TAG, "Successfully hooked Application.onCreate")
+            } catch (t: Throwable) {
+                appContextHooked.set(false)
+                Log.w(TAG, "Failed to hook Application.onCreate (ROM compatibility): ${t.message}")
             }
-            Log.i(TAG, "Successfully hooked Application.onCreate")
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed to hook Application.onCreate (ROM compatibility): ${t.message}")
         }
     }
 }

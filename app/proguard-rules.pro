@@ -26,6 +26,7 @@
     public <init>();
 }
 -keep class io.github.jh_mmm.biliaccelerator.hook.HookEntry { *; }
+-keep class io.github.libxposed.service.** { *; }
 -adaptresourcefilecontents META-INF/xposed/java_init.list
 -dontwarn io.github.libxposed.**
 

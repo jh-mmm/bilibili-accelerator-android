@@ -1,9 +1,13 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.database.ContentObserver
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -13,7 +17,10 @@ import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
+import io.github.jh_mmm.biliaccelerator.provider.XposedServiceProvider
 import io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver
+import io.github.libxposed.api.XposedInterface
+import io.github.libxposed.api.XposedModule
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -51,7 +58,51 @@ object RemoteClient {
 
     @Volatile
     private var appContext: Context? = null
+    private val contextInitialized = AtomicBoolean(false)
     private val isObserverRegistered = AtomicBoolean(false)
+    private val isSyncReceiverRegistered = AtomicBoolean(false)
+    private val isRemotePrefsAttached = AtomicBoolean(false)
+    @Volatile
+    private var remotePrefsRef: SharedPreferences? = null
+    @Volatile
+    private var remotePrefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+
+    fun getCachedConfig(): AcceleratorConfig = cachedConfig
+
+    fun attachXposedModule(module: XposedModule) {
+        if (!isRemotePrefsAttached.compareAndSet(false, true)) return
+        try {
+            if ((module.frameworkProperties and XposedInterface.PROP_CAP_REMOTE) == 0L) return
+            val prefs = module.getRemotePreferences(XposedServiceProvider.REMOTE_CONFIG_GROUP)
+            remotePrefsRef = prefs
+            applyConfigJsonFromRemotePrefs(prefs)
+            val listener = SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
+                if (key == XposedServiceProvider.KEY_REMOTE_CONFIG_JSON || key == null) {
+                    applyConfigJsonFromRemotePrefs(sp)
+                }
+            }
+            remotePrefsListener = listener
+            prefs.registerOnSharedPreferenceChangeListener(listener)
+        } catch (t: Throwable) {
+            Log.d(TAG, "RemotePreferences unavailable: ${t.message}")
+        }
+    }
+
+    private fun applyConfigJsonFromRemotePrefs(prefs: SharedPreferences) {
+        try {
+            val json = prefs.getString(XposedServiceProvider.KEY_REMOTE_CONFIG_JSON, null)
+            if (!json.isNullOrBlank()) {
+                val cfg = gson.fromJson(json, AcceleratorConfig::class.java) ?: return
+                cachedConfig = cfg
+                lastConfigFetchTime.set(System.currentTimeMillis())
+                appContext?.let { saveConfigToLocalCache(it, cfg) }
+                syncBtrProxyState(cfg)
+                Log.i(TAG, "Synced config via LibXposed RemotePreferences: targetHost=${cfg.targetHost}")
+            }
+        } catch (t: Throwable) {
+            Log.d(TAG, "Failed to parse RemotePreferences config: ${t.message}")
+        }
+    }
 
     fun setAppContext(context: Context) {
         val app = try {
@@ -61,14 +112,25 @@ object RemoteClient {
         }
         appContext = app
 
-        // 从目标 App 私有目录载入历史持久化配置（1.0.5 逻辑，避免冷启动使用硬编码默认镜像）
-        loadConfigFromLocalCache(app)
+        if (!contextInitialized.compareAndSet(false, true)) {
+            return
+        }
 
-        // 依据本地持久化配置初始化或同步 BTR Proxy 服务状态
+        // 从目标 App 私有目录载入历史持久化配置，若未从 RemotePreferences 同步到则使用本地缓存
+        if (lastConfigFetchTime.get() == 0L) {
+            loadConfigFromLocalCache(app)
+        } else {
+            saveConfigToLocalCache(app, cachedConfig)
+        }
+
+        // 按需更新 BTR 参数（实际代理套接字在首次媒体拦截时按进程惰性启动，避免非播放进程多开空闲线程池）
         syncBtrProxyState(cachedConfig)
 
-        // 注册 ContentObserver 监听配置变更（实现毫秒级实时同步，彻底消除 30 秒延迟）
+        // 注册 ContentObserver 监听配置变更（Android < 11 或可见性允许时实现毫秒级同步）
         registerConfigObserver(app)
+
+        // 注册双向配置同步广播接收器（兜底 Android 11+ 包可见性反向阻断 StatsProvider）
+        registerConfigSyncReceiver(app)
 
         // 发送启动握手（同步包名、版本，更新看板“等待拦截”活跃状态）
         sendHandshakeAsync(app)
@@ -79,35 +141,100 @@ object RemoteClient {
         }
     }
 
+    fun ensureBtrProxyStarted(config: AcceleratorConfig): Boolean {
+        if (!config.enabled || !config.enableBtr) return false
+        val proxy = io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer
+        if (!proxy.isStarted) {
+            proxy.start(
+                concurrency = config.btrConcurrency,
+                chunkSizeKb = config.btrChunkSizeKb,
+                autoConcurrency = config.btrAutoConcurrency,
+                autoChunkSize = config.btrAutoChunkSize
+            )
+            if (proxy.isStarted) {
+                HookStatusTracker.recordStatus("btr_proxy", "127.0.0.1:${proxy.port}")
+            }
+        } else {
+            proxy.updateParameters(
+                concurrency = config.btrConcurrency,
+                chunkSizeKb = config.btrChunkSizeKb,
+                autoConcurrency = config.btrAutoConcurrency,
+                autoChunkSize = config.btrAutoChunkSize
+            )
+        }
+        return proxy.isStarted
+    }
+
     fun syncBtrProxyState(config: AcceleratorConfig) {
         try {
+            val proxy = io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer
             if (config.enabled && config.enableBtr) {
-                if (!io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
-                    io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.start(
+                if (proxy.isStarted) {
+                    proxy.updateParameters(
                         concurrency = config.btrConcurrency,
                         chunkSizeKb = config.btrChunkSizeKb,
                         autoConcurrency = config.btrAutoConcurrency,
                         autoChunkSize = config.btrAutoChunkSize
                     )
+                    HookStatusTracker.recordStatus("btr_proxy", "127.0.0.1:${proxy.port}")
                 } else {
-                    io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.updateParameters(
+                    proxy.updateParameters(
                         concurrency = config.btrConcurrency,
                         chunkSizeKb = config.btrChunkSizeKb,
                         autoConcurrency = config.btrAutoConcurrency,
                         autoChunkSize = config.btrAutoChunkSize
                     )
-                }
-                if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
-                    HookStatusTracker.recordStatus("btr_proxy", "127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
+                    HookStatusTracker.recordStatus("btr_proxy", "ready (on-demand)")
                 }
             } else {
-                if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
-                    io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.stop()
-                    HookStatusTracker.recordStatus("btr_proxy", "disabled")
+                if (proxy.isStarted) {
+                    proxy.stop()
                 }
+                HookStatusTracker.recordStatus("btr_proxy", "disabled")
             }
         } catch (t: Throwable) {
             Log.w(TAG, "Failed to sync BTR proxy state: ${t.message}")
+        }
+    }
+
+    private fun registerConfigSyncReceiver(context: Context) {
+        if (!isSyncReceiverRegistered.compareAndSet(false, true)) return
+        try {
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context?, intent: Intent?) {
+                    if (intent?.action != StatsReceiver.ACTION_SYNC_CONFIG) return
+                    val authToken: PendingIntent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        runCatching { intent.getParcelableExtra(StatsReceiver.EXTRA_AUTH_TOKEN, PendingIntent::class.java) }.getOrNull()
+                    } else {
+                        @Suppress("DEPRECATION")
+                        runCatching { intent.getParcelableExtra<PendingIntent>(StatsReceiver.EXTRA_AUTH_TOKEN) }.getOrNull()
+                    }
+                    val creatorPkg = authToken?.creatorPackage
+                    val sentFromPkg = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        runCatching { sentFromPackage }.getOrNull()
+                    } else null
+                    val authorized = creatorPkg == BiliAcceleratorCore.MODULE_PACKAGE ||
+                            sentFromPkg == BiliAcceleratorCore.MODULE_PACKAGE
+                    if (!authorized) return
+
+                    val json = intent.getStringExtra(StatsProvider.EXTRA_CONFIG_JSON) ?: return
+                    val newConfig = runCatching { gson.fromJson(json, AcceleratorConfig::class.java) }.getOrNull() ?: return
+                    cachedConfig = newConfig
+                    lastConfigFetchTime.set(System.currentTimeMillis())
+                    saveConfigToLocalCache(context, newConfig)
+                    syncBtrProxyState(newConfig)
+                    Log.i(TAG, "Synced config via module broadcast push: targetHost=${newConfig.targetHost}")
+                }
+            }
+            val filter = IntentFilter(StatsReceiver.ACTION_SYNC_CONFIG)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                context.registerReceiver(receiver, filter)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to register config sync receiver: ${t.message}")
         }
     }
 
@@ -170,6 +297,16 @@ object RemoteClient {
         } catch (_: Throwable) {}
     }
 
+    fun refreshConfigAsyncIfStale() {
+        val now = System.currentTimeMillis()
+        val lastFetch = lastConfigFetchTime.get()
+        if (now - lastFetch < CONFIG_CACHE_TTL && lastFetch != 0L) return
+        val context = getContext() ?: return
+        fetchConfigAsync(context) { newConfig ->
+            syncBtrProxyState(newConfig)
+        }
+    }
+
     fun fetchConfig(): AcceleratorConfig {
         val now = System.currentTimeMillis()
         val lastFetch = lastConfigFetchTime.get()
@@ -187,11 +324,14 @@ object RemoteClient {
                 cachedConfig = direct
                 lastConfigFetchTime.set(now)
                 saveConfigToLocalCache(context, direct)
+                syncBtrProxyState(direct)
                 return direct
             }
         }
 
-        fetchConfigAsync(context)
+        fetchConfigAsync(context) { newConfig ->
+            syncBtrProxyState(newConfig)
+        }
         return cachedConfig
     }
 

@@ -8,7 +8,7 @@ import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
@@ -17,7 +17,8 @@ data class ParsedRange(
     val start: Long = 0L,
     val end: Long? = null,
     val isSuffix: Boolean = false,
-    val suffixLength: Long = 0L
+    val suffixLength: Long = 0L,
+    val isInvalid: Boolean = false
 )
 
 object BtrLocalProxyServer {
@@ -43,15 +44,17 @@ object BtrLocalProxyServer {
     @Volatile
     private var currentAutoChunkSize: Boolean = true
 
-    // 有界弹性线程池，core=4, max=64, 保持 60 秒存活，杜绝线程无节制创建
+    // 直通弹性线程池（SynchronousQueue）：不排队阻塞在 Keep-Alive / FLV 长连接后面，杜绝 >4 连接卡死
     private val clientThreadPool = ThreadPoolExecutor(
-        4,
-        64,
+        8,
+        128,
         60L,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue(128)
+        SynchronousQueue()
     ) { r ->
         Thread(r, "BTR-ProxyWorker").apply { isDaemon = true }
+    }.apply {
+        allowCoreThreadTimeOut(true)
     }
 
     @Synchronized
@@ -72,12 +75,15 @@ object BtrLocalProxyServer {
 
             val acceptThread = Thread({
                 while (isRunning) {
+                    var client: Socket? = null
                     try {
-                        val client = ss.accept() ?: break
+                        client = ss.accept() ?: break
+                        val accepted = client
                         clientThreadPool.execute {
-                            handleClientSocket(client, currentConcurrency, currentChunkSizeKb, currentAutoConcurrency, currentAutoChunkSize)
+                            handleClientSocket(accepted, currentConcurrency, currentChunkSizeKb, currentAutoConcurrency, currentAutoChunkSize)
                         }
                     } catch (e: Exception) {
+                        runCatching { client?.close() }
                         if (!isRunning) break
                     }
                 }
@@ -176,24 +182,29 @@ object BtrLocalProxyServer {
                         break
                     }
 
-                    // 动态透传播放器发来的真实 User-Agent 与 Referer，杜绝 Dalvik UA 触发 CDN 403 熔断
-                    headers["user-agent"]?.let { ua ->
-                        if (ua.isNotBlank()) session.userAgent = ua
+                    // 仅按单次请求透传合法 User-Agent / Referer，避免探测或异常请求头永久污染 session 共享状态
+                    val reqUserAgent = headers["user-agent"]
+                        ?.trim()
+                        ?.takeIf { it.isNotBlank() && !it.startsWith("Dalvik/", ignoreCase = true) }
+                        ?: session.userAgent
+                    if (session.userAgent.isNullOrBlank() && !reqUserAgent.isNullOrBlank()) {
+                        session.userAgent = reqUserAgent
                     }
-                    headers["referer"]?.let { ref ->
-                        if (ref.isNotBlank()) session.referer = ref
-                    }
+                    val reqReferer = headers["referer"]
+                        ?.trim()
+                        ?.takeIf { it.isNotBlank() && it.contains("bilibili.com", ignoreCase = true) }
+                        ?: session.referer
 
-                    val streamSuccess = if (session.isLive) {
+                    val keepConnectionAlive = if (session.isLive) {
                         when {
                             path.contains(".m3u8") -> {
-                                BtrLiveEngine.pipePlaylist(session, path, headers, out, port)
+                                BtrLiveEngine.pipePlaylist(session, path, headers, out, port, keepAlive = shouldKeepAlive, requestUserAgent = reqUserAgent, requestReferer = reqReferer)
                             }
                             path.contains(".flv") -> {
-                                BtrLiveEngine.pipeLiveFlvStream(session, headers, out)
+                                BtrLiveEngine.pipeLiveFlvStream(session, headers, out, requestUserAgent = reqUserAgent, requestReferer = reqReferer)
                             }
                             else -> {
-                                BtrLiveEngine.pipeSegment(session, path, headers, out)
+                                BtrLiveEngine.pipeSegment(session, path, headers, out, keepAlive = shouldKeepAlive, requestUserAgent = reqUserAgent, requestReferer = reqReferer)
                             }
                         }
                     } else {
@@ -213,11 +224,13 @@ object BtrLocalProxyServer {
                             autoChunkSize = autoChunkSize,
                             proxyPort = port,
                             parsedRange = parsedRange,
-                            keepAlive = shouldKeepAlive
+                            keepAlive = shouldKeepAlive,
+                            requestUserAgent = reqUserAgent,
+                            requestReferer = reqReferer
                         )
                     }
 
-                    if (!shouldKeepAlive || !streamSuccess) {
+                    if (!shouldKeepAlive || !keepConnectionAlive) {
                         break
                     }
                 }
@@ -227,10 +240,10 @@ object BtrLocalProxyServer {
     }
 
     fun parseRangeHeader(rangeHeader: String?): ParsedRange {
-        if (rangeHeader.isNullOrBlank() || !rangeHeader.startsWith("bytes=")) {
+        if (rangeHeader.isNullOrBlank() || !rangeHeader.trim().startsWith("bytes=", ignoreCase = true)) {
             return ParsedRange(hasRange = false, start = 0L, end = null)
         }
-        val rangeSpec = rangeHeader.substringAfter("bytes=").trim()
+        val rangeSpec = rangeHeader.substringAfter("=").trim()
         val singleRange = rangeSpec.substringBefore(',').trim()
         val dashIdx = singleRange.indexOf('-')
         if (dashIdx == -1) {
@@ -240,17 +253,20 @@ object BtrLocalProxyServer {
         val endStr = singleRange.substring(dashIdx + 1).trim()
 
         if (startStr.isEmpty()) {
-            // Suffix range: bytes=-500 (请求媒体文件的最后 500 字节，例如播放器解析 MP4 末尾 moov box)
+            // Suffix range: bytes=-500 (请求媒体文件的最后 500 字节)
             val suffixLen = endStr.toLongOrNull()
             return if (suffixLen != null && suffixLen > 0L) {
                 ParsedRange(hasRange = true, isSuffix = true, suffixLength = suffixLen)
             } else {
-                ParsedRange(hasRange = false, start = 0L, end = null)
+                ParsedRange(hasRange = true, isSuffix = true, suffixLength = 0L, isInvalid = true)
             }
         }
 
-        val start = startStr.toLongOrNull() ?: 0L
+        val start = startStr.toLongOrNull()
         val end = if (endStr.isNotEmpty()) endStr.toLongOrNull() else null
+        if (start == null || start < 0L || (endStr.isNotEmpty() && (end == null || end < start))) {
+            return ParsedRange(hasRange = true, start = start ?: 0L, end = end, isInvalid = true)
+        }
         return ParsedRange(hasRange = true, start = start, end = end)
     }
 

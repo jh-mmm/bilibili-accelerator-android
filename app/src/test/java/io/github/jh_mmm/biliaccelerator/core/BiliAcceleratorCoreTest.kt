@@ -79,16 +79,20 @@ class BiliAcceleratorCoreTest {
 
     @Test
     fun testMcdnV1ResourceProtectedFromOrdinaryHostSwap() {
-        // 关键防护测试（对齐 BTR Issue #47）：
-        // 即使配置了 replace 策略或 forceUpos=true，若资源路径为 /v1/resource/，绝不直接替换为普通 UPOS 域名，强制走 proxy-tf-all-ws 代理
+        // 关键防护测试（对齐上游 routing.js）：
+        // 1. 默认 / proxy-v1 策略对 /v1/resource/ 走 proxy-tf-all-ws 中继代理
         val v1Mcdn = "http://xy123.mcdn.bilivideo.cn/v1/resource/upgcxcode/54/12/34567.m4s"
-        val replaceConfig = defaultConfig.copy(mcdnStrategy = "replace", forceUpos = true)
-        val result = BiliAcceleratorCore.rewriteUrl(v1Mcdn, replaceConfig)
+        val proxyV1Result = BiliAcceleratorCore.rewriteUrl(v1Mcdn, defaultConfig.copy(mcdnStrategy = "proxy-v1", forceUpos = true))
+        assertTrue(proxyV1Result.changed)
+        assertEquals("mcdn-proxy", proxyV1Result.reason)
+        assertTrue("Must wrap with proxy-tf-all-ws", proxyV1Result.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
+        assertFalse("Must NOT replace authority with ordinary UPOS", proxyV1Result.finalUrl.contains("upos-sz-mirrorcos.bilivideo.com/v1/resource/"))
 
-        assertTrue(result.changed)
-        assertEquals("mcdn-proxy", result.reason)
-        assertTrue("Must wrap with proxy-tf-all-ws", result.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
-        assertFalse("Must NOT replace authority with ordinary UPOS", result.finalUrl.contains("upos-sz-mirrorcos.bilivideo.com/v1/resource/"))
+        // 2. proxyMcdn = false 时，即使 blockPcdn/forceUpos 开启，/v1/resource/ 仍安全放行并标记为 mcdn-v1-pass
+        val noProxyResult = BiliAcceleratorCore.rewriteUrl(v1Mcdn, defaultConfig.copy(proxyMcdn = false, blockPcdn = true, forceUpos = true))
+        assertFalse(noProxyResult.changed)
+        assertEquals("mcdn-v1-pass", noProxyResult.reason)
+        assertTrue(noProxyResult.isMcdn)
     }
 
     @Test
@@ -373,10 +377,18 @@ class BiliAcceleratorCoreTest {
         assertEquals("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s?os=mcdn", resReplace.finalUrl)
         assertEquals("mcdn-host", resReplace.reason)
 
-        // 4. proxyMcdn = false 关闭 MCDN 处理
-        val resDisabled = BiliAcceleratorCore.rewriteUrl(mcdnUrl, defaultConfig.copy(proxyMcdn = false))
-        assertFalse(resDisabled.changed)
-        assertEquals("ok", resDisabled.reason)
+        // 4. proxyMcdn = false 时：/v1/resource/ 安全放行 (mcdn-v1-pass)，标准 /upgcxcode/ 在 blockPcdn=true 时改写为 UPOS，blockPcdn=false 时放行
+        val resV1Disabled = BiliAcceleratorCore.rewriteUrl(mcdnV1Url, defaultConfig.copy(proxyMcdn = false, blockPcdn = true))
+        assertFalse(resV1Disabled.changed)
+        assertEquals("mcdn-v1-pass", resV1Disabled.reason)
+
+        val resDisabledBlockPcdn = BiliAcceleratorCore.rewriteUrl(mcdnUrl, defaultConfig.copy(proxyMcdn = false, blockPcdn = true))
+        assertTrue(resDisabledBlockPcdn.changed)
+        assertEquals("mcdn-host", resDisabledBlockPcdn.reason)
+
+        val resDisabledPass = BiliAcceleratorCore.rewriteUrl(mcdnUrl, defaultConfig.copy(proxyMcdn = false, blockPcdn = false, forceUpos = false))
+        assertFalse(resDisabledPass.changed)
+        assertEquals("ok", resDisabledPass.reason)
     }
 
     @Test
@@ -455,13 +467,16 @@ class BiliAcceleratorCoreTest {
         assertTrue("Disguised os=mcdn should be flagged as PCDN", resDisguised.isPcdn)
         assertEquals("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s?os=mcdn", resDisguised.finalUrl)
 
-        // 原生 *.mcdn.bilivideo.cn 仍严格受 proxyMcdn 控制（放行）
+        // 原生 *.mcdn.bilivideo.cn 在 /upgcxcode/ 路径下受 blockPcdn/forceUpos 控制转为 UPOS
         val resExplicit = BiliAcceleratorCore.rewriteUrl(explicitMcdnUrl, cfg)
-        assertFalse("Explicit *.mcdn.* URL should remain governed by proxyMcdn=false", resExplicit.changed)
+        assertTrue("Explicit *.mcdn.* /upgcxcode/ should fall back to UPOS when proxyMcdn=false and blockPcdn=true", resExplicit.changed)
+        assertEquals("mcdn-host", resExplicit.reason)
 
-        // 当同时关闭 blockPcdn 时，伪装 os=mcdn 节点允许透传
-        val resPass = BiliAcceleratorCore.rewriteUrl(disguisedUrl, defaultConfig.copy(proxyMcdn = false, blockPcdn = false))
+        // 当同时关闭 blockPcdn 时，伪装 os=mcdn 与显式 MCDN 均允许透传
+        val noBlockCfg = defaultConfig.copy(proxyMcdn = false, blockPcdn = false, forceUpos = false)
+        val resPass = BiliAcceleratorCore.rewriteUrl(disguisedUrl, noBlockCfg)
         assertFalse("Disguised os=mcdn should pass when blockPcdn=false", resPass.changed)
+        assertFalse("Explicit *.mcdn.* should pass when proxyMcdn=false and blockPcdn=false", BiliAcceleratorCore.rewriteUrl(explicitMcdnUrl, noBlockCfg).changed)
     }
 
     @Test
@@ -494,5 +509,75 @@ class BiliAcceleratorCoreTest {
         // 2. 首元素是 Akamai 时，Donor 探测必须跳过 Akamai 选中后续 UPOS 镜像来合成备选
         val mixed = BiliAcceleratorCore.filterAndFillBackupUrls(listOf(akamaiUrl, cleanUposUrl), defaultConfig)
         assertTrue("Non-Akamai donor URL must be preserved", mixed.contains(cleanUposUrl))
+    }
+
+    @Test
+    fun testOverseasEnvironmentIgnoresLocaleAndBogusCst() {
+        val prevTz = java.util.TimeZone.getDefault()
+        val prevLocale = java.util.Locale.getDefault()
+        try {
+            // 1. 即使系统 Locale 为 en_US，只要时区是 Asia/Shanghai，仍应判定为国内环境
+            java.util.Locale.setDefault(java.util.Locale.US)
+            java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("Asia/Shanghai"))
+            assertFalse("Asia/Shanghai must be treated as mainland even with en_US locale", BiliAcceleratorCore.isOverseasEnvironment())
+
+            // 2. 海外简体中文用户 (zh_CN + America/Los_Angeles) 应正确判定为海外
+            java.util.Locale.setDefault(java.util.Locale.CHINA)
+            java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("America/Los_Angeles"))
+            assertTrue("Overseas timezone must be detected regardless of zh_CN locale", BiliAcceleratorCore.isOverseasEnvironment())
+
+            // 3. Java CST (America/Chicago) 不应误判为中国时区
+            java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("CST"))
+            assertTrue("Java CST (America/Chicago) must not be treated as China mainland", BiliAcceleratorCore.isOverseasEnvironment())
+
+            // 4. resolveTargetHost 绝不能擅自覆盖用户显式选择的 upos-sz-mirrorcos
+            assertEquals("upos-sz-mirrorcos.bilivideo.com", BiliAcceleratorCore.resolveTargetHost("upos-sz-mirrorcos.bilivideo.com"))
+        } finally {
+            java.util.TimeZone.setDefault(prevTz)
+            java.util.Locale.setDefault(prevLocale)
+        }
+    }
+
+    @Test
+    fun testAudioTrackDoesNotMisclassifyDirectoryNames() {
+        assertFalse(
+            "Directory names containing 'audio'/'sound' must not misclassify a video segment as audio",
+            BiliAcceleratorCore.isAudioTrack("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/audio/sound/video-100024.m4s")
+        )
+        assertTrue(
+            "Filename stem ending with -30280 must be detected as audio",
+            BiliAcceleratorCore.isAudioTrack("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567-30280.m4s?mid=1")
+        )
+        assertTrue(
+            "Query param rep_id=30216 must be detected as audio",
+            BiliAcceleratorCore.isAudioTrack("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s?rep_id=30216")
+        )
+    }
+
+    @Test
+    fun testUnwrapSmtcdnsSupportsMultiSubdomainPortsAndIpv4() {
+        val multiSub = "https://cdn-1.smtcdns.net/a.b.bilivideo.com:8443/live-bvc/123.m4s?token=1"
+        assertEquals(
+            "https://a.b.bilivideo.com:8443/live-bvc/123.m4s?token=1",
+            BiliAcceleratorCore.unwrapSmtcdnsUrl(multiSub)
+        )
+
+        val ipv4Wrapped = "https://cdn-1.smtcdns.com/120.200.1.2:8080/live-bvc/123.flv"
+        assertEquals(
+            "https://120.200.1.2:8080/live-bvc/123.flv",
+            BiliAcceleratorCore.unwrapSmtcdnsUrl(ipv4Wrapped)
+        )
+    }
+
+    @Test
+    fun testExtractUrlDeadlineSeconds() {
+        assertEquals(
+            1799999999L,
+            BiliAcceleratorCore.extractUrlDeadlineSeconds("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/123.m4s?deadline=1799999999&os=upos")
+        )
+        assertEquals(
+            0L,
+            BiliAcceleratorCore.extractUrlDeadlineSeconds("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/123.m4s?os=upos")
+        )
     }
 }

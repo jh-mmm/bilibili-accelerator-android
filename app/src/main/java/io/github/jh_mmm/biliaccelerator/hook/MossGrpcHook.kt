@@ -5,6 +5,8 @@ import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.libxposed.api.XposedModule
 import java.math.BigDecimal
 import java.math.BigInteger
+import java.util.Collections
+import java.util.WeakHashMap
 
 object MossGrpcHook {
 
@@ -13,6 +15,8 @@ object MossGrpcHook {
     @Volatile
     var isHooked: Boolean = false
         internal set
+
+    private val hookedClasses = Collections.newSetFromMap(WeakHashMap<Class<*>, Boolean>())
 
     private val RUNTIME_HELPER_CLASSES = listOf(
         "com.bilibili.lib.moss.utils.RuntimeHelper",
@@ -29,6 +33,14 @@ object MossGrpcHook {
                 null
             } ?: continue
 
+            val alreadyHooked = synchronized(hookedClasses) {
+                !hookedClasses.add(runtimeHelper)
+            }
+            if (alreadyHooked) {
+                hooked = true
+                break
+            }
+
             try {
                 // 仅拦截无参或单个上下文参数的 tf() 方法，避免误命中同名其他重载方法
                 val tfMethods = (runtimeHelper.declaredMethods + runtimeHelper.methods)
@@ -37,8 +49,14 @@ object MossGrpcHook {
 
                 for (method in tfMethods) {
                     module.hook(method).intercept { chain ->
-                        val config = RemoteClient.fetchConfig()
+                        // 非阻塞检查：先使用缓存配置，避免在未启用 Moss Hook 时阻塞冷启动或关键线程进行同步 IPC
+                        val cachedConfig = RemoteClient.getCachedConfig()
                         val result = chain.proceed()
+                        if (!cachedConfig.enableMossHook) {
+                            RemoteClient.refreshConfigAsyncIfStale()
+                            return@intercept result
+                        }
+                        val config = RemoteClient.fetchConfig()
                         if (!shouldIntercept(config, result)) {
                             return@intercept result
                         }

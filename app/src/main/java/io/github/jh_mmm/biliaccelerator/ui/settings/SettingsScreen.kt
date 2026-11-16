@@ -376,10 +376,14 @@ fun SettingsScreen(
 
                                 PreferenceSwitchItem(
                                     title = "改写 Akamai 官方节点",
-                                    summary = "默认放行官方 Akamai 线路；开启后将其重定向至首选 UPOS 镜像（适合当地 Akamai 连接较慢的情况）",
+                                    summary = if (config.enableBtr) {
+                                        "默认放行官方 Akamai 线路；开启后将其重定向至首选 UPOS 镜像（适合当地 Akamai 连接较慢的情况）"
+                                    } else {
+                                        "仅在启用 BTR 多线程加速后生效；当前 BTR 已关闭，将继续直连官方 Akamai 节点"
+                                    },
                                     checked = config.rewriteAkamai,
                                     onCheckedChange = { onConfigChange(config.copy(rewriteAkamai = it)) },
-                                    enabled = config.enabled
+                                    enabled = config.enabled && config.enableBtr
                                 )
 
                                 PreferenceDivider()
@@ -597,7 +601,7 @@ fun SettingsScreen(
                                     else -> "${config.btrConcurrency} 线程"
                                 }
                                 val concurrencySummary = if (config.btrAutoConcurrency) {
-                                    "基准 / 冲刺上限: $concurrencyDesc (自动动态调节中)"
+                                    "最高并发上限: $concurrencyDesc (在 2~$concurrencyDesc 间自适应调节)"
                                 } else {
                                     "固定并发: $concurrencyDesc"
                                 }
@@ -681,7 +685,7 @@ fun SettingsScreen(
                                     else -> "${config.btrChunkSizeKb} KB"
                                 }
                                 val chunkSizeSummary = if (config.btrAutoChunkSize) {
-                                    "基准: $chunkSizeDesc (自适应动态调节中)"
+                                    "标准档基准: $chunkSizeDesc (按文件体积在 256KB~2048KB 间比例缩放)"
                                 } else {
                                     "固定分片大小: $chunkSizeDesc"
                                 }

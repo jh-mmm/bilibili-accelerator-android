@@ -262,7 +262,8 @@ object StatsManager {
         val segKey = result.segmentKey.trim()
         if (segKey.isEmpty()) return true
         val compositeKey = if (result.isBtr || segKey.startsWith("btr_stream_")) {
-            "$segKey|${result.originalHost}|${result.targetHost}|btr|${result.changed}"
+            // 每一次独立的 BTR Range 传输流都会生成唯一的 segmentKey（含偏移与传输序号），避免首片探测把后续大流量统计误判为重复
+            "$segKey|${result.originalHost}|${result.targetHost}|${result.btrBytes}|${result.btrChunks}|btr|${result.changed}"
         } else {
             "$segKey|${result.originalHost}|${result.targetHost}|${result.reason}|${result.changed}"
         }

@@ -67,4 +67,11 @@ object BtrHttpClient {
         .connectTimeout(5000, TimeUnit.MILLISECONDS)
         .readTimeout(8000, TimeUnit.MILLISECONDS)
         .build()
+
+    // 直播 FLV 长流透传专用客户端：避免上游短暂推流卡顿触发 6s 读超时断流
+    val liveStreamClient: OkHttpClient = client.newBuilder()
+        .connectTimeout(4000, TimeUnit.MILLISECONDS)
+        .readTimeout(30_000, TimeUnit.MILLISECONDS)
+        .writeTimeout(10_000, TimeUnit.MILLISECONDS)
+        .build()
 }

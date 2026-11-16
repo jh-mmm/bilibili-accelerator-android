@@ -163,7 +163,7 @@ object BtrLiveCore {
 
     private val LIVE_HOST_REGEX = Regex("""(?:\.|^)bilivideo\.(com|cn|net)$""", RegexOption.IGNORE_CASE)
     private val PROXY_WRAP_REGEX = Regex(
-        """^(https?:)//[\w.-]+\.smtcdns\.(?:net|com)/([\w-]+\.bilivideo\.(?:com|cn|net))(/.*)$""",
+        """^(https?:)//[\w.-]+\.smtcdns\.(?:net|com)/([\w.-]+\.bilivideo\.(?:com|cn|net)(?::\d{1,5})?)(/.*)$""",
         RegexOption.IGNORE_CASE
     )
 
@@ -215,8 +215,19 @@ object BtrLiveCore {
     }
 
     fun segmentNumber(name: String): Long {
-        val match = Regex("""(\d+)\.m4s""", RegexOption.IGNORE_CASE).find(name)
+        val cleanName = name.substringBefore('?').substringBefore('#')
+        val match = Regex("""(\d+)\.m4s$""", RegexOption.IGNORE_CASE).find(cleanName)
+            ?: Regex("""(\d+)\.m4s""", RegexOption.IGNORE_CASE).find(cleanName)
         return match?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+    }
+
+    fun isFmp4Playlist(text: String, parsed: ParsedM3u8): Boolean {
+        if (!text.contains("#EXT-X-MAP", ignoreCase = true) || parsed.segments.isEmpty()) {
+            return false
+        }
+        return parsed.segments.all { seg ->
+            seg.name.substringBefore('?').substringBefore('#').endsWith(".m4s", ignoreCase = true)
+        }
     }
 
     /**

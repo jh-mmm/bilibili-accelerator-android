@@ -1,8 +1,10 @@
 package io.github.jh_mmm.biliaccelerator.provider
 
+import android.app.PendingIntent
 import android.content.ContentProvider
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.os.Binder
@@ -16,6 +18,8 @@ import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
+import io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver
+import java.util.concurrent.Executors
 
 /**
  * 传输层 DTO，防范反射反序列化导致的不可信字段与 NPE，且绝不接收完整签名 URL（仅传输裸域名）
@@ -102,6 +106,9 @@ class StatsProvider : ContentProvider() {
         const val KEY_ENABLE_LIVE_ACCELERATION = "cfg_enable_live_acceleration"
 
         private val gson = Gson()
+        private val configPushExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "StatsProvider-ConfigPush").apply { isDaemon = true }
+        }
 
         private fun log(msg: String) {
             Log.i("BiliAccelerator-Stats", msg)
@@ -191,9 +198,58 @@ class StatsProvider : ContentProvider() {
                 .putBoolean(KEY_ENABLE_EPISODE_ACCELERATION, config.enableEpisodeAcceleration)
                 .putBoolean(KEY_ENABLE_LIVE_ACCELERATION, config.enableLiveAcceleration)
                 .apply()
+            val configJson = gson.toJson(config)
             runCatching {
                 context.contentResolver.notifyChange(CONTENT_URI, null)
             }
+            runCatching {
+                XposedServiceProvider.updateRemoteConfigAsync(configJson)
+            }
+            pushConfigToTargetsAsync(context.applicationContext ?: context, configJson)
+        }
+
+        fun pushConfigToTargetsAsync(context: Context, configJson: String? = null) {
+            val appCtx = context.applicationContext ?: context
+            configPushExecutor.execute {
+                val json = configJson ?: gson.toJson(loadConfig(appCtx))
+                val targets = LinkedHashSet<String>()
+                StatsManager.getSnapshot().clientPackage?.takeIf { BiliAcceleratorCore.isTargetPackage(it) }?.let {
+                    targets.add(it)
+                }
+                targets.addAll(BiliAcceleratorCore.TARGET_PACKAGES)
+                for (pkg in targets) {
+                    sendConfigSyncBroadcast(appCtx, pkg, json)
+                }
+            }
+        }
+
+        fun pushConfigToPackageAsync(context: Context, packageName: String?) {
+            if (packageName.isNullOrBlank() || !BiliAcceleratorCore.isTargetPackage(packageName)) return
+            val appCtx = context.applicationContext ?: context
+            configPushExecutor.execute {
+                val json = gson.toJson(loadConfig(appCtx))
+                sendConfigSyncBroadcast(appCtx, packageName, json)
+            }
+        }
+
+        private fun sendConfigSyncBroadcast(context: Context, targetPkg: String, configJson: String) {
+            try {
+                // Only send to packages actually visible/installed to avoid dead intents
+                runCatching { context.packageManager.getPackageInfo(targetPkg, 0) }.getOrNull() ?: return
+                val authIntent = Intent().apply { setPackage(context.packageName) }
+                val authToken = PendingIntent.getBroadcast(
+                    context,
+                    1,
+                    authIntent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+                val syncIntent = Intent(StatsReceiver.ACTION_SYNC_CONFIG).apply {
+                    setPackage(targetPkg)
+                    putExtra(EXTRA_CONFIG_JSON, configJson)
+                    putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, authToken)
+                }
+                context.sendBroadcast(syncIntent)
+            } catch (_: Throwable) {}
         }
     }
 

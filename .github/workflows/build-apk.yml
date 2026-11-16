@@ -82,12 +82,15 @@ jobs:
 
       - name: Run Lint & Unit Tests
         run: |
-          ./gradlew lintDebug testDebugUnitTest --stacktrace 2>&1 | tee build.log || {
-            ERR=$(grep -E "(e: |error:|FAILURE:)" build.log | head -n 20 | tr '\n' ' ')
+          set -o pipefail
+          ./gradlew lintDebug testDebugUnitTest --stacktrace 2>&1 | tee build.log
+          STATUS=${PIPESTATUS[0]}
+          if [ $STATUS -ne 0 ] || grep -q "BUILD FAILED" build.log; then
+            ERR=$(grep -E "(e: |error:|FAILURE:|FAILED)" build.log | head -n 20 | tr '\n' ' ')
             echo "::error::Gradle Error: $ERR"
             tail -n 100 build.log
             exit 1
-          }
+          fi
 
       - name: Build Release APK
         run: |

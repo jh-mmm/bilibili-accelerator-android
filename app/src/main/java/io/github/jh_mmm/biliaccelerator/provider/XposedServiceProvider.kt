@@ -12,6 +12,8 @@ import android.os.Parcel
 import android.os.Process
 import android.util.Log
 import androidx.annotation.VisibleForTesting
+import com.google.gson.Gson
+import io.github.libxposed.service.IXposedService
 
 /**
  * 现代 LibXposed 规范服务桥接组件。
@@ -27,9 +29,11 @@ class XposedServiceProvider : ContentProvider() {
         const val METHOD_SEND_BINDER = "SendBinder"
         const val EXTRA_BINDER = "binder"
 
-        const val DESCRIPTOR = "io.github.libxposed.service.IXposedService"
-        const val TRANSACTION_GET_FRAMEWORK_NAME = IBinder.FIRST_CALL_TRANSACTION + 2 // Code 3
-        const val TRANSACTION_GET_SCOPE = IBinder.FIRST_CALL_TRANSACTION + 10 // Code 11
+        const val DESCRIPTOR = IXposedService.DESCRIPTOR
+        const val REMOTE_CONFIG_GROUP = "bili_accelerator_config"
+        const val KEY_REMOTE_CONFIG_JSON = "config_json"
+
+        private val gson = Gson()
 
         private val TRUSTED_PACKAGES = setOf(
             "org.lsposed.manager",
@@ -142,50 +146,43 @@ class XposedServiceProvider : ContentProvider() {
         }
 
         fun queryFrameworkName(binder: IBinder): String? {
-            val data = runCatching { Parcel.obtain() }.getOrNull() ?: return null
-            val reply = runCatching { Parcel.obtain() }.getOrNull() ?: run {
-                runCatching { data.recycle() }
-                return null
-            }
             return try {
-                data.writeInterfaceToken(DESCRIPTOR)
-                val ok = binder.transact(TRANSACTION_GET_FRAMEWORK_NAME, data, reply, 0)
-                if (ok) {
-                    runCatching { reply.readException() }
-                    reply.readString()
-                } else {
-                    null
-                }
+                IXposedService.Stub.asInterface(binder)?.frameworkName
             } catch (t: Throwable) {
-                runCatching { Log.w(TAG, "transact TRANSACTION_GET_FRAMEWORK_NAME failed: ${t.message}") }
+                runCatching { Log.w(TAG, "IXposedService.getFrameworkName failed: ${t.message}") }
                 null
-            } finally {
-                runCatching { reply.recycle() }
-                runCatching { data.recycle() }
             }
         }
 
         fun queryFrameworkScope(binder: IBinder): List<String>? {
-            val data = runCatching { Parcel.obtain() }.getOrNull() ?: return null
-            val reply = runCatching { Parcel.obtain() }.getOrNull() ?: run {
-                runCatching { data.recycle() }
-                return null
-            }
             return try {
-                data.writeInterfaceToken(DESCRIPTOR)
-                val ok = binder.transact(TRANSACTION_GET_SCOPE, data, reply, 0)
-                if (ok) {
-                    runCatching { reply.readException() }
-                    reply.createStringArrayList()
-                } else {
-                    null
-                }
+                IXposedService.Stub.asInterface(binder)?.scope
             } catch (t: Throwable) {
-                runCatching { Log.w(TAG, "transact TRANSACTION_GET_SCOPE failed: ${t.message}") }
+                runCatching { Log.w(TAG, "IXposedService.getScope failed: ${t.message}") }
                 null
-            } finally {
-                runCatching { reply.recycle() }
-                runCatching { data.recycle() }
+            }
+        }
+
+        fun updateRemoteConfigAsync(configJson: String) {
+            val targetBinder = serviceBinder ?: return
+            if (!rawIsBound || !targetBinder.isBinderAlive) return
+            scopeExecutor.execute {
+                try {
+                    val svc = IXposedService.Stub.asInterface(targetBinder) ?: return@execute
+                    if ((svc.frameworkProperties and IXposedService.PROP_CAP_REMOTE) == 0L) {
+                        return@execute
+                    }
+                    val diff = Bundle().apply {
+                        putBoolean("clear", false)
+                        putSerializable("delete", HashSet<String>())
+                        putSerializable("put", HashMap<String, Any>().apply {
+                            put(KEY_REMOTE_CONFIG_JSON, configJson)
+                        })
+                    }
+                    svc.updateRemotePreferences(REMOTE_CONFIG_GROUP, diff)
+                } catch (t: Throwable) {
+                    runCatching { Log.d(TAG, "Failed to update RemotePreferences: ${t.message}") }
+                }
             }
         }
 
@@ -332,8 +329,12 @@ class XposedServiceProvider : ContentProvider() {
             }
         }
 
-        // 绑定成功后立即在后台异步查询 LSPosed 模块作用域
+        // 绑定成功后立即在后台异步查询 LSPosed 模块作用域，并推送最新配置至 RemotePreferences
         triggerScopeQueryAsync(binder, force = true)
+        context?.let { ctx ->
+            val configJson = gson.toJson(StatsProvider.loadConfig(ctx))
+            updateRemoteConfigAsync(configJson)
+        }
 
         return Bundle().apply {
             putBoolean("result", true)

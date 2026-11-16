@@ -62,10 +62,12 @@ class BtrEngineTest {
     fun testSynthesizeCompatibleBackupsForOverseasAkamai() {
         val akamaiPrimary = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/12345.m4s?deadline=1700000000"
         val backups = BtrSessionManager.synthesizeCompatibleBackups(akamaiPrimary)
-        assertTrue("Overseas Akamai stream should synthesize overseas mirrors", backups.isNotEmpty())
+        assertTrue("Overseas Akamai stream should synthesize compatible mirrors", backups.isNotEmpty())
+        assertTrue("Synthesized mirrors should prioritize overseas ov nodes", backups.any { it.contains("ov.bilivideo.com") })
         for (backup in backups) {
-            val isOverseasNode = backup.contains("ov.bilivideo.com") || backup.contains("cn-hk-eq-")
-            assertTrue("Synthesized backup must be an overseas node (ov or hk): $backup", isOverseasNode)
+            assertFalse("Must exclude Akamai hosts", backup.contains("akamaized.net") || backup.contains("mirrorakam"))
+            assertFalse("Must exclude HK-specific cn-hk-eq nodes", backup.contains("cn-hk-eq-"))
+            assertFalse("Must exclude bstarstatic.com", backup.contains("bstarstatic.com"))
         }
     }
 
@@ -75,9 +77,11 @@ class BtrEngineTest {
         val backups = BtrSessionManager.synthesizeCompatibleBackups(primary)
 
         assertTrue("Compatible backups should be generated", backups.isNotEmpty())
+        assertTrue("Cross-tier pool should include ov mirrors for race selection", backups.any { it.contains("ov.bilivideo.com") })
         for (backup in backups) {
             assertFalse("Must not include primary host", backup.contains("upos-sz-mirrorali.bilivideo.com"))
-            assertFalse("Must not include overseas ov mirrors", backup.contains("ov.bilivideo.com"))
+            assertFalse("Must not include HK-specific cn-hk-eq mirrors", backup.contains("cn-hk-eq-"))
+            assertFalse("Must not include bstarstatic.com mirrors", backup.contains("bstarstatic.com"))
             assertFalse("Must not include Akamai mirrors", backup.contains("akamaized.net") || backup.contains("mirrorakam"))
         }
     }
@@ -219,11 +223,13 @@ class BtrEngineTest {
         val overseasPrimary = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/54/12/12345.m4s?deadline=1700000000"
         val backups = BtrSessionManager.synthesizeCompatibleBackups(overseasPrimary)
 
-        assertTrue("Overseas stream should synthesize overseas mirrors", backups.isNotEmpty())
+        assertTrue("Overseas stream should synthesize compatible mirrors", backups.isNotEmpty())
+        assertTrue("Overseas synthesis should include ov mirrors", backups.any { it.contains("ov.bilivideo.com") })
         for (backup in backups) {
-            val isOverseasNode = backup.contains("ov.bilivideo.com") || backup.contains("cn-hk-eq-")
-            assertTrue("Synthesized backup must be an overseas node (ov or hk): $backup", isOverseasNode)
             assertFalse("Must not include primary host", backup.contains("mirrorcosov"))
+            assertFalse("Must not include Akamai hosts", backup.contains("akamaized.net") || backup.contains("mirrorakam"))
+            assertFalse("Must not include HK-dedicated cn-hk-eq nodes", backup.contains("cn-hk-eq-"))
+            assertFalse("Must not include bstarstatic.com", backup.contains("bstarstatic.com"))
         }
     }
 
@@ -402,22 +408,24 @@ class BtrEngineTest {
 
     @Test
     fun testEpisodeSessionRegistrationAndRegionalIsolation() {
-        val regionalEpisodeUrl = "https://bstarstatic.com/upgcxcode/12/34/12345.m4s?ep_id=12345"
-        val sessionId = BtrSessionManager.register(
-            primaryUrl = regionalEpisodeUrl,
-            isEpisode = true
-        )
-        val session = BtrSessionManager.get(sessionId)
-        assertNotNull(session)
-        assertTrue("Session must be marked as episode", session?.isEpisode == true)
-        assertEquals("https://www.bilibili.com/bangumi/play/", session?.referer)
+        // 1. bstarstatic.com 专属区域签名流严禁混入 bilivideo 镜像，防止签名 403
+        val bstarUrl = "https://cdn-1.bstarstatic.com/upgcxcode/12/34/12345.m4s?ep_id=12345"
+        val bstarSid = BtrSessionManager.register(primaryUrl = bstarUrl, isEpisode = true)
+        val bstarSession = BtrSessionManager.get(bstarSid)
+        assertNotNull(bstarSession)
+        assertTrue("Session must be marked as episode", bstarSession?.isEpisode == true)
+        assertEquals("https://www.bilibili.com/bangumi/play/", bstarSession?.referer)
+        assertTrue("bstarstatic.com must NOT synthesize bilivideo mirrors", bstarSession?.backupUrls.isNullOrEmpty())
 
-        val backups = session?.backupUrls.orEmpty()
-        assertTrue("Regional PGC must synthesize backups", backups.isNotEmpty())
-        for (backup in backups) {
-            val isOverseasNode = backup.contains("ov.bilivideo.com") || backup.contains("cn-hk-eq-")
-            assertTrue("Regional PGC must strictly use overseas/hk mirrors, never mainland UPOS: $backup", isOverseasNode)
-        }
+        // 2. cn-hk-eq 港澳台番剧流允许合成 HK 节点与海外/跨区官方镜像
+        val hkEpisodeUrl = "https://cn-hk-eq-01-01.bilivideo.com/upgcxcode/12/34/12345.m4s?ep_id=12345"
+        val hkSid = BtrSessionManager.register(primaryUrl = hkEpisodeUrl, isEpisode = true)
+        val hkSession = BtrSessionManager.get(hkSid)
+        val hkBackups = hkSession?.backupUrls.orEmpty()
+        assertTrue("HK regional PGC must synthesize compatible backups", hkBackups.isNotEmpty())
+        assertTrue("HK PGC backups should include cn-hk-eq-01-03 or ov nodes",
+            hkBackups.any { it.contains("cn-hk-eq-01-03.bilivideo.com") || it.contains("ov.bilivideo.com") })
+        assertFalse("HK backups must never include bstarstatic.com", hkBackups.any { it.contains("bstarstatic.com") })
     }
 
     @Test
@@ -509,20 +517,26 @@ class BtrEngineTest {
             mainlandPrimary,
             AcceleratorConfig(btrCdnPoolSize = 10)
         )
-        assertTrue("Full mainland synthesis should include mirrorcoso1/mirrorbos/mirrorbd",
-            fullMainlandBackups.any { it.contains("mirrorcoso1") || it.contains("mirrorbos") || it.contains("mirrorbd") })
-        assertTrue("Mainland pool should include > 5 mirrors", fullMainlandBackups.size > 5)
+        assertTrue("Full synthesis should include ov and secondary mirrors",
+            fullMainlandBackups.any { it.contains("ov.bilivideo.com") } &&
+                fullMainlandBackups.any { it.contains("mirrorcoso1") || it.contains("mirrorbos") || it.contains("mirrorbd") })
+        assertFalse("Regular stream synthesis must exclude HK-dedicated cn-hk-eq nodes",
+            fullMainlandBackups.any { it.contains("cn-hk-eq-") })
 
         val overseasPrimary = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/54/12/12345.m4s?deadline=1"
         val fullOverseasBackups = BtrSessionManager.synthesizeCompatibleBackups(
             overseasPrimary,
             AcceleratorConfig(btrCdnPoolSize = 8)
         )
-        assertTrue("Overseas synthesis must include HK nodes cn-hk-eq-01-01/03",
-            fullOverseasBackups.any { it.contains("cn-hk-eq-01-01.bilivideo.com") } &&
-                fullOverseasBackups.any { it.contains("cn-hk-eq-01-03.bilivideo.com") })
-        assertFalse("Overseas synthesis must exclude mainland nodes",
-            fullOverseasBackups.any { it.contains("mirrorcos.bilivideo.com") || it.contains("mirrorali.bilivideo.com") })
+        assertTrue("Overseas synthesis supports cross-tier ov and mainland UPOS mirrors",
+            fullOverseasBackups.any { it.contains("ov.bilivideo.com") } &&
+                fullOverseasBackups.any { it.contains("mirrorcos.bilivideo.com") || it.contains("mirrorali.bilivideo.com") })
+        assertFalse("Non-HK overseas stream must exclude HK-dedicated cn-hk-eq nodes",
+            fullOverseasBackups.any { it.contains("cn-hk-eq-") })
+
+        val hkPrimary = "https://cn-hk-eq-01-01.bilivideo.com/upgcxcode/54/12/12345.m4s?deadline=1"
+        val hkBackups = BtrSessionManager.synthesizeCompatibleBackups(hkPrimary, AcceleratorConfig(btrCdnPoolSize = 8))
+        assertTrue("HK stream synthesis must include peer HK node", hkBackups.any { it.contains("cn-hk-eq-01-03.bilivideo.com") })
     }
 
     @Test
@@ -643,5 +657,243 @@ class BtrEngineTest {
         val guessed = BtrLiveCore.guessNextSegmentUrl(lastSeg)
         assertEquals("https://d1--cn-gotcha204.bilivideo.com/live-bvc/123/live_106.m4s?sign=abc", guessed)
         BtrLiveEngine.clearCache()
+    }
+
+    @Test
+    fun testChunkSizeScalingRespectsBasePreference() {
+        // 音频始终保持 128KB
+        assertEquals(128 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(300 * 1024 * 1024L, 1024, autoChunkSize = true, isAudio = true))
+
+        // 标准基准 512KB 维持 256 / 512 / 1024 / 2048 阶梯
+        assertEquals(256 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(10 * 1024 * 1024L, 512, autoChunkSize = true, isAudio = false))
+        assertEquals(512 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(30 * 1024 * 1024L, 512, autoChunkSize = true, isAudio = false))
+        assertEquals(1024 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(100 * 1024 * 1024L, 512, autoChunkSize = true, isAudio = false))
+        assertEquals(2048 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(300 * 1024 * 1024L, 512, autoChunkSize = true, isAudio = false))
+
+        // 较大基准 1024KB 在中等体积视频应维持 1024KB 而非退回 512KB
+        assertEquals(512 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(10 * 1024 * 1024L, 1024, autoChunkSize = true, isAudio = false))
+        assertEquals(1024 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(30 * 1024 * 1024L, 1024, autoChunkSize = true, isAudio = false))
+        assertEquals(2048 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(100 * 1024 * 1024L, 1024, autoChunkSize = true, isAudio = false))
+    }
+
+    @Test
+    fun testStrictContentRangeValidationAndCaseInsensitiveParse() {
+        val sid = BtrSessionManager.register("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/999.m4s")
+        val session = BtrSessionManager.get(sid)!!
+        session.totalLength = 10_000_000L
+
+        assertFalse("206 without Content-Range header must be rejected",
+            BtrChunkEngine.isValidContentRange(206, null, 0L, session))
+        assertFalse("206 with blank Content-Range header must be rejected",
+            BtrChunkEngine.isValidContentRange(206, "   ", 0L, session))
+        assertFalse("206 with mismatched end byte must be rejected",
+            BtrChunkEngine.isValidContentRange(206, "bytes 0-1000/10000000", 0L, session, expectedEnd = 65535L))
+        assertTrue("206 matching exact start, end, and total must pass",
+            BtrChunkEngine.isValidContentRange(206, "bytes 0-65535/10000000", 0L, session, expectedEnd = 65535L))
+        assertEquals(1024L, BtrChunkEngine.parseRangeStart("BYTES 1024-2047/4096"))
+    }
+
+    @Test
+    fun testRouteKeyIsolationAndSmoothWeightedRoundRobinAndTailTrial() {
+        val fastA = "https://fast-a.bilivideo.com/upgcxcode/1/test_swrr.m4s?sign=a1"
+        val medB = "https://med-b.bilivideo.com/upgcxcode/1/test_swrr.m4s?sign=b1"
+        val slowC = "https://slow-c.bilivideo.com/upgcxcode/1/test_swrr.m4s?sign=c1"
+        val unmeasuredD = "https://new-d.bilivideo.com/upgcxcode/1/test_swrr.m4s?sign=d1"
+
+        assertEquals(
+            BtrChunkEngine.routeKey(fastA),
+            BtrChunkEngine.routeKey("https://fast-a.bilivideo.com/upgcxcode/1/test_swrr.m4s?sign=other")
+        )
+        assertFalse(
+            BtrChunkEngine.routeKey(fastA) ==
+                BtrChunkEngine.routeKey("https://fast-a.bilivideo.com/upgcxcode/2/other_video.m4s")
+        )
+
+        BtrChunkEngine.recordRouteSpeed(fastA, 20L * 1024 * 1024, 1000L) // 20 MB/s
+        BtrChunkEngine.recordRouteSpeed(medB, 10L * 1024 * 1024, 1000L)  // 10 MB/s
+        BtrChunkEngine.recordRouteSpeed(slowC, 1L * 1024 * 1024, 1000L)  // 1 MB/s (< 20/12 = 1.67 MB/s -> cutoff!)
+
+        val sid = BtrSessionManager.register(fastA, listOf(medB, slowC, unmeasuredD))
+        val session = BtrSessionManager.get(sid)!!
+        val allUrls = listOf(fastA, medB, slowC, unmeasuredD)
+
+        var picksA = 0
+        var picksB = 0
+        for (i in 0L until 12L) {
+            val ordered = BtrChunkEngine.sortUrlsByHealthAndSpeed(allUrls, i, session, allowUnmeasuredTrial = false)
+            val first = ordered.first()
+            assertFalse("Unmeasured node must not take primary on startup chunks", first == unmeasuredD)
+            assertFalse("Slow cutoff node must not take primary", first == slowC)
+            if (first == fastA) picksA++ else if (first == medB) picksB++
+        }
+        assertTrue("SWRR must assign strictly more chunks to fastA ($picksA) than medB ($picksB)", picksA > picksB && picksB > 0)
+
+        val tailOrdered = BtrChunkEngine.sortUrlsByHealthAndSpeed(allUrls, 12L, session, allowUnmeasuredTrial = true)
+        assertEquals("Unmeasured node should receive tail trial slot", unmeasuredD, tailOrdered.first())
+    }
+
+    @Test
+    fun testDynamicConcurrencyDemandGatingAndStepDown() {
+        var t = 2_000_000L
+        val controller = BtrChunkEngine.DynamicConcurrencyController(
+            initialConcurrency = 4,
+            autoScale = true,
+            minConcurrency = 2,
+            maxConcurrency = 8,
+            initialNowMs = t
+        )
+        // 无队列饱和压力时不得盲目升档
+        controller.recordDemand(active = 1, limit = 4, queued = 0, nowMs = t)
+        t += 1_500L
+        controller.recordProgress(4 * 1024 * 1024L, nowMs = t)
+        assertEquals("Must NOT scale up without saturation pressure", 4, controller.currentConcurrency)
+
+        // 存在持续饱和压力时应升档试探，且不超过用户上限 8
+        controller.recordDemand(active = 4, limit = 4, queued = 5, nowMs = t)
+        t += 1_500L
+        controller.recordProgress(6 * 1024 * 1024L, nowMs = t)
+        assertEquals("Should scale up from 4 to 6 under saturation", 6, controller.currentConcurrency)
+
+        // 低需求持续 > 8 秒后应自动回落
+        t += 9_000L
+        controller.recordDemand(active = 0, limit = 6, queued = 0, nowMs = t)
+        assertEquals("Should step down after sustained low demand", 4, controller.currentConcurrency)
+    }
+
+    @Test
+    fun testStatsManagerAcceptsMultipleBtrTransfersPerSession() {
+        val now = System.currentTimeMillis()
+        val uniqueSuffix = System.nanoTime()
+        val first = RewriteResult(
+            changed = true, originalUrl = "", finalUrl = "", originalHost = "upos-sz-mirrorcos.bilivideo.com",
+            targetHost = "127.0.0.1:18000", reason = "BTR并发加速 · 1分片(0.1MB)", isPcdn = false, isMcdn = false,
+            segmentKey = "btr_stream_sess_${uniqueSuffix}_1", isBtr = true, btrChunks = 1, btrBytes = 64 * 1024L, btrConcurrency = 4, btrCdnCount = 1, btrAvgLatencyMs = 20L
+        )
+        val second = RewriteResult(
+            changed = true, originalUrl = "", finalUrl = "", originalHost = "upos-sz-mirrorcos.bilivideo.com",
+            targetHost = "127.0.0.1:18000", reason = "BTR并发加速 · 40分片(20.0MB)", isPcdn = false, isMcdn = false,
+            segmentKey = "btr_stream_sess_${uniqueSuffix}_2", isBtr = true, btrChunks = 40, btrBytes = 20L * 1024 * 1024, btrConcurrency = 6, btrCdnCount = 2, btrAvgLatencyMs = 25L
+        )
+        assertTrue(StatsManager.shouldAcceptCrossProcessSegment(first, now))
+        assertTrue(StatsManager.shouldAcceptCrossProcessSegment(second, now + 500L))
+        assertFalse("Identical duplicate report within window must still dedup",
+            StatsManager.shouldAcceptCrossProcessSegment(second, now + 1000L))
+    }
+
+    @Test
+    fun testLiveCoreFmp4DetectionAndQuerySegmentNumber() {
+        val baseUrl = "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123/index.m3u8"
+        val fmp4M3u8 = "#EXTM3U\n#EXT-X-MAP:URI=\"init.m4s\"\n#EXTINF:1.0,\nlive_205.m4s?token=abc\n"
+        val tsM3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:1.0,\nlive_1.ts?token=abc\n"
+        val parsedFmp4 = BtrLiveCore.parseM3u8(fmp4M3u8, baseUrl)
+        val parsedTs = BtrLiveCore.parseM3u8(tsM3u8, baseUrl)
+
+        assertTrue(BtrLiveCore.isFmp4Playlist(fmp4M3u8, parsedFmp4))
+        assertFalse(BtrLiveCore.isFmp4Playlist(tsM3u8, parsedTs))
+        assertEquals(205L, BtrLiveCore.segmentNumber("live_205.m4s?token=abc"))
+    }
+
+    @Test
+    fun testLoopbackProxy416UnknownLengthAndKeepAliveFraming() {
+        val totalPayload = ByteArray(150_000) { idx -> (idx % 251).toByte() }
+        val hideTotalLength = java.util.concurrent.atomic.AtomicBoolean(false)
+        val ignoreRangeWith200 = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        val mockCdn = java.net.ServerSocket(0)
+        val cdnThread = Thread {
+            while (!mockCdn.isClosed) {
+                val client = try { mockCdn.accept() } catch (_: Exception) { break }
+                Thread {
+                    client.use { sock ->
+                        val reader = sock.getInputStream().bufferedReader(Charsets.UTF_8)
+                        val reqLine = reader.readLine() ?: return@use
+                        var rangeHeader: String? = null
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                            if (line.startsWith("Range:", ignoreCase = true)) {
+                                rangeHeader = line.substringAfter(':').trim()
+                            }
+                        }
+                        val out = sock.getOutputStream()
+                        if (ignoreRangeWith200.get()) {
+                            out.write("HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: ${totalPayload.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                            out.write(totalPayload)
+                            out.flush()
+                            return@use
+                        }
+                        val rangeSpec = rangeHeader?.removePrefix("bytes=")?.split('-')
+                        val start = rangeSpec?.getOrNull(0)?.toIntOrNull() ?: 0
+                        val reqEnd = rangeSpec?.getOrNull(1)?.toIntOrNull() ?: (totalPayload.size - 1)
+                        val actualEnd = minOf(reqEnd, totalPayload.size - 1)
+                        if (start >= totalPayload.size) {
+                            out.write("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */${totalPayload.size}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                            out.flush()
+                            return@use
+                        }
+                        val len = actualEnd - start + 1
+                        val totalTag = if (hideTotalLength.get()) "*" else totalPayload.size.toString()
+                        val hdr = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes $start-$actualEnd/$totalTag\r\nContent-Length: $len\r\nConnection: close\r\n\r\n"
+                        out.write(hdr.toByteArray(Charsets.UTF_8))
+                        out.write(totalPayload, start, len)
+                        out.flush()
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+        }.apply { isDaemon = true; start() }
+
+        try {
+            BtrLocalProxyServer.start()
+            val port = BtrLocalProxyServer.port
+            assertTrue("Proxy server should start", port > 0)
+
+            // 1. 未知总长 (Content-Range: bytes .../*) 下严禁 64KB 截断，且 Keep-Alive 请求必须以 Connection: close 正确结束流而不挂死
+            hideTotalLength.set(true)
+            val unknownUrl = "http://127.0.0.1:${mockCdn.localPort}/test/1/unknown.m4s"
+            val sid1 = BtrSessionManager.register(unknownUrl)
+            val conn1 = java.net.URL("http://127.0.0.1:$port/stream/$sid1/media.m4s").openConnection() as java.net.HttpURLConnection
+            conn1.connectTimeout = 5000
+            conn1.readTimeout = 5000
+            conn1.setRequestProperty("Connection", "keep-alive")
+            assertEquals(200, conn1.responseCode)
+            assertEquals("close", conn1.getHeaderField("Connection")?.lowercase())
+            val received1 = conn1.inputStream.use { it.readBytes() }
+            assertEquals("Unknown total length stream must not truncate at 64KB probe!", totalPayload.size, received1.size)
+            assertTrue("All bytes must match", totalPayload.contentEquals(received1))
+            BtrSessionManager.remove(sid1)
+
+            // 2. 越界 Range 与倒置 Range 必须返回 416 Range Not Satisfiable
+            hideTotalLength.set(false)
+            val normalUrl = "http://127.0.0.1:${mockCdn.localPort}/test/1/normal.m4s"
+            val sid2 = BtrSessionManager.register(normalUrl)
+            val invConn = java.net.URL("http://127.0.0.1:$port/stream/$sid2/media.m4s").openConnection() as java.net.HttpURLConnection
+            invConn.setRequestProperty("Range", "bytes=200-100")
+            assertEquals("Inverted range must return 416", 416, invConn.responseCode)
+            invConn.disconnect()
+
+            // 正常探测一次写入 totalLength，再请求越界偏移
+            val okConn = java.net.URL("http://127.0.0.1:$port/stream/$sid2/media.m4s").openConnection() as java.net.HttpURLConnection
+            okConn.setRequestProperty("Range", "bytes=0-1023")
+            assertEquals(206, okConn.responseCode)
+            assertEquals(1024, okConn.inputStream.use { it.readBytes() }.size)
+
+            val oobConn = java.net.URL("http://127.0.0.1:$port/stream/$sid2/media.m4s").openConnection() as java.net.HttpURLConnection
+            oobConn.setRequestProperty("Range", "bytes=999999-")
+            assertEquals("Out-of-bounds range must return 416", 416, oobConn.responseCode)
+            oobConn.disconnect()
+
+            // 3. Seek 到非 0 偏移时若上游忽略 Range 返回 200 全量数据，必须拒收错位字节并延迟返回 502（非 206 误导播放器）
+            ignoreRangeWith200.set(true)
+            val seekConn = java.net.URL("http://127.0.0.1:$port/stream/$sid2/media.m4s").openConnection() as java.net.HttpURLConnection
+            seekConn.connectTimeout = 5000
+            seekConn.readTimeout = 10000
+            seekConn.setRequestProperty("Range", "bytes=70000-100000")
+            assertEquals("Deferred Seek headers must report 502 when upstream returns 200 for non-zero offset", 502, seekConn.responseCode)
+            seekConn.disconnect()
+            BtrSessionManager.remove(sid2)
+        } finally {
+            runCatching { mockCdn.close() }
+            cdnThread.interrupt()
+        }
     }
 }
