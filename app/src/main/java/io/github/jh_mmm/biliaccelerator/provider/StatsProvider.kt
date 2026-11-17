@@ -223,12 +223,19 @@ class StatsProvider : ContentProvider() {
             }
         }
 
-        fun pushConfigToPackageAsync(context: Context, packageName: String?) {
-            if (packageName.isNullOrBlank() || !BiliAcceleratorCore.isTargetPackage(packageName)) return
+        fun pushConfigToPackageAsync(context: Context, packageName: String?, onComplete: (() -> Unit)? = null) {
+            if (packageName.isNullOrBlank() || !BiliAcceleratorCore.isTargetPackage(packageName)) {
+                onComplete?.invoke()
+                return
+            }
             val appCtx = context.applicationContext ?: context
             configPushExecutor.execute {
-                val json = gson.toJson(loadConfig(appCtx))
-                sendConfigSyncBroadcast(appCtx, packageName, json)
+                try {
+                    val json = gson.toJson(loadConfig(appCtx))
+                    sendConfigSyncBroadcast(appCtx, packageName, json)
+                } finally {
+                    onComplete?.invoke()
+                }
             }
         }
 

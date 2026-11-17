@@ -141,10 +141,25 @@ object BiliAcceleratorCore {
         }
     }
 
+    /**
+     * 校验用户自定义 CDN 池或目标节点是否为合法的 B 站官方 CDN 域名（对齐 BTR normalizeCdnHost）。
+     * 严格拒绝任意第三方域名、IP、MCDN、PCDN、调度域名与海外节点，防止在拉流时将含签名的请求泄露到非 B 站服务器。
+     */
+    fun isValidCustomCdnHost(rawHost: String): Boolean {
+        val host = cleanHost(rawHost).lowercase().substringBefore(':')
+        if (host.isBlank() || !isValidHost(host)) return false
+        if (isIpAddress(host) || isAkamaiHost(host) || isMcdnHost(host) ||
+            isKnownP2pHost(host) || isSchedulerHost(host) || host.endsWith(".bstarstatic.com")
+        ) {
+            return false
+        }
+        return isBiliCdnHost(host)
+    }
+
     fun getEffectiveCdnPool(config: AcceleratorConfig): List<String> {
         val userList = config.customCdnPool
-            .map { cleanHost(it).lowercase() }
-            .filter { isValidHost(it) && !isAkamaiHost(it) }
+            .map { cleanHost(it).lowercase().substringBefore(':') }
+            .filter { isValidCustomCdnHost(it) }
             .distinct()
         val basePool = if (userList.isNotEmpty()) userList else CANDIDATE_POOL
         val poolSize = config.btrCdnPoolSize.coerceIn(1, 32)
@@ -281,7 +296,6 @@ object BiliAcceleratorCore {
         return url.contains("bilivideo") ||
                 url.contains("akamaized.net") ||
                 url.contains("bstarstatic") ||
-                url.contains("bstar") ||
                 url.contains("szbdyd.com") ||
                 url.contains("mountaintoys") ||
                 url.contains("nexusedgeio") ||
@@ -293,6 +307,24 @@ object BiliAcceleratorCore {
                 pathPart.contains("/upgcxcode/") ||
                 pathPart.contains("/v1/resource/") ||
                 MEDIA_PATH_REGEX.containsMatchIn(pathPart)
+    }
+
+    fun isMediaUrl(url: String): Boolean {
+        if (url.isBlank()) return false
+        val unwrapped = unwrapSmtcdnsUrl(url).ifBlank { url }
+        val parsed = parseUri(unwrapped) ?: return false
+        val host = cleanHost(parsed.host).lowercase().substringBefore(':')
+        if (host.startsWith("proxy-tf-all-")) {
+            val inner = parsed.queryParam("url")
+            return !inner.isNullOrBlank() && isMediaUrl(inner)
+        }
+        val path = parsed.path
+        return MEDIA_PATH_REGEX.containsMatchIn(path) ||
+                path.startsWith("/upgcxcode/", ignoreCase = true) ||
+                path.startsWith("/v1/resource/", ignoreCase = true) ||
+                path.contains("/live-bvc/", ignoreCase = true) ||
+                path.contains("/live-stream/", ignoreCase = true) ||
+                path.contains("/live-flv/", ignoreCase = true)
     }
 
     internal fun isKnownP2pHost(hostname: String): Boolean {
@@ -352,17 +384,30 @@ object BiliAcceleratorCore {
     /**
      * 识别中继/MCDN/P2P资源流（对齐 BTR Issue #47）：
      * 这类流的路径和鉴权签名由边缘中继专享，普通 UPOS 镜像无法解析，换 Host 必报 403。
+     * 注意：仅当路径为 /v1/resource/ 或非干净官方 UPOS/CDN 节点时，?os=mcdn 才视作中继流，
+     * 避免已改写为 UPOS 的 /upgcxcode/ 流因保留查询参数而被误判为中继从而丢失备用镜像池。
      */
     fun isRelayUrl(url: String): Boolean {
         if (url.isBlank()) return false
         val parsed = parseUri(url) ?: return false
         val host = cleanHost(parsed.host).lowercase().substringBefore(':')
         val path = parsed.path.lowercase()
-        return isMcdnHost(host) ||
-                host == "proxy-tf-all-ws.bilivideo.com" ||
-                host.startsWith("proxy-tf-all-") ||
-                path.startsWith("/v1/resource/") ||
-                parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
+        if (isMcdnHost(host) ||
+            host == "proxy-tf-all-ws.bilivideo.com" ||
+            host.startsWith("proxy-tf-all-") ||
+            path.startsWith("/v1/resource/")
+        ) {
+            return true
+        }
+        val hasOsMcdn = parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
+        if (!hasOsMcdn) return false
+        val isCleanOfficialUpos = isBiliCdnHost(host) &&
+                !isAkamaiHost(host) &&
+                !isSchedulerHost(host) &&
+                !isIpAddress(host) &&
+                !host.endsWith(".bstarstatic.com") &&
+                (parsed.port == -1 || parsed.port == 80 || parsed.port == 443)
+        return !isCleanOfficialUpos
     }
 
     fun isAkamaiHost(hostname: String): Boolean {
@@ -389,9 +434,29 @@ object BiliAcceleratorCore {
         return h.endsWith(".szbdyd.com") || h.endsWith(".mountaintoys.cn")
     }
 
+    private val HDNTS_EXP_REGEX = Regex("""(?:^|[~&])exp=(\d+)""", RegexOption.IGNORE_CASE)
+
     fun extractUrlDeadlineSeconds(url: String): Long {
         if (url.isBlank()) return 0L
-        return parseUri(url)?.queryParam("deadline")?.toLongOrNull() ?: 0L
+        var effectiveUrl = unwrapSmtcdnsUrl(url).ifBlank { url }
+        var parsed = parseUri(effectiveUrl) ?: return 0L
+        val host = cleanHost(parsed.host).lowercase().substringBefore(':')
+        if (host.startsWith("proxy-tf-all-")) {
+            val inner = parsed.queryParam("url")
+            if (!inner.isNullOrBlank()) {
+                effectiveUrl = unwrapSmtcdnsUrl(inner).ifBlank { inner }
+                parsed = parseUri(effectiveUrl) ?: return 0L
+            }
+        }
+        val directDeadline = listOf("deadline", "e", "expires")
+            .firstNotNullOfOrNull { key -> parsed.queryParam(key)?.toLongOrNull()?.takeIf { it > 0L } }
+        if (directDeadline != null) return directDeadline
+        val hdnts = parsed.queryParam("hdnts")
+        if (!hdnts.isNullOrBlank()) {
+            val exp = HDNTS_EXP_REGEX.find(hdnts)?.groupValues?.getOrNull(1)?.toLongOrNull()
+            if (exp != null && exp > 0L) return exp
+        }
+        return 0L
     }
 
     fun unwrapSmtcdnsUrl(url: String): String {
@@ -418,8 +483,12 @@ object BiliAcceleratorCore {
     )
 
     fun parseUri(original: String): ParsedUri? {
+        val trimmed = original.trim()
+        if (trimmed.isEmpty()) return null
+        val normalized = if (trimmed.startsWith("//")) "https:$trimmed" else trimmed
+
         try {
-            val u = Uri.parse(original)
+            val u = Uri.parse(normalized)
             val host = u.host
             if (!host.isNullOrBlank()) {
                 val scheme = u.scheme?.lowercase() ?: "https"
@@ -440,7 +509,7 @@ object BiliAcceleratorCore {
                                 .scheme("https")
                                 .encodedAuthority(cleanProxy)
                                 .path("/")
-                                .appendQueryParameter("url", original)
+                                .appendQueryParameter("url", normalized)
                                 .build().toString()
                         }
                     )
@@ -500,18 +569,23 @@ object BiliAcceleratorCore {
     }
 
     fun isLiveMediaUrl(path: String, fullUrl: String = ""): Boolean {
-        val lowerPath = path.lowercase()
-        val lowerUrl = fullUrl.lowercase()
-        return lowerPath.contains("/live-bvc/") ||
-                lowerPath.contains("/live-stream/") ||
-                lowerPath.contains("/live-flv/") ||
-                lowerUrl.contains("/live-bvc/") ||
-                lowerUrl.contains("/live-stream/") ||
-                lowerUrl.contains("/live-flv/") ||
-                lowerUrl.contains("gotcha") ||
-                lowerUrl.contains("live.bilibili.com") ||
-                lowerUrl.contains("live-play") ||
-                lowerUrl.contains("live_id=")
+        val parsed = if (fullUrl.isNotBlank()) parseUri(fullUrl) else null
+        val lowerPath = (parsed?.path ?: path).lowercase()
+        if (lowerPath.contains("/live-bvc/") ||
+            lowerPath.contains("/live-stream/") ||
+            lowerPath.contains("/live-flv/")
+        ) {
+            return true
+        }
+        val lowerHost = parsed?.host?.lowercase().orEmpty()
+        if (lowerHost.contains("gotcha") ||
+            lowerHost == "live.bilibili.com" ||
+            lowerHost.endsWith(".live.bilibili.com") ||
+            lowerHost.contains("live-play")
+        ) {
+            return true
+        }
+        return !parsed?.queryParam("live_id").isNullOrBlank()
     }
 
     private val AUDIO_REP_REGEX = Regex("""-(302\d{2}|3025\d)\.(m4s|mp4)""", RegexOption.IGNORE_CASE)
@@ -550,12 +624,14 @@ object BiliAcceleratorCore {
         val cleanedTarget = cleanHost(config.targetHost)
         val targetHostOnly = cleanedTarget.substringBefore(':')
         val effectivePool = getEffectiveCdnPool(config)
-        return if (isValidHost(cleanedTarget) && (isBiliCdnHost(targetHostOnly) || effectivePool.contains(targetHostOnly) || CANDIDATE_POOL.contains(targetHostOnly)) && !isAkamaiHost(targetHostOnly)) {
+        return if (isValidHost(cleanedTarget) && isValidCustomCdnHost(targetHostOnly) &&
+            (isBiliCdnHost(targetHostOnly) || effectivePool.contains(targetHostOnly) || CANDIDATE_POOL.contains(targetHostOnly))
+        ) {
             targetHostOnly
         } else {
             config.customCdnPool
                 .map { cleanHost(it).lowercase().substringBefore(':') }
-                .firstOrNull { isValidHost(it) && !isAkamaiHost(it) }
+                .firstOrNull { isValidCustomCdnHost(it) }
                 ?: CANDIDATE_POOL[0]
         }
     }
@@ -579,6 +655,9 @@ object BiliAcceleratorCore {
         val hostname = parsed.host.lowercase()
         if (hostname == "127.0.0.1" || hostname == "localhost") {
             return noChange(original, "already-local-proxy")
+        }
+        if (!isMediaUrl(original)) {
+            return noChange(original, "ignored")
         }
         val segKey = extractSegmentKey(parsed.path)
         val cleanProxyHost = cleanHost(config.proxyHost).substringBefore(':').ifBlank { "proxy-tf-all-ws.bilivideo.com" }
@@ -765,7 +844,6 @@ object BiliAcceleratorCore {
         // 3. Akamai 节点处理：默认放行官方 Akamai 鉴权线路；杜绝非 BTR 模式下直接改写 Host 导致 403 播放失败
         val isAkamai = isAkamaiHost(hostname)
         val isBstar = hostname.endsWith(".bstarstatic.com", ignoreCase = true)
-        val isUposAkamai = isBiliAkamaiHost(hostname)
 
         // 关键防护（对齐 realzza 与 BTR）：Akamai HMAC 鉴权签名与 UPOS 完全不兼容。
         // 在非 BTR 模式下（无法通过 BTR 多源对冲兜底），严禁直接替换 Host 为 UPOS，强制放行以杜绝 HTTP 403 播放失败。
@@ -776,7 +854,7 @@ object BiliAcceleratorCore {
         // 4. PCDN 拦截 / Force 模式 / Akamai 改写
         val shouldRewrite = (isPcdn && config.blockPcdn) ||
                 (isAkamai && config.rewriteAkamai && config.enableBtr) ||
-                (config.forceUpos && (isBiliCdnHost(hostname) || isUposAkamai) && !isAkamai && !isBstar)
+                (config.forceUpos && isBiliCdnHost(hostname) && !isAkamai && !isBstar)
 
         if (shouldRewrite) {
             val target = resolveTargetHost(config)
@@ -806,7 +884,8 @@ object BiliAcceleratorCore {
         return noChange(original, "ok", isPcdn = isPcdn, isMcdn = false, segmentKey = segKey)
     }
 
-    private fun isCleanUposDonor(url: String, requireUpgcxcode: Boolean = false): Boolean {
+    internal fun isCleanUposDonor(url: String, requireUpgcxcode: Boolean = false): Boolean {
+        if (url.contains("hdnts=", ignoreCase = true)) return false
         val parsed = parseUri(url) ?: return false
         val host = cleanHost(parsed.host).lowercase().substringBefore(':')
         if (host.isBlank() || isIpAddress(host) || isKnownP2pHost(host) || isMcdnHost(host) ||

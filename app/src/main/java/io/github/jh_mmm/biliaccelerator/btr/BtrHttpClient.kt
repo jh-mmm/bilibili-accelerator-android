@@ -56,6 +56,18 @@ object BtrHttpClient {
         .retryOnConnectionFailure(false)
         .build()
 
+    const val CHUNK_ATTEMPT_CALL_TIMEOUT_MS = 15_000L
+
+    // 单分片拉取专用客户端：附加 15s 总调用超时，防止慢速滴流节点无限占用并发槽位
+    val chunkClient: OkHttpClient = client.newBuilder()
+        .callTimeout(CHUNK_ATTEMPT_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .build()
+
+    // 音频单分片拉取专用客户端：独立池 + 15s 总调用超时
+    val chunkAudioClient: OkHttpClient = audioClient.newBuilder()
+        .callTimeout(CHUNK_ATTEMPT_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .build()
+
     // 探针专用客户端：更紧凑的超时控制
     val probeClient: OkHttpClient = client.newBuilder()
         .connectTimeout(4000, TimeUnit.MILLISECONDS)

@@ -125,8 +125,9 @@ class BtrLiveHostPool(
     }
 
     fun unproven(): List<String> {
+        val now = System.currentTimeMillis()
         return health.entries
-            .filter { !it.value.proven && !it.value.banned }
+            .filter { !it.value.proven && !it.value.banned && it.value.blockedUntil <= now }
             .map { it.key }
     }
 
@@ -195,11 +196,26 @@ object BtrLiveCore {
     }
 
     fun isP2pUrl(value: String): Boolean {
-        val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(value)?.host).lowercase()
+        val trimmed = value.trim()
+        if (trimmed.isEmpty()) return false
+        val parsedHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(trimmed)?.host).lowercase()
+        val host = parsedHost.ifBlank {
+            val cleaned = BiliAcceleratorCore.cleanHost(trimmed).lowercase().substringBefore('/')
+            when {
+                cleaned.startsWith("[") -> cleaned.substringBefore(']') + "]"
+                cleaned.count { it == ':' } == 1 -> cleaned.substringBefore(':')
+                else -> cleaned
+            }
+        }
         if (host.isBlank()) return false
-        return BiliAcceleratorCore.isKnownP2pHost(host) ||
-                BiliAcceleratorCore.isMcdnHost(host) ||
-                host.split(".").firstOrNull()?.contains("302") == true
+        val bareHost = host.removeSurrounding("[", "]")
+        if (bareHost == "127.0.0.1" || bareHost == "::1" || bareHost == "0:0:0:0:0:0:0:1" || bareHost == "localhost") {
+            return false
+        }
+        return BiliAcceleratorCore.isIpAddress(host) ||
+            BiliAcceleratorCore.isKnownP2pHost(host) ||
+            BiliAcceleratorCore.isMcdnHost(host) ||
+            host.split(".").firstOrNull()?.contains("302") == true
     }
 
     /**

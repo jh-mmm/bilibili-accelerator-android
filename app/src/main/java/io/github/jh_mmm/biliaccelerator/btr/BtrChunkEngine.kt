@@ -48,9 +48,9 @@ object BtrChunkEngine {
     private class ClientDisconnectException(cause: IOException) : IOException(cause)
 
     internal fun shouldAllowUnmeasuredTrial(taskIndex: Long, totalTasks: Long): Boolean {
-        if (taskIndex < 2L) return false
+        if (taskIndex < 6L) return false
         if (taskIndex % UNMEASURED_TRIAL_INTERVAL_CHUNKS == 2L) return true
-        return totalTasks > 0L && taskIndex >= maxOf(2L, totalTasks - 3L)
+        return totalTasks > 0L && taskIndex >= maxOf(6L, totalTasks - 3L)
     }
 
     @Volatile
@@ -431,6 +431,7 @@ object BtrChunkEngine {
         private companion object {
             const val SAT_WINDOW_MS = 5_000L
             const val STEP_COOLDOWN_MS = 2_500L
+            const val TRIAL_WINDOW_MS = 5_000L
             const val TRIAL_REST_MS = 90_000L
             const val STALL_DEBOUNCE_MS = 3_000L
             const val IDLE_STEP_DOWN_MS = 8_000L
@@ -448,6 +449,9 @@ object BtrChunkEngine {
         private var intervalStartMs: Long = initialNowMs
         private var intervalBytes: Long = 0L
         private var bestBps: Double = 0.0
+        private var lastMeasuredBps: Double = 0.0
+        private var trialStartedAtMs: Long = 0L
+        private var trialBaselineBps: Double = 0.0
         private var lastTrialDirection: Int = 0
         private var trialStalled: Boolean = false
         private var prevIndexBeforeTrial: Int = 0
@@ -574,6 +578,8 @@ object BtrChunkEngine {
             if (currentConcurrency > peakConcurrency) peakConcurrency = currentConcurrency
             lastTrialDirection = 1
             trialStalled = false
+            trialStartedAtMs = nowMs
+            trialBaselineBps = lastMeasuredBps
             lastChangedAtMs = nowMs
             intervalStartMs = nowMs
             intervalBytes = 0L
@@ -624,21 +630,31 @@ object BtrChunkEngine {
                 syncCrossProcessHardCapLocked(nowMs)
                 intervalBytes += bytes
                 val elapsed = nowMs - intervalStartMs
-                if (elapsed < 1000L || intervalBytes < 256 * 1024L) return
-
-                val currentBps = (intervalBytes * 1000.0) / elapsed.coerceAtLeast(1L)
-                intervalStartMs = nowMs
-                intervalBytes = 0L
 
                 if (nowMs < pushbackCooldownUntilMs) {
-                    if (bestBps <= 0.0) bestBps = currentBps
+                    if (elapsed >= 1000L && intervalBytes >= 256 * 1024L) {
+                        val currentBps = (intervalBytes * 1000.0) / elapsed.coerceAtLeast(1L)
+                        intervalStartMs = nowMs
+                        intervalBytes = 0L
+                        lastMeasuredBps = currentBps
+                        if (bestBps <= 0.0 || currentBps > bestBps) bestBps = currentBps
+                    }
                     return
                 }
 
                 if (lastTrialDirection > 0) {
-                    val gained = currentBps >= bestBps * 1.08
+                    val trialElapsed = nowMs - trialStartedAtMs
+                    if (trialElapsed < TRIAL_WINDOW_MS || elapsed < 1000L || intervalBytes < 256 * 1024L) {
+                        return
+                    }
+                    val trialBps = (intervalBytes * 1000.0) / elapsed.coerceAtLeast(1L)
+                    intervalStartMs = nowMs
+                    intervalBytes = 0L
+                    lastMeasuredBps = trialBps
+                    if (trialBps > bestBps) bestBps = trialBps
+
+                    val gained = trialBaselineBps <= 0.0 || trialBps >= trialBaselineBps
                     if (gained || trialStalled) {
-                        if (currentBps > bestBps) bestBps = currentBps
                         lastTrialDirection = 0
                         trialStalled = false
                         pushbackStreak = 0
@@ -661,6 +677,13 @@ object BtrChunkEngine {
                     }
                     return
                 }
+
+                if (elapsed < 1000L || intervalBytes < 256 * 1024L) return
+
+                val currentBps = (intervalBytes * 1000.0) / elapsed.coerceAtLeast(1L)
+                intervalStartMs = nowMs
+                intervalBytes = 0L
+                lastMeasuredBps = currentBps
 
                 if (currentBps > bestBps) {
                     bestBps = currentBps
@@ -692,6 +715,8 @@ object BtrChunkEngine {
                 currentConcurrency = CONCURRENCY_LADDER[ladderIdx].coerceIn(minConcurrency, maxConcurrency)
                 lastTrialDirection = 0
                 trialStalled = false
+                trialStartedAtMs = 0L
+                trialBaselineBps = 0.0
                 lastChangedAtMs = nowMs
                 pushbackCooldownUntilMs = maxOf(pushbackCooldownUntilMs, nowMs + 15_000L)
                 if (isHard) {
@@ -747,6 +772,31 @@ object BtrChunkEngine {
                     lastHungerStepAtMs = nowMs
                     persistedLearnedConcurrency = currentConcurrency
                     persistState(nowMs)
+                }
+            }
+        }
+
+        fun onSeekSprint(targetConcurrency: Int, nowMs: Long = System.currentTimeMillis()) {
+            if (!autoScale) return
+            synchronized(lock) {
+                syncCrossProcessHardCapLocked(nowMs)
+                val hardMax = allowedMaxIndex(nowMs)
+                val clampedTarget = targetConcurrency.coerceIn(minConcurrency, maxConcurrency)
+                val targetIdx = CONCURRENCY_LADDER.indexOfFirst { it >= clampedTarget }
+                    .let { if (it == -1) CONCURRENCY_LADDER.lastIndex else it }
+                    .coerceAtMost(hardMax)
+                if (targetIdx > ladderIdx) {
+                    ladderIdx = targetIdx
+                    currentConcurrency = CONCURRENCY_LADDER[ladderIdx].coerceIn(minConcurrency, maxConcurrency)
+                    if (currentConcurrency > peakConcurrency) peakConcurrency = currentConcurrency
+                    lastTrialDirection = 0
+                    trialStalled = false
+                    trialStartedAtMs = 0L
+                    trialBaselineBps = 0.0
+                    lastChangedAtMs = nowMs
+                    idleSinceMs = nowMs
+                    intervalStartMs = nowMs
+                    intervalBytes = 0L
                 }
             }
         }
@@ -910,7 +960,8 @@ object BtrChunkEngine {
         }
 
         BtrSessionManager.maybeTriggerProactiveRefresh(session)
-        var candidateUrls = (listOf(session.primaryUrl) + session.backupUrls).distinct()
+        var candidateUrls = session.currentCandidateUrls()
+        val myStreamSeq = session.activeStreamSeq.incrementAndGet()
         val primaryHost = BiliAcceleratorCore.cleanHost(extractHostname(session.primaryUrl))
         val streamCallKey = "${session.sessionId}_${System.nanoTime()}"
         bindStreamSession(streamCallKey, session.sessionId)
@@ -961,7 +1012,7 @@ object BtrChunkEngine {
                         outcome.sawForbidden403 &&
                         BtrSessionManager.maybeTriggerProactiveRefresh(session, forceOnAuthFailure = true)
                     ) {
-                        candidateUrls = (listOf(session.primaryUrl) + session.backupUrls).distinct()
+                        candidateUrls = session.currentCandidateUrls()
                         outcome = probeMediaOutcome(
                             urls = candidateUrls,
                             session = session,
@@ -1066,7 +1117,7 @@ object BtrChunkEngine {
                         outcome.sawForbidden403 &&
                         BtrSessionManager.maybeTriggerProactiveRefresh(session, forceOnAuthFailure = true)
                     ) {
-                        candidateUrls = (listOf(session.primaryUrl) + session.backupUrls).distinct()
+                        candidateUrls = session.currentCandidateUrls()
                         outcome = probeMediaOutcome(
                             urls = candidateUrls,
                             session = session,
@@ -1138,6 +1189,17 @@ object BtrChunkEngine {
                 return false
             }
 
+            // Seek 并发瞬时冲刺恢复：兼容已完成片段的 Range 跳跃，及客户端主动断开旧流后重连的 Seek
+            val prevWarmEnd = session.warmEnd.get()
+            val abortedSeekHint = session.lastAbortedSeekHint.getAndSet(false)
+            val prevObservedStart = session.lastObservedStart.getAndSet(effectiveStart)
+            val isDisjointSeek = (prevWarmEnd > 0L && effectiveStart != prevWarmEnd) ||
+                (abortedSeekHint && prevObservedStart >= 0L && effectiveStart != prevObservedStart) ||
+                (prevWarmEnd == 0L && effectiveStart > 0L && prevObservedStart >= 0L && effectiveStart != prevObservedStart)
+            if (!isHeadOnly && !isAudio && !isEpisode && useAuto && isDisjointSeek) {
+                concurrencyController.onSeekSprint(initialCon)
+            }
+
             // 根据探针测得或已缓存的媒体总长度，自适应计算后续分片拉取的最佳 ChunkSize
             val activeChunkSize = calculateDynamicChunkSize(
                 totalLength = totalLength,
@@ -1146,10 +1208,15 @@ object BtrChunkEngine {
                 isAudio = isAudio
             )
 
-            // 2. 构造 HTTP 206 Partial Content (或 200 OK) 响应头
-            val isPartial = parsedRange.hasRange || effectiveStart > 0L || effectiveEnd != null
+            // 2. 构造 HTTP 206 Partial Content (或 200 OK) 响应头（严格符合 RFC 9110，杜绝无 Content-Range 的 206）
             val hasExactTotalRange = totalLength > 0L && actualEnd >= effectiveStart
             val hasBoundedClientRange = effectiveEnd != null && actualEnd >= effectiveStart
+            if (effectiveStart > 0L && !hasExactTotalRange && !hasBoundedClientRange) {
+                sendHttpError(clientOut, 502, "Bad Gateway - Unknown Total Length for Open Range Seek")
+                return false
+            }
+            val isPartial = (parsedRange.hasRange || effectiveStart > 0L || effectiveEnd != null) &&
+                (hasExactTotalRange || hasBoundedClientRange)
             val canKeepAliveResponse = keepAlive && hasExactTotalRange
 
             fun buildResponseHeadersBytes(): ByteArray {
@@ -1224,6 +1291,9 @@ object BtrChunkEngine {
 
             // 已在首片探针中完成全部范围传输
             if (currentOffset > actualEnd) {
+                if (!isHeadOnly && hasExactTotalRange && session.activeStreamSeq.get() == myStreamSeq) {
+                    session.warmEnd.set(actualEnd + 1L)
+                }
                 return canKeepAliveResponse
             }
 
@@ -1446,10 +1516,22 @@ object BtrChunkEngine {
                     } catch (_: IOException) {
                         Log.i(TAG, "Client disconnected (Seek or stop). Session=${session.sessionId}")
                         isClientAborted.set(true)
+                        if (session.activeStreamSeq.get() == myStreamSeq) {
+                            session.warmEnd.set(0L)
+                            session.lastAbortedSeekHint.set(true)
+                        }
                         return false
                     }
                 }
-                return (nextDeliverIndex >= totalTasks && !isClientAborted.get() && canKeepAliveResponse)
+                val completed = nextDeliverIndex >= totalTasks && !isClientAborted.get()
+                if (session.activeStreamSeq.get() == myStreamSeq) {
+                    if (completed && !isHeadOnly && hasExactTotalRange) {
+                        session.warmEnd.set(actualEnd + 1L)
+                    } else if (!completed) {
+                        session.warmEnd.set(0L)
+                    }
+                }
+                return (completed && canKeepAliveResponse)
             } finally {
                 isClientAborted.set(true)
                 synchronized(workerGate) {
@@ -1624,13 +1706,13 @@ object BtrChunkEngine {
         streamCallKey: String
     ) {
         var offset = startOffset
-        val okClient = if (session.isAudio) BtrHttpClient.audioClient else BtrHttpClient.client
+        val okClient = if (session.isAudio) BtrHttpClient.chunkAudioClient else BtrHttpClient.chunkClient
         val buffer = ByteArray(16 * 1024)
         var didRefresh403 = false
 
         while (true) {
             val reqEnd = offset + chunkSize - 1L
-            val activeUrls = (listOf(session.primaryUrl) + session.backupUrls).distinct()
+            val activeUrls = session.currentCandidateUrls()
             val candidates = sortUrlsByHealthAndSpeed(activeUrls, offset / chunkSize.coerceAtLeast(1L), session)
             var progressed = false
             var reachedEof = false
@@ -1667,6 +1749,11 @@ object BtrChunkEngine {
                             return@use
                         }
                         val crInfo = parseContentRange(cr)
+                        crInfo?.total?.let { knownTotal ->
+                            if (knownTotal > 0L && session.totalLength <= 0L) {
+                                session.totalLength = knownTotal
+                            }
+                        }
                         val expectedBodyLen = response.body?.contentLength() ?: -1L
                         val bodyStream = response.body?.byteStream() ?: return@use
                         var read: Int
@@ -2013,9 +2100,14 @@ object BtrChunkEngine {
         totalTasks: Long
     ) {
         if (isClientAborted.get()) return
-        val allowUnmeasuredTrial = shouldAllowUnmeasuredTrial(task.index, totalTasks)
+        val allowUnmeasuredTrial = shouldAllowUnmeasuredTrial(task.index, totalTasks) || (
+            totalTasks in 1L..5L &&
+                task.index == totalTasks - 1L &&
+                (session.unmeasuredTrialWaited.incrementAndGet() % 4 == 0)
+            )
         val lastHttpCode = AtomicInteger(0)
         var didRefresh403 = false
+        val triedUrlsInPiece = java.util.Collections.synchronizedSet(HashSet<String>())
         var round = 0
 
         while (round < PIECE_ROUNDS) {
@@ -2024,7 +2116,9 @@ object BtrChunkEngine {
                 concurrencyController?.onSlow()
             }
 
-            val activeUrls = (listOf(session.primaryUrl) + session.backupUrls).distinct()
+            val roundStartMs = System.currentTimeMillis()
+            val baselineBytes = task.receivedBytes.toLong()
+            val activeUrls = session.currentCandidateUrls()
             val rotationIndex = session.globalChunkIndex.getAndIncrement()
             val sortedUrls = sortUrlsByHealthAndSpeed(activeUrls, rotationIndex, session, allowUnmeasuredTrial)
             if (sortedUrls.isEmpty()) break
@@ -2044,12 +2138,27 @@ object BtrChunkEngine {
                 }
             }
 
-            val primaryUrl = roundUrls.first()
-            val hedgeUrl = if (round == 0 && roundUrls.size > 1) roundUrls[1] else null
+            val untriedRoundUrls = roundUrls.filter { it !in triedUrlsInPiece }
+            val alreadyTriedRoundUrls = roundUrls.filter { it in triedUrlsInPiece }
+            val orderedRoundUrls = when {
+                untriedRoundUrls.isNotEmpty() -> untriedRoundUrls + alreadyTriedRoundUrls
+                roundUrls.size > 1 -> {
+                    val shift = round % roundUrls.size
+                    roundUrls.subList(shift, roundUrls.size) + roundUrls.subList(0, shift)
+                }
+                else -> roundUrls
+            }
+
+            val primaryUrl = orderedRoundUrls.first()
+            triedUrlsInPiece.add(primaryUrl)
+            val primaryEndpoint = extractEndpointKey(primaryUrl)
+            val hedgeUrl = orderedRoundUrls.drop(1).firstOrNull { extractEndpointKey(it) != primaryEndpoint }
+                ?: orderedRoundUrls.getOrNull(1)
             val hedgeDelayMs = if (task.index <= 1L) 800L else DEFAULT_HEDGE_DELAY_MS
 
             val hasWinner = AtomicBoolean(false)
             val primaryFinished = AtomicBoolean(false)
+            val hedgeFired = AtomicBoolean(false)
             val hedgeLock = Object()
             registerHedgeLock(streamCallKey, hedgeLock)
             val primaryCallRef = AtomicReference<Call?>(null)
@@ -2067,7 +2176,19 @@ object BtrChunkEngine {
                                     hedgeLock.wait(rem)
                                 }
                             }
-                            if (!hasWinner.get() && !isClientAborted.get() && !task.isSuccess) {
+                            val downloaded = task.receivedBytes.toLong()
+                            val expected = (task.endByte - task.startByte + 1L).coerceAtLeast(1L)
+                            val elapsedMs = maxOf(1L, System.currentTimeMillis() - roundStartMs)
+                            val liveBytes = maxOf(0L, downloaded - baselineBytes)
+                            val primaryLiveBps = (liveBytes * 1000.0) / elapsedMs
+                            val hedgeBps = getRouteSpeed(hedgeUrl)
+                            val skipFastAlmostDoneHedge = !primaryFinished.get() &&
+                                downloaded > (expected * 3L) / 4L &&
+                                primaryLiveBps >= 256.0 * 1024.0 &&
+                                !(hedgeBps > 0.0 && hedgeBps >= primaryLiveBps * 1.5)
+                            if (!hasWinner.get() && !isClientAborted.get() && !task.isSuccess && !skipFastAlmostDoneHedge) {
+                                hedgeFired.set(true)
+                                triedUrlsInPiece.add(hedgeUrl)
                                 tryAttemptFetch(
                                     task = task,
                                     url = hedgeUrl,
@@ -2081,7 +2202,8 @@ object BtrChunkEngine {
                                     callHolder = hedgeCallRef,
                                     counterpartCallHolder = primaryCallRef,
                                     streamCallKey = streamCallKey,
-                                    lastHttpCode = lastHttpCode
+                                    lastHttpCode = lastHttpCode,
+                                    isClientAborted = isClientAborted
                                 )
                             }
                         } catch (_: InterruptedException) {}
@@ -2103,7 +2225,8 @@ object BtrChunkEngine {
                     callHolder = primaryCallRef,
                     counterpartCallHolder = hedgeCallRef,
                     streamCallKey = streamCallKey,
-                    lastHttpCode = lastHttpCode
+                    lastHttpCode = lastHttpCode,
+                    isClientAborted = isClientAborted
                 )
             } finally {
                 primaryFinished.set(true)
@@ -2124,11 +2247,13 @@ object BtrChunkEngine {
             }
 
             if (!task.isSuccess && !isClientAborted.get()) {
-                val startRemaining = if (hedgeUrl != null) 2 else 1
-                val remainingUrls = roundUrls.drop(startRemaining)
+                val remainingUrls = orderedRoundUrls.filter { candidate ->
+                    candidate != primaryUrl && (!hedgeFired.get() || candidate != hedgeUrl)
+                }
                 for (url in remainingUrls) {
                     if (isClientAborted.get() || task.isSuccess) break
                     if (lastHttpCode.get() == 403 && isUrlExpired(session) && didRefresh403) break
+                    triedUrlsInPiece.add(url)
                     val singleCallRef = AtomicReference<Call?>(null)
                     tryAttemptFetch(
                         task = task,
@@ -2143,7 +2268,8 @@ object BtrChunkEngine {
                         callHolder = singleCallRef,
                         counterpartCallHolder = null,
                         streamCallKey = streamCallKey,
-                        lastHttpCode = lastHttpCode
+                        lastHttpCode = lastHttpCode,
+                        isClientAborted = isClientAborted
                     )
                     if (task.isSuccess) break
                 }
@@ -2156,6 +2282,7 @@ object BtrChunkEngine {
             ) {
                 didRefresh403 = true
                 lastHttpCode.set(0)
+                triedUrlsInPiece.clear()
                 continue
             }
 
@@ -2164,7 +2291,7 @@ object BtrChunkEngine {
                     task.lastHttpCode = 403
                     break
                 }
-                val backoffMs = (250L * (round + 1)).coerceAtMost(750L)
+                val backoffMs = minOf(2000L, 500L * (1L shl round))
                 var slept = 0L
                 while (slept < backoffMs && !isClientAborted.get()) {
                     try {
@@ -2179,7 +2306,7 @@ object BtrChunkEngine {
         }
 
         // 最终直连兜底尝试
-        val latestUrls = (listOf(session.primaryUrl) + session.backupUrls).distinct()
+        val latestUrls = session.currentCandidateUrls()
         if (!task.isSuccess && !isClientAborted.get() && latestUrls.isNotEmpty() && !(lastHttpCode.get() == 403 && isUrlExpired(session))) {
             val sortedFallback = sortUrlsByHealthAndSpeed(latestUrls, task.index, session)
             val fallbackCandidate = sortedFallback.firstOrNull { u ->
@@ -2219,8 +2346,10 @@ object BtrChunkEngine {
         callHolder: AtomicReference<Call?>,
         counterpartCallHolder: AtomicReference<Call?>?,
         streamCallKey: String,
-        lastHttpCode: AtomicInteger? = null
+        lastHttpCode: AtomicInteger? = null,
+        isClientAborted: AtomicBoolean? = null
     ) {
+        if (hasWinner.get() || task.isSuccess || isClientAborted?.get() == true) return
         val host = extractHostname(url)
         val attemptId = attemptSeq.incrementAndGet()
         val startTime = System.currentTimeMillis()
@@ -2242,13 +2371,20 @@ object BtrChunkEngine {
             .header("Connection", "keep-alive")
             .build()
 
-        val okClient = if (session.isAudio) BtrHttpClient.audioClient else BtrHttpClient.client
+        val okClient = if (session.isAudio) BtrHttpClient.chunkAudioClient else BtrHttpClient.chunkClient
         val call = okClient.newCall(request)
         callHolder.set(call)
         registerStreamCall(streamCallKey, session.sessionId, call)
+        if (hasWinner.get() || task.isSuccess || isClientAborted?.get() == true) {
+            runCatching { call.cancel() }
+            unregisterStreamCall(streamCallKey, call)
+            return
+        }
 
         var localBytesRead = 0L
         var completedNormally = false
+        var partialResultBuf: ByteArray? = null
+        var partialWritePos = 0
         val isPrefixProducer = (resumeOffset == 0) && task.tryClaimPrefixProducer(attemptId)
 
         try {
@@ -2276,7 +2412,20 @@ object BtrChunkEngine {
 
                     val body = response.body ?: return
                     val stream = body.byteStream()
-                    var finalData: ByteArray? = null
+
+                    fun commitWin(data: ByteArray) {
+                        task.data = data
+                        task.isSuccess = true
+                        task.clearPrefixBuffersOnWin()
+                        session.banList.recordSuccess(url, host)
+                        val latency = maxOf(1L, System.currentTimeMillis() - startTime)
+                        recordRouteSpeed(url, data.size.toLong(), latency)
+                        statsTracker.recordChunk(host, data.size.toLong(), latency)
+                        concurrencyController?.recordProgress(data.size.toLong())
+                        counterpartCallHolder?.get()?.let { slowCall ->
+                            runCatching { slowCall.cancel() }
+                        }
+                    }
 
                     if (isPrefixProducer) {
                         val tempBuf = ByteArray(16 * 1024)
@@ -2305,20 +2454,33 @@ object BtrChunkEngine {
                             reportFailover(host, "分片数据截断 ($localBytesRead/$needBytes 字节)", session.sessionId)
                             return
                         }
-                        finalData = task.consumeOwnedLiveBuffer(attemptId)
+                        completedNormally = true
+                        if (hasWinner.compareAndSet(false, true)) {
+                            val ownedData = task.consumeOwnedLiveBuffer(attemptId)
+                            if (ownedData != null && ownedData.size == expectedTotal) {
+                                commitWin(ownedData)
+                            }
+                        }
+                        return
                     } else {
                         val resultBuf = ByteArray(expectedTotal)
                         if (resumeOffset > 0 && existingPrefix != null) {
                             System.arraycopy(existingPrefix, 0, resultBuf, 0, resumeOffset)
                         }
                         var writePos = resumeOffset
+                        partialResultBuf = resultBuf
+                        partialWritePos = writePos
                         while (writePos < expectedTotal) {
                             val toRead = minOf(16 * 1024, expectedTotal - writePos)
                             val read = stream.read(resultBuf, writePos, toRead)
                             if (read == -1) break
                             if (hasWinner.get() && task.isSuccess) return
                             writePos += read
+                            partialWritePos = writePos
                             localBytesRead += read
+                            if (writePos > task.receivedBytes) {
+                                task.receivedBytes = writePos
+                            }
                         }
                         if (localBytesRead == 0L) {
                             session.banList.recordTransportFailure(host, 20_000L, url = url)
@@ -2332,7 +2494,7 @@ object BtrChunkEngine {
                             return
                         }
                         if (writePos < expectedTotal) {
-                            if (resumeOffset == 0 && writePos >= RESUME_MIN_BYTES && !hasWinner.get()) {
+                            if (writePos >= RESUME_MIN_BYTES && !hasWinner.get()) {
                                 task.saveFallbackPrefixIfBetter(resultBuf, writePos)
                             }
                             session.banList.recordTransportFailure(host, 15_000L, url = url, receivedBytes = localBytesRead)
@@ -2340,27 +2502,12 @@ object BtrChunkEngine {
                             reportFailover(host, "分片数据截断 (${localBytesRead}/$needBytes 字节)", session.sessionId)
                             return
                         }
-                        finalData = resultBuf
-                    }
-
-                    if (finalData == null || finalData.size != expectedTotal) return
-
-                    completedNormally = true
-                    if (hasWinner.compareAndSet(false, true)) {
-                        task.data = finalData
-                        task.isSuccess = true
-                        task.clearPrefixBuffersOnWin()
-                        session.banList.recordSuccess(url, host)
-                        val latency = maxOf(1L, System.currentTimeMillis() - startTime)
-                        recordRouteSpeed(url, finalData.size.toLong(), latency)
-                        statsTracker.recordChunk(host, finalData.size.toLong(), latency)
-                        concurrencyController?.recordProgress(finalData.size.toLong())
-
-                        counterpartCallHolder?.get()?.let { slowCall ->
-                            runCatching { slowCall.cancel() }
+                        completedNormally = true
+                        if (hasWinner.compareAndSet(false, true)) {
+                            commitWin(resultBuf)
                         }
+                        return
                     }
-                    return
                 } else if (code >= 400) {
                     lastHttpCode?.set(code)
                     val isNodeFault = session.banList.recordHttpFailure(url, host, code)
@@ -2378,11 +2525,17 @@ object BtrChunkEngine {
             }
         } catch (e: Exception) {
             if (!call.isCanceled()) {
+                if (localBytesRead == 0L && (e is java.net.SocketTimeoutException || e is java.io.InterruptedIOException)) {
+                    concurrencyController?.onSlow()
+                }
                 session.banList.recordTransportFailure(host, 15_000L, url = url, receivedBytes = localBytesRead)
                 penalizeHost(host, 12_000L)
                 reportFailover(host, "分片拉取异常: ${e.message}", session.sessionId)
             }
         } finally {
+            if (!completedNormally && partialResultBuf != null && partialWritePos >= RESUME_MIN_BYTES && partialWritePos < expectedTotal && !hasWinner.get() && !task.isSuccess) {
+                task.saveFallbackPrefixIfBetter(partialResultBuf!!, partialWritePos)
+            }
             if (!completedNormally && localBytesRead >= CANCEL_SPEED_MIN_BYTES) {
                 val partialElapsed = maxOf(1L, System.currentTimeMillis() - startTime)
                 recordRouteSpeed(url, localBytesRead, partialElapsed)
@@ -2477,9 +2630,15 @@ object BtrChunkEngine {
                 fastMeasured[(taskIndex % fastMeasured.size).toInt()]
             }
 
-            // 未测速新节点不插入起播关键前段分片；仅在流尾部窗口按试探位前置一次，避免慢节点拖垮起播
-            val trialPrimary = if (allowUnmeasuredTrial && unmeasured.isNotEmpty()) {
-                unmeasured[(taskIndex % unmeasured.size).toInt()]
+            // 未测速新节点不插入起播关键前段分片；仅在流尾部窗口或小范围抽样按轮换试探位前置，避免单个慢节点拖垮
+            val rotatedUnmeasured = if (unmeasured.size > 1) {
+                val uOffset = ((taskIndex % unmeasured.size).toInt() + unmeasured.size) % unmeasured.size
+                unmeasured.subList(uOffset, unmeasured.size) + unmeasured.subList(0, uOffset)
+            } else {
+                unmeasured
+            }
+            val trialPrimary = if (allowUnmeasuredTrial && rotatedUnmeasured.isNotEmpty()) {
+                rotatedUnmeasured.first()
             } else null
 
             val headList = if (trialPrimary != null) {
@@ -2489,7 +2648,7 @@ object BtrChunkEngine {
             }
 
             val slowMeasured = (measured - fastMeasured.toSet()).sortedByDescending { speeds[it] ?: 0.0 }
-            (headList + fastMeasured + unmeasured + slowMeasured).distinct()
+            (headList + fastMeasured + rotatedUnmeasured + slowMeasured).distinct()
         } else {
             val offset = ((taskIndex % healthyUrls.size).toInt() + healthyUrls.size) % healthyUrls.size
             healthyUrls.subList(offset, healthyUrls.size) + healthyUrls.subList(0, offset)
@@ -2573,6 +2732,14 @@ object BtrChunkEngine {
         return BiliAcceleratorCore.parseUri(url)?.host
             ?: runCatching { java.net.URI(url).host }.getOrNull()
             ?: ""
+    }
+
+    private fun extractEndpointKey(url: String): String {
+        val parsed = BiliAcceleratorCore.parseUri(url) ?: return extractHostname(url).lowercase()
+        val host = parsed.host.lowercase()
+        if (host.isBlank()) return ""
+        val port = parsed.port
+        return if (port > 0 && port != 80 && port != 443) "$host:$port" else host
     }
 
     private fun isPenalized(host: String): Boolean {

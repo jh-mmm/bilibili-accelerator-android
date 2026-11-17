@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
@@ -18,7 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.outlined.AltRoute
+import androidx.compose.material.icons.automirrored.outlined.AltRoute
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
@@ -35,7 +36,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -249,7 +252,8 @@ fun SettingsScreen(
                                         config.targetHost
                                     },
                                     selectedValue = currentUposLabel,
-                                    onClick = { showUposDialog = true }
+                                    onClick = { showUposDialog = true },
+                                    enabled = config.enabled
                                 )
 
                                 PreferenceDivider()
@@ -304,7 +308,7 @@ fun SettingsScreen(
                                     title = "MCDN 策略配置",
                                     summary = mcdnSummary,
                                     selectedValue = if (config.proxyMcdn) "已开启" else "已停用",
-                                    icon = Icons.Outlined.AltRoute,
+                                    icon = Icons.AutoMirrored.Outlined.AltRoute,
                                     onClick = { currentSubPage = SettingsSubPage.MCDN },
                                     enabled = config.enabled
                                 )
@@ -454,7 +458,7 @@ fun SettingsScreen(
                                     summary = stringResource(R.string.summary_enable_mcdn_proxy),
                                     checked = config.proxyMcdn,
                                     onCheckedChange = { onConfigChange(config.copy(proxyMcdn = it)) },
-                                    icon = Icons.Outlined.AltRoute,
+                                    icon = Icons.AutoMirrored.Outlined.AltRoute,
                                     enabled = config.enabled
                                 )
 
@@ -548,15 +552,18 @@ fun SettingsScreen(
 
                                 PreferenceDivider()
 
-                                // 1. BTR 并发线程数 - 滑块调节
-                                val concurrencyDesc = when (config.btrConcurrency) {
+                                // 1. BTR 并发线程数 - 滑块调节（拖动中仅更新本地瞬态，松手/点击完成时统一提交 IPC）
+                                var sliderConcurrency by remember(config.btrConcurrency) {
+                                    mutableIntStateOf(config.btrConcurrency.coerceIn(2, 16))
+                                }
+                                val concurrencyDesc = when (sliderConcurrency) {
                                     2 -> "2 线程"
                                     4 -> "4 线程"
                                     6 -> "6 线程"
                                     8 -> "8 线程"
                                     12 -> "12 线程"
                                     16 -> "16 线程"
-                                    else -> "${config.btrConcurrency} 线程"
+                                    else -> "$sliderConcurrency 线程"
                                 }
                                 val concurrencySummary = if (config.btrAutoConcurrency) {
                                     "最高并发上限: $concurrencyDesc (在 2~$concurrencyDesc 间自适应调节)"
@@ -567,48 +574,55 @@ fun SettingsScreen(
                                 PreferenceSliderItem(
                                     title = "BTR 并发线程数",
                                     summary = concurrencySummary,
-                                    value = config.btrConcurrency.coerceIn(2, 16).toFloat(),
+                                    value = sliderConcurrency.toFloat(),
                                     onValueChange = { newVal ->
-                                        val rounded = newVal.roundToInt()
-                                        if (rounded != config.btrConcurrency) {
-                                            onConfigChange(config.copy(btrConcurrency = rounded))
+                                        sliderConcurrency = newVal.roundToInt().coerceIn(2, 16)
+                                    },
+                                    onValueChangeFinished = {
+                                        if (sliderConcurrency != config.btrConcurrency) {
+                                            onConfigChange(config.copy(btrConcurrency = sliderConcurrency))
                                         }
                                     },
                                     valueRange = 2f..16f,
                                     steps = 13,
                                     showKeyPoints = true,
                                     keyPoints = listOf(2f, 4f, 6f, 8f, 12f, 16f),
-                                    valueLabel = "${config.btrConcurrency} 线程",
+                                    valueLabel = "$sliderConcurrency 线程",
                                     enabled = config.enabled && config.enableBtr
                                 )
 
                                 PreferenceDivider()
 
                                 // 2. 并发 CDN 节点池 - 滑块调节
-                                val poolSummary = when (config.btrCdnPoolSize) {
+                                var sliderPoolSize by remember(config.btrCdnPoolSize) {
+                                    mutableIntStateOf(config.btrCdnPoolSize.coerceIn(1, 16))
+                                }
+                                val poolSummary = when (sliderPoolSize) {
                                     1 -> "1 个节点 · 仅单源拉取，不进行多源并发调度"
-                                    in 2..3 -> "${config.btrCdnPoolSize} 个节点 · 基础多源互备，低握手开销"
-                                    in 4..6 -> "${config.btrCdnPoolSize} 个节点 · 骨干云厂商节点均衡并发"
+                                    in 2..3 -> "$sliderPoolSize 个节点 · 基础多源互备，低握手开销"
+                                    in 4..6 -> "$sliderPoolSize 个节点 · 骨干云厂商节点均衡并发"
                                     8 -> "8 个节点 · 推荐配置，官方多源全量并发拉取"
-                                    in 9..12 -> "${config.btrCdnPoolSize} 个节点 · 深度竞速，含全国混流节点"
-                                    else -> "${config.btrCdnPoolSize} 个节点 · 极限全量并发，极高吞吐 (全池竞速)"
+                                    in 9..12 -> "$sliderPoolSize 个节点 · 深度竞速，含全国混流节点"
+                                    else -> "$sliderPoolSize 个节点 · 极限全量并发，极高吞吐 (全池竞速)"
                                 }
 
                                 PreferenceSliderItem(
                                     title = "并发 CDN 节点池",
                                     summary = poolSummary,
-                                    value = config.btrCdnPoolSize.coerceIn(1, 16).toFloat(),
+                                    value = sliderPoolSize.toFloat(),
                                     onValueChange = { newVal ->
-                                        val rounded = newVal.roundToInt().coerceIn(1, 16)
-                                        if (rounded != config.btrCdnPoolSize) {
-                                            onConfigChange(config.copy(btrCdnPoolSize = rounded))
+                                        sliderPoolSize = newVal.roundToInt().coerceIn(1, 16)
+                                    },
+                                    onValueChangeFinished = {
+                                        if (sliderPoolSize != config.btrCdnPoolSize) {
+                                            onConfigChange(config.copy(btrCdnPoolSize = sliderPoolSize))
                                         }
                                     },
                                     valueRange = 1f..16f,
                                     steps = 14,
                                     showKeyPoints = true,
                                     keyPoints = listOf(1f, 2f, 4f, 6f, 8f, 12f, 16f),
-                                    valueLabel = "${config.btrCdnPoolSize} 个节点",
+                                    valueLabel = "$sliderPoolSize 个节点",
                                     enabled = config.enabled && config.enableBtr
                                 )
 
@@ -617,7 +631,8 @@ fun SettingsScreen(
                                 PreferenceActionItem(
                                     title = "自定义 CDN 节点池",
                                     summary = if (config.customCdnPool.isEmpty()) "未自定义 (使用系统默认 CDN 节点池)" else "已配置 ${config.customCdnPool.size} 个自定义节点",
-                                    onClick = { if (config.enabled && config.enableBtr) showCustomCdnDialog = true }
+                                    onClick = { showCustomCdnDialog = true },
+                                    enabled = config.enabled && config.enableBtr
                                 )
 
                                 PreferenceDivider()
@@ -634,13 +649,16 @@ fun SettingsScreen(
 
                                 // 3. 基准分片大小 - 滑块调节
                                 val chunkOptions = listOf(256, 512, 1024, 2048)
-                                val currentChunkIndex = chunkOptions.indexOf(config.btrChunkSizeKb).let { if (it >= 0) it else 1 }
-                                val chunkSizeDesc = when (config.btrChunkSizeKb) {
+                                var sliderChunkIdx by remember(config.btrChunkSizeKb) {
+                                    mutableIntStateOf(chunkOptions.indexOf(config.btrChunkSizeKb).let { if (it >= 0) it else 1 })
+                                }
+                                val displayChunkSizeKb = chunkOptions[sliderChunkIdx.coerceIn(0, chunkOptions.lastIndex)]
+                                val chunkSizeDesc = when (displayChunkSizeKb) {
                                     256 -> "256 KB"
                                     512 -> "512 KB (标准均衡推荐)"
                                     1024 -> "1024 KB"
                                     2048 -> "2048 KB"
-                                    else -> "${config.btrChunkSizeKb} KB"
+                                    else -> "$displayChunkSizeKb KB"
                                 }
                                 val chunkSizeSummary = if (config.btrAutoChunkSize) {
                                     "标准档基准: $chunkSizeDesc (按文件体积在 256KB~2048KB 间比例缩放)"
@@ -651,19 +669,21 @@ fun SettingsScreen(
                                 PreferenceSliderItem(
                                     title = "基准分片大小",
                                     summary = chunkSizeSummary,
-                                    value = currentChunkIndex.toFloat(),
+                                    value = sliderChunkIdx.toFloat(),
                                     onValueChange = { newIdx ->
-                                        val idx = newIdx.roundToInt().coerceIn(0, chunkOptions.lastIndex)
-                                        val newChunkSize = chunkOptions[idx]
-                                        if (newChunkSize != config.btrChunkSizeKb) {
-                                            onConfigChange(config.copy(btrChunkSizeKb = newChunkSize))
+                                        sliderChunkIdx = newIdx.roundToInt().coerceIn(0, chunkOptions.lastIndex)
+                                    },
+                                    onValueChangeFinished = {
+                                        val committedChunkSize = chunkOptions[sliderChunkIdx.coerceIn(0, chunkOptions.lastIndex)]
+                                        if (committedChunkSize != config.btrChunkSizeKb) {
+                                            onConfigChange(config.copy(btrChunkSizeKb = committedChunkSize))
                                         }
                                     },
                                     valueRange = 0f..3f,
                                     steps = 2,
                                     showKeyPoints = true,
                                     keyPoints = listOf(0f, 1f, 2f, 3f),
-                                    valueLabel = "${config.btrChunkSizeKb} KB",
+                                    valueLabel = "$displayChunkSizeKb KB",
                                     enabled = config.enabled && config.enableBtr
                                 )
                             }
@@ -733,7 +753,7 @@ private fun SingleChoiceDialog(
                             selected = (index == selectedIndex),
                             onClick = { onSelect(index) }
                         )
-                        Spacer(Modifier.height(4.dp))
+                        Spacer(Modifier.width(4.dp))
                         Text(
                             text = text,
                             fontSize = 14.sp,
@@ -761,6 +781,9 @@ private fun CustomCdnPoolDialog(
     var textValue by rememberSaveable {
         mutableStateOf(customPool.joinToString("\n"))
     }
+    var validationError by rememberSaveable {
+        mutableStateOf<String?>(null)
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -772,14 +795,19 @@ private fun CustomCdnPoolDialog(
                     .verticalScroll(rememberScrollState())
             ) {
                 Text(
-                    text = "每行填写一个 CDN 节点域名。留空则自动使用官方推荐的默认骨干 CDN 节点池。",
+                    text = "每行填写一个 B 站官方 CDN 域名（.bilivideo.com/.cn/.net）。留空则自动使用官方推荐的默认骨干 CDN 节点池。",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(bottom = 8.dp)
                 )
                 OutlinedTextField(
                     value = textValue,
-                    onValueChange = { textValue = it },
+                    onValueChange = {
+                        textValue = it
+                        validationError = null
+                    },
+                    isError = validationError != null,
+                    supportingText = validationError?.let { err -> { Text(err) } },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(180.dp),
@@ -789,10 +817,18 @@ private fun CustomCdnPoolDialog(
         },
         confirmButton = {
             TextButton(onClick = {
-                val hosts = textValue.lines()
-                    .map { BiliAcceleratorCore.cleanHost(it).trim().lowercase() }
-                    .filter { it.isNotBlank() && BiliAcceleratorCore.isValidHost(it) && !BiliAcceleratorCore.isAkamaiHost(it) }
-                    .distinct()
+                val parsed = textValue.lines()
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .map { raw -> raw to BiliAcceleratorCore.cleanHost(raw).trim().lowercase().substringBefore(':') }
+                val invalid = parsed.filter { (_, host) -> !BiliAcceleratorCore.isValidCustomCdnHost(host) }
+                if (invalid.isNotEmpty()) {
+                    val preview = invalid.take(2).joinToString(", ") { it.first }
+                    val suffix = if (invalid.size > 2) " 等 ${invalid.size} 项" else ""
+                    validationError = "包含无效或非官方 CDN 域名：$preview$suffix"
+                    return@TextButton
+                }
+                val hosts = parsed.map { it.second }.distinct()
                 onSave(hosts)
             }) {
                 Text("保存")
@@ -828,10 +864,13 @@ private fun ProxyHostDialog(
     val presetIndex = presets.indexOfFirst { it.first == currentHost }
     val isPreset = presetIndex >= 0
     var selectedPresetIndex by rememberSaveable {
-        mutableStateOf(if (isPreset) presetIndex else presets.size)
+        mutableIntStateOf(if (isPreset) presetIndex else presets.size)
     }
     var customHost by rememberSaveable {
         mutableStateOf(if (isPreset) "" else currentHost)
+    }
+    var validationError by rememberSaveable {
+        mutableStateOf<String?>(null)
     }
 
     AlertDialog(
@@ -849,14 +888,20 @@ private fun ProxyHostDialog(
                             .fillMaxWidth()
                             .selectable(
                                 selected = (selectedPresetIndex == index),
-                                onClick = { selectedPresetIndex = index }
+                                onClick = {
+                                    selectedPresetIndex = index
+                                    validationError = null
+                                }
                             )
                             .padding(vertical = 10.dp, horizontal = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         RadioButton(
                             selected = (selectedPresetIndex == index),
-                            onClick = { selectedPresetIndex = index }
+                            onClick = {
+                                selectedPresetIndex = index
+                                validationError = null
+                            }
                         )
                         Column(modifier = Modifier.padding(start = 8.dp)) {
                             Text(text = label, fontSize = 14.sp)
@@ -893,7 +938,12 @@ private fun ProxyHostDialog(
                 if (selectedPresetIndex == presets.size) {
                     OutlinedTextField(
                         value = customHost,
-                        onValueChange = { customHost = it },
+                        onValueChange = {
+                            customHost = it
+                            validationError = null
+                        },
+                        isError = validationError != null,
+                        supportingText = validationError?.let { err -> { Text(err) } },
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 4.dp, vertical = 6.dp),
@@ -908,8 +958,12 @@ private fun ProxyHostDialog(
                 val chosenHost = if (selectedPresetIndex in presets.indices) {
                     presets[selectedPresetIndex].first
                 } else {
-                    val cleaned = BiliAcceleratorCore.cleanHost(customHost).substringBefore(':')
-                    if (BiliAcceleratorCore.isValidHost(cleaned)) cleaned else "proxy-tf-all-ws.bilivideo.com"
+                    val cleaned = BiliAcceleratorCore.cleanHost(customHost).trim().lowercase().substringBefore(':')
+                    if (!BiliAcceleratorCore.isValidCustomCdnHost(cleaned)) {
+                        validationError = "请输入有效的 B 站官方中继域名（如 proxy-tf-all-ws.bilivideo.com）"
+                        return@TextButton
+                    }
+                    cleaned
                 }
                 onSelect(chosenHost)
             }) {

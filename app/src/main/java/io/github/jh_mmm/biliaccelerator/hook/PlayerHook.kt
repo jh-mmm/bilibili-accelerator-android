@@ -9,10 +9,14 @@ import io.github.jh_mmm.biliaccelerator.core.PlayinfoRegistry
 import io.github.jh_mmm.biliaccelerator.core.PlayinfoTrackEntry
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.libxposed.api.XposedModule
+import java.lang.ref.ReferenceQueue
+import java.lang.ref.WeakReference
+import java.lang.reflect.Constructor
 import java.lang.reflect.Method
 import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.WeakHashMap
+import java.util.concurrent.ConcurrentHashMap
 
 object PlayerHook {
 
@@ -24,17 +28,71 @@ object PlayerHook {
 
     private val hookedBuilderClasses = Collections.newSetFromMap(WeakHashMap<Class<*>, Boolean>())
     private val hookedPlayerClasses = Collections.newSetFromMap(WeakHashMap<Class<*>, Boolean>())
+    private val hookedMethods = Collections.newSetFromMap(WeakHashMap<Method, Boolean>())
+    private val hookedConstructors = Collections.newSetFromMap(WeakHashMap<Constructor<*>, Boolean>())
 
-    private val builderPendingBackups = Collections.synchronizedMap(WeakHashMap<Any, List<String>>())
-    private val builderDeferredBackupMethod = Collections.synchronizedMap(WeakHashMap<Any, Method>())
-    private val builderLastBackupMethod = Collections.synchronizedMap(WeakHashMap<Any, Method>())
-    private val builderNativeConvergedToBtr = Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
-    private val builderResolvedNonBtr = Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
-    private val builderCleanLiveHost = Collections.synchronizedMap(WeakHashMap<Any, String>())
-    private val builderBtrUrl = Collections.synchronizedMap(WeakHashMap<Any, String>())
+    /**
+     * 基于对象引用恒等性 (===) 与 WeakReference 的线程安全映射，
+     * 防止目标 Builder/Player 类重写 equals/hashCode 导致的状态丢失或错乱。
+     */
+    private class IdentityWeakMap<V : Any> {
+        private class WeakIdentityKey(
+            referent: Any,
+            queue: ReferenceQueue<Any>? = null
+        ) : WeakReference<Any>(referent, queue) {
+            val identityHash: Int = System.identityHashCode(referent)
+            override fun hashCode(): Int = identityHash
+            override fun equals(other: Any?): Boolean {
+                if (this === other) return true
+                if (other !is WeakIdentityKey) return false
+                val a = get() ?: return false
+                val b = other.get() ?: return false
+                return a === b
+            }
+        }
+
+        private val queue = ReferenceQueue<Any>()
+        private val map = ConcurrentHashMap<WeakIdentityKey, V>()
+
+        private fun expungeStale() {
+            while (true) {
+                val ref = queue.poll() ?: break
+                @Suppress("UNCHECKED_CAST")
+                map.remove(ref as WeakIdentityKey)
+            }
+        }
+
+        operator fun get(key: Any?): V? {
+            if (key == null) return null
+            expungeStale()
+            return map[WeakIdentityKey(key)]
+        }
+
+        operator fun set(key: Any, value: V): V? {
+            expungeStale()
+            return map.put(WeakIdentityKey(key, queue), value)
+        }
+
+        fun remove(key: Any?): V? {
+            if (key == null) return null
+            expungeStale()
+            return map.remove(WeakIdentityKey(key))
+        }
+
+        fun containsKey(key: Any?): Boolean = get(key) != null
+    }
+
+    private val builderPendingBackups = IdentityWeakMap<List<String>>()
+    private val builderRawBackups = IdentityWeakMap<List<String>>()
+    private val builderDeferredBackupMethod = IdentityWeakMap<Method>()
+    private val builderLastBackupMethod = IdentityWeakMap<Method>()
+    private val builderNativeConvergedToBtr = IdentityWeakMap<Boolean>()
+    private val builderResolvedNonBtr = IdentityWeakMap<Boolean>()
+    private val builderCleanLiveUrls = IdentityWeakMap<List<String>>()
+    private val builderBtrUrl = IdentityWeakMap<String>()
     private val suppressBackupHook = ThreadLocal.withInitial { false }
-    private val liveDirCleanHosts = object : LinkedHashMap<String, String>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 16
+    private val livePathCleanUrls = object : LinkedHashMap<String, List<String>>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<String>>?): Boolean = size > 32
     }
 
     internal fun computeNativeBackupsForSession(
@@ -138,6 +196,7 @@ object PlayerHook {
                 builderDeferredBackupMethod.remove(it)
                 builderNativeConvergedToBtr.remove(it)
                 builderPendingBackups.remove(it)
+                builderRawBackups.remove(it)
             }
             return withBackupHookSuppressed { proceedOriginal() }
         }
@@ -147,6 +206,7 @@ object PlayerHook {
                 builderDeferredBackupMethod.remove(it)
                 builderNativeConvergedToBtr.remove(it)
                 builderPendingBackups.remove(it)
+                builderRawBackups.remove(it)
             }
             return withBackupHookSuppressed { proceedOriginal() }
         }
@@ -155,41 +215,52 @@ object PlayerHook {
             PlayinfoRegistry.lookup(rawUrl)?.hasDrm == true ||
                 BiliAcceleratorCore.hasDrmSignal(rawUrl)
         }
-        val distinctFiltered = if (!hasDrmBackup &&
-            (config.blockPcdn || config.proxyMcdn || config.forceUpos || (config.rewriteAkamai && config.enableBtr))
+        if (hasDrmBackup) {
+            builder?.let {
+                builderDeferredBackupMethod.remove(it)
+                builderNativeConvergedToBtr.remove(it)
+                builderPendingBackups.remove(it)
+                builderRawBackups.remove(it)
+                clearBuilderBtrState(it)
+                builderResolvedNonBtr[it] = true
+            }
+            return withBackupHookSuppressed { proceedOriginal() }
+        }
+
+        val distinctRaw = rawList.distinct()
+        val distinctFiltered = if (
+            config.blockPcdn || config.proxyMcdn || config.forceUpos || (config.rewriteAkamai && config.enableBtr)
         ) {
             filterAndFillBackupUrls(rawList, config, onRewrite)
         } else {
-            rawList.distinct()
+            distinctRaw
         }
 
         builder?.let {
+            builderRawBackups[it] = distinctRaw
             builderPendingBackups[it] = distinctFiltered
             builderLastBackupMethod[it] = method
-            if (!hasDrmBackup) {
-                val cleanLive = distinctFiltered.firstOrNull { cand ->
-                    val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cand)?.host)
-                    BiliAcceleratorCore.isLiveMediaUrl("", cand) &&
-                        !BiliAcceleratorCore.isSlowLiveHost(host, cand, config.portHeuristic)
-                }
-                if (cleanLive != null) {
-                    val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cleanLive)?.host)
-                    if (host.isNotBlank()) {
-                        builderCleanLiveHost[it] = host
-                        recordCleanLiveHost(cleanLive, host)
-                    }
+            val cleanLiveList = distinctFiltered.filter { cand ->
+                val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cand)?.host)
+                BiliAcceleratorCore.isLiveMediaUrl("", cand) &&
+                    !BiliAcceleratorCore.isSlowLiveHost(host, cand, config.portHeuristic)
+            }
+            if (cleanLiveList.isNotEmpty()) {
+                builderCleanLiveUrls[it] = cleanLiveList
+                for (cand in cleanLiveList) {
+                    recordCleanLiveUrl(cand)
                 }
             }
         }
 
         val rawBoundSessionId = builder?.let { BtrSessionManager.getSessionForBuilder(it) }
         val boundSessionId = rawBoundSessionId?.takeIf { BtrSessionManager.get(it) != null }
-        if (builder != null && ((rawBoundSessionId != null && boundSessionId == null) || hasDrmBackup)) {
+        if (builder != null && rawBoundSessionId != null && boundSessionId == null) {
             clearBuilderBtrState(builder)
             builderResolvedNonBtr[builder] = true
         }
         val btrConfigActive = config.enableBtr
-        if (btrConfigActive && !hasDrmBackup) {
+        if (btrConfigActive) {
             if (boundSessionId != null) {
                 BtrSessionManager.updateBackups(boundSessionId, distinctFiltered)
                 val btrUrl = builderBtrUrl[builder]
@@ -230,18 +301,38 @@ object PlayerHook {
         return withBackupHookSuppressed { proceedOriginal() }
     }
 
-    private fun recordCleanLiveHost(url: String, host: String) {
-        if (host.isBlank()) return
-        val dir = BiliAcceleratorCore.parseUri(url)?.path?.substringBeforeLast('/')?.takeIf { it.isNotBlank() } ?: return
-        synchronized(liveDirCleanHosts) {
-            liveDirCleanHosts[dir] = host
+    private fun normalizeLivePathKey(url: String): String {
+        return BiliAcceleratorCore.parseUri(url)?.path?.trim()?.trimEnd('/')?.lowercase().orEmpty()
+    }
+
+    private fun recordCleanLiveUrl(url: String) {
+        val pathKey = normalizeLivePathKey(url)
+        if (pathKey.isBlank()) return
+        synchronized(livePathCleanUrls) {
+            val existing = livePathCleanUrls[pathKey].orEmpty()
+            if (!existing.contains(url)) {
+                livePathCleanUrls[pathKey] = (existing + url).take(8)
+            }
         }
     }
 
-    private fun findCleanLiveHostForUrl(url: String, builderInstance: Any?): String? {
-        builderInstance?.let { builderCleanLiveHost[it] }?.let { return it }
-        val dir = BiliAcceleratorCore.parseUri(url)?.path?.substringBeforeLast('/')?.takeIf { it.isNotBlank() } ?: return null
-        return synchronized(liveDirCleanHosts) { liveDirCleanHosts[dir] }
+    private fun findCleanLiveUrlForUrl(
+        url: String,
+        builderInstance: Any?,
+        portHeuristic: Boolean
+    ): String? {
+        val targetPath = normalizeLivePathKey(url)
+        val builderCandidates = builderInstance?.let { builderCleanLiveUrls[it] }.orEmpty()
+        val pathCandidates = if (targetPath.isNotBlank()) {
+            synchronized(livePathCleanUrls) { livePathCleanUrls[targetPath].orEmpty() }
+        } else emptyList()
+        val combined = (builderCandidates + pathCandidates).distinct()
+        return combined.firstOrNull { cand ->
+            val candPath = normalizeLivePathKey(cand)
+            val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cand)?.host)
+            (targetPath.isBlank() || candPath == targetPath) &&
+                !BiliAcceleratorCore.isSlowLiveHost(host, cand, portHeuristic)
+        }
     }
 
     // Both spellings are observed across different Bilibili versions (Assert vs Asset)
@@ -283,9 +374,10 @@ object PlayerHook {
         synchronized(hookedBuilderClasses) {
             if (!hookedBuilderClasses.add(clazz)) return
         }
-        // 1. Hook all constructors (distinct 防止 public 构造器重复注入)
+        // 1. Hook all constructors (distinct + 全局去重防止继承方法重复注入)
         val constructors = (clazz.declaredConstructors + clazz.constructors).distinct()
         for (constructor in constructors) {
+            if (!synchronized(hookedConstructors) { hookedConstructors.add(constructor) }) continue
             try {
                 module.hook(constructor).intercept { chain ->
                     val newArgs = rewriteArgIfMedia(chain.args, chain.thisObject)
@@ -305,6 +397,7 @@ object PlayerHook {
         val methods = (clazz.declaredMethods + clazz.methods).distinct()
         for (m in methods) {
             if (m.name in setterNames) {
+                if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
                 try {
                     module.hook(m).intercept { chain ->
                         val newArgs = rewriteArgIfMedia(chain.args, chain.thisObject)
@@ -324,6 +417,7 @@ object PlayerHook {
         }
 
         for (method in backupMethods) {
+            if (!synchronized(hookedMethods) { hookedMethods.add(method) }) continue
             try {
                 module.hook(method).intercept { chain ->
                     interceptSetBackupUrls(
@@ -345,6 +439,7 @@ object PlayerHook {
         // 4. 兜底 Hook build()/create()：确保 Builder 仅有 setBackupUrls 而无 setUrl 时也能正确刷出暂缓的备用地址
         val buildMethods = methods.filter { (it.name == "build" || it.name == "create") && it.parameterTypes.isEmpty() }
         for (m in buildMethods) {
+            if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
             try {
                 module.hook(m).intercept { chain ->
                     flushDeferredBackupsBeforeBuild(chain.thisObject)
@@ -426,8 +521,14 @@ object PlayerHook {
     private fun shouldReportResult(result: RewriteResult): Boolean {
         return result.reason != "ignored" &&
                 result.reason != "parse-failed" &&
-                result.reason != "already-local-proxy"
+                result.reason != "already-local-proxy" &&
+                result.reason != "already-proxied"
     }
+
+    private data class BtrRewriteOutcome(
+        val btrUrl: String,
+        val effectiveResult: RewriteResult
+    )
 
     private fun tryRewriteToBtr(
         originalUrl: String,
@@ -435,8 +536,11 @@ object PlayerHook {
         config: AcceleratorConfig,
         builderInstance: Any? = null,
         requestHeaders: Map<*, *>? = null
-    ): String? {
+    ): BtrRewriteOutcome? {
         if (!config.enabled || !config.enableBtr) {
+            return null
+        }
+        if (!BiliAcceleratorCore.isMediaUrl(originalUrl)) {
             return null
         }
         // 防重入：严禁对已重定向至本地代理回环的 URL 重复改写
@@ -496,7 +600,7 @@ object PlayerHook {
             return null
         }
 
-        var targetUrl = if (result.changed) result.finalUrl else originalUrl
+        val rawBackups = builderInstance?.let { builderRawBackups[it] }.orEmpty()
         val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty().toMutableList()
 
         if (playinfoTrack != null && playinfoTrack.backupUrls.isNotEmpty()) {
@@ -506,43 +610,59 @@ object PlayerHook {
                 playinfoTrack.backupUrls
             }
             for (b in filteredPlayinfoBackups) {
-                if (b.isNotBlank() && b != targetUrl && b != originalUrl && !pendingBackups.contains(b)) {
+                if (b.isNotBlank() && b != originalUrl && !pendingBackups.contains(b)) {
                     pendingBackups.add(b)
                 }
             }
         }
 
+        val cleanOfficialBackup = findPromotableOfficialBackup(originalUrl, result, rawBackups, isLive)
+        var targetUrl: String
+        var effectiveResult: RewriteResult
+        if (cleanOfficialBackup != null) {
+            targetUrl = cleanOfficialBackup
+            val promotedHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cleanOfficialBackup)?.host)
+            effectiveResult = result.copy(
+                changed = cleanOfficialBackup != originalUrl,
+                finalUrl = cleanOfficialBackup,
+                targetHost = promotedHost,
+                reason = "pcdn-promote"
+            )
+            Log.i(TAG, "Promoted official backup mirror to primary: $cleanOfficialBackup")
+        } else if (!isLive && result.reason == "akamai-redirect") {
+            // 无干净 UPOS 备用源时，保留原签名 Akamai 地址作为主源，严禁将 Akamai hdnts= 签名发往 UPOS
+            targetUrl = originalUrl
+            effectiveResult = result.copy(
+                changed = false,
+                finalUrl = originalUrl,
+                targetHost = result.originalHost,
+                reason = "akamai-pass"
+            )
+        } else {
+            targetUrl = if (result.changed) result.finalUrl else originalUrl
+            effectiveResult = result
+        }
+
         // 对齐 BTR / realzza：BTR 模式下将 Akamai 重写至 UPOS 节点时，必须保留原签名 Akamai 地址作为 403 兜底备用源
-        if (!isLive && result.changed && (result.reason == "akamai-redirect" || BiliAcceleratorCore.isAkamaiHost(result.originalHost))) {
-            if (!pendingBackups.contains(originalUrl)) {
+        if (!isLive && (result.reason == "akamai-redirect" || BiliAcceleratorCore.isAkamaiHost(result.originalHost))) {
+            if (originalUrl != targetUrl && !pendingBackups.contains(originalUrl)) {
                 pendingBackups.add(originalUrl)
             }
         }
 
-        if (!isLive && (result.isPcdn || result.isMcdn)) {
-            val cleanOfficialBackup = pendingBackups.firstOrNull { backup ->
-                val bHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(backup)?.host).lowercase()
-                bHost.isNotBlank() && BiliAcceleratorCore.isBiliCdnHost(bHost) &&
-                    !BiliAcceleratorCore.isMcdnHost(bHost) && !BiliAcceleratorCore.isKnownP2pHost(bHost) &&
-                    !BiliAcceleratorCore.isIpAddress(bHost) && !BiliAcceleratorCore.isAkamaiHost(bHost) &&
-                    !bHost.endsWith(".bstarstatic.com")
-            }
-            if (cleanOfficialBackup != null) {
-                targetUrl = cleanOfficialBackup
-                Log.i(TAG, "Promoted official backup mirror to primary: $cleanOfficialBackup")
+        if (isLive) {
+            val cleanCandidate = findCleanLiveUrlForUrl(targetUrl, builderInstance, config.portHeuristic)
+            if (!cleanCandidate.isNullOrBlank() && cleanCandidate != targetUrl && !pendingBackups.contains(cleanCandidate)) {
+                pendingBackups.add(cleanCandidate)
             }
         }
 
-        if (isLive) {
-            val cleanHost = findCleanLiveHostForUrl(targetUrl, builderInstance)
-            if (!cleanHost.isNullOrBlank()) {
-                val parsed = BiliAcceleratorCore.parseUri(targetUrl)
-                if (parsed != null && !BiliAcceleratorCore.isSlowLiveHost(cleanHost, portHeuristic = config.portHeuristic)) {
-                    val candidate = parsed.replaceAuthority(cleanHost)
-                    if (!pendingBackups.contains(candidate)) {
-                        pendingBackups.add(candidate)
-                    }
-                }
+        pendingBackups.removeAll { candidate ->
+            if (candidate == targetUrl) {
+                true
+            } else {
+                val candHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(candidate)?.host)
+                !BiliAcceleratorCore.isAkamaiHost(candHost) && candidate.contains("hdnts=", ignoreCase = true)
             }
         }
 
@@ -571,7 +691,7 @@ object PlayerHook {
                 builderResolvedNonBtr.remove(builderInstance)
                 builderBtrUrl[builderInstance] = reusedUrl
                 flushDeferredBackups(builderInstance, reusedUrl)
-                return reusedUrl
+                return BtrRewriteOutcome(reusedUrl, effectiveResult)
             }
             if (existingId != null) {
                 BtrSessionManager.remove(existingId)
@@ -601,7 +721,7 @@ object PlayerHook {
             builderBtrUrl[builderInstance] = btrUrl
             flushDeferredBackups(builderInstance, btrUrl)
         }
-        return btrUrl
+        return BtrRewriteOutcome(btrUrl, effectiveResult)
     }
 
     internal fun rewriteArgIfMedia(
@@ -644,14 +764,14 @@ object PlayerHook {
 
         if (isLive) {
             if (config.enableLiveAcceleration) {
-                val btrUrl = tryRewriteToBtr(originalUrl, result, config, builderInstance)
-                if (btrUrl != null) {
-                    if (result.changed) {
-                        onRewrite?.invoke(result)
+                val btrOutcome = tryRewriteToBtr(originalUrl, result, config, builderInstance)
+                if (btrOutcome != null) {
+                    if (btrOutcome.effectiveResult.changed && shouldReportResult(btrOutcome.effectiveResult)) {
+                        onRewrite?.invoke(btrOutcome.effectiveResult)
                     }
                     Log.i(TAG, "Rewrote live stream to BTR proxy: ${result.originalHost} -> 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
                     val newArgs = args.toTypedArray()
-                    newArgs[strIndex] = btrUrl
+                    newArgs[strIndex] = btrOutcome.btrUrl
                     return newArgs
                 }
             }
@@ -665,13 +785,13 @@ object PlayerHook {
                 return newArgs
             }
             if (result.isPcdn && config.blockPcdn) {
-                val cleanLiveHost = findCleanLiveHostForUrl(originalUrl, builderInstance)
-                if (!cleanLiveHost.isNullOrBlank() && !BiliAcceleratorCore.isSlowLiveHost(cleanLiveHost, portHeuristic = config.portHeuristic)) {
-                    val rewritten = parsed.replaceAuthority(cleanLiveHost)
+                val cleanLiveUrl = findCleanLiveUrlForUrl(originalUrl, builderInstance, config.portHeuristic)
+                val cleanLiveHost = cleanLiveUrl?.let { BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(it)?.host) }
+                if (!cleanLiveUrl.isNullOrBlank() && !cleanLiveHost.isNullOrBlank() && cleanLiveUrl != originalUrl) {
                     val liveResult = RewriteResult(
                         changed = true,
                         originalUrl = originalUrl,
-                        finalUrl = rewritten,
+                        finalUrl = cleanLiveUrl,
                         originalHost = parsed.host,
                         targetHost = cleanLiveHost,
                         reason = "live-pcdn-filter",
@@ -681,7 +801,7 @@ object PlayerHook {
                     )
                     onRewrite?.invoke(liveResult)
                     val newArgs = args.toTypedArray()
-                    newArgs[strIndex] = rewritten
+                    newArgs[strIndex] = cleanLiveUrl
                     return newArgs
                 }
             }
@@ -689,39 +809,66 @@ object PlayerHook {
             return null
         }
 
-        val btrUrl = tryRewriteToBtr(originalUrl, result, config, builderInstance)
-        if (btrUrl != null) {
-            if (result.changed) {
-                onRewrite?.invoke(result)
+        val btrOutcome = tryRewriteToBtr(originalUrl, result, config, builderInstance)
+        if (btrOutcome != null) {
+            if (btrOutcome.effectiveResult.changed && shouldReportResult(btrOutcome.effectiveResult)) {
+                onRewrite?.invoke(btrOutcome.effectiveResult)
             }
             Log.i(TAG, "Rewrote media url to BTR proxy: ${result.originalHost} -> 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
             val newArgs = args.toTypedArray()
-            newArgs[strIndex] = btrUrl
+            newArgs[strIndex] = btrOutcome.btrUrl
             return newArgs
         }
 
         clearBuilderBtrState(builderInstance)
         flushDeferredBackups(builderInstance, btrUrl = null)
         builderInstance?.let { builderResolvedNonBtr[it] = true }
-        if (shouldReportResult(result)) onRewrite?.invoke(result)
         if (result.changed) {
-            val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty()
-            val cleanOfficialBackup = if (!isLive && (result.isPcdn || result.isMcdn)) {
-                pendingBackups.firstOrNull { backup ->
-                    val bHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(backup)?.host).lowercase()
-                    bHost.isNotBlank() && BiliAcceleratorCore.isBiliCdnHost(bHost) &&
-                        !BiliAcceleratorCore.isMcdnHost(bHost) && !BiliAcceleratorCore.isKnownP2pHost(bHost) &&
-                        !BiliAcceleratorCore.isIpAddress(bHost) && !BiliAcceleratorCore.isAkamaiHost(bHost)
-                }
-            } else null
+            val rawBackups = builderInstance?.let { builderRawBackups[it] }.orEmpty()
+            val cleanOfficialBackup = findPromotableOfficialBackup(originalUrl, result, rawBackups, isLive)
 
             val finalUrl = cleanOfficialBackup ?: result.finalUrl
-            Log.i(TAG, "Rewrote media url: ${result.originalHost} -> ${BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(finalUrl)?.host)} [${result.reason}]")
+            val finalTargetHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(finalUrl)?.host)
+            val reportedResult = if (cleanOfficialBackup != null) {
+                result.copy(
+                    finalUrl = finalUrl,
+                    targetHost = finalTargetHost,
+                    reason = "pcdn-promote"
+                )
+            } else {
+                result
+            }
+            if (shouldReportResult(reportedResult)) onRewrite?.invoke(reportedResult)
+            Log.i(TAG, "Rewrote media url: ${result.originalHost} -> $finalTargetHost [${reportedResult.reason}]")
             val newArgs = args.toTypedArray()
             newArgs[strIndex] = finalUrl
             return newArgs
         }
+        if (shouldReportResult(result)) onRewrite?.invoke(result)
         return null
+    }
+
+    private fun findPromotableOfficialBackup(
+        originalUrl: String,
+        result: RewriteResult,
+        rawBackups: List<String>,
+        isLive: Boolean
+    ): String? {
+        if (isLive) return null
+        val shouldPromote = result.isPcdn ||
+            result.isMcdn ||
+            BiliAcceleratorCore.isRelayUrl(originalUrl) ||
+            result.reason == "akamai-redirect"
+        if (!shouldPromote) return null
+        val playinfoEntry = PlayinfoRegistry.lookup(originalUrl)
+            ?: if (result.changed) PlayinfoRegistry.lookup(result.finalUrl) else null
+        val playinfoUrls = listOfNotNull(playinfoEntry?.primaryUrl) + playinfoEntry?.backupUrls.orEmpty()
+        val candidateBackups = (rawBackups + playinfoUrls)
+            .map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }
+            .distinct()
+        return candidateBackups.firstOrNull { backup ->
+            BiliAcceleratorCore.isCleanUposDonor(backup)
+        }
     }
 
     internal fun rewriteFallbackDataSource(
@@ -731,7 +878,7 @@ object PlayerHook {
         configOverride: AcceleratorConfig? = null,
         onRewrite: ((RewriteResult) -> Unit)? = { RemoteClient.notifyRewrite(it) }
     ): String? {
-        if (original == null || !BiliAcceleratorCore.hasMediaSignal(original)) {
+        if (original == null || !BiliAcceleratorCore.hasMediaSignal(original) || !BiliAcceleratorCore.isMediaUrl(original)) {
             clearBuilderBtrState(playerInstance)
             return null
         }
@@ -752,20 +899,35 @@ object PlayerHook {
             clearBuilderBtrState(playerInstance)
             return null
         }
-        val btrUrl = tryRewriteToBtr(original, result, config, playerInstance, headersMap)
-        if (btrUrl != null) {
-            if (result.changed) {
-                onRewrite?.invoke(result)
+        val btrOutcome = tryRewriteToBtr(original, result, config, playerInstance, headersMap)
+        if (btrOutcome != null) {
+            if (btrOutcome.effectiveResult.changed && shouldReportResult(btrOutcome.effectiveResult)) {
+                onRewrite?.invoke(btrOutcome.effectiveResult)
             }
             Log.i(TAG, "Rewrote IjkMediaPlayer dataSource to BTR: 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
-            return btrUrl
+            return btrOutcome.btrUrl
         }
         clearBuilderBtrState(playerInstance)
-        if (shouldReportResult(result)) onRewrite?.invoke(result)
         if (result.changed) {
-            Log.i(TAG, "Rewrote IjkMediaPlayer dataSource: ${result.originalHost} -> ${result.targetHost}")
-            return result.finalUrl
+            val rawBackups = playerInstance?.let { builderRawBackups[it] }.orEmpty()
+            val isLive = BiliAcceleratorCore.isLiveMediaUrl("", original)
+            val cleanOfficialBackup = findPromotableOfficialBackup(original, result, rawBackups, isLive)
+            val finalUrl = cleanOfficialBackup ?: result.finalUrl
+            val finalTargetHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(finalUrl)?.host)
+            val reportedResult = if (cleanOfficialBackup != null) {
+                result.copy(
+                    finalUrl = finalUrl,
+                    targetHost = finalTargetHost,
+                    reason = "pcdn-promote"
+                )
+            } else {
+                result
+            }
+            if (shouldReportResult(reportedResult)) onRewrite?.invoke(reportedResult)
+            Log.i(TAG, "Rewrote IjkMediaPlayer dataSource: ${result.originalHost} -> $finalTargetHost [${reportedResult.reason}]")
+            return finalUrl
         }
+        if (shouldReportResult(result)) onRewrite?.invoke(result)
         return null
     }
 
@@ -788,6 +950,7 @@ object PlayerHook {
                 it.name == "setDataSource" && it.parameterTypes.isNotEmpty() && it.parameterTypes[0] == String::class.java
             }
             for (m in stringMethods) {
+                if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
                 try {
                     module.hook(m).intercept { chain ->
                         val original = chain.args.getOrNull(0) as? String
@@ -808,6 +971,7 @@ object PlayerHook {
                 it.name == "setDataSource" && it.parameterTypes.size >= 2 && it.parameterTypes[1] == Uri::class.java
             }
             for (m in uriMethods) {
+                if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
                 try {
                     module.hook(m).intercept { chain ->
                         val originalUri = chain.args.getOrNull(1) as? Uri
@@ -824,43 +988,62 @@ object PlayerHook {
             }
 
             // 3. Hook IjkMediaPlayer / AbstractMediaPlayer buffering & stall callbacks 通知并发控制器
+            //    优先拦截 postEventFromNative；仅当未挂载 postEventFromNative 时才回退到 notifyOnInfo/notifyOnBufferingUpdate，避免重复触发
             val eventClasses = listOfNotNull(ijkPlayerClass, ijkPlayerClass.superclass)
+            var hookedPostEvent = false
             for (cls in eventClasses) {
                 for (m in cls.declaredMethods) {
-                    try {
-                        when (m.name) {
-                            "postEventFromNative" -> if (m.parameterTypes.size >= 4) {
-                                module.hook(m).intercept { chain ->
-                                    val what = chain.args.getOrNull(1) as? Int
-                                    val arg1 = chain.args.getOrNull(2) as? Int
-                                    if (what == 200 && arg1 == 701) {
-                                        BtrSessionManager.notifyPlayerStall()
-                                    } else if (what == 3 && arg1 != null && arg1 in 0..15) {
-                                        BtrSessionManager.notifyPlayerBufferHunger()
-                                    }
-                                    chain.proceed()
-                                }
-                            }
-                            "notifyOnInfo" -> if (m.parameterTypes.size == 2) {
-                                module.hook(m).intercept { chain ->
-                                    val what = chain.args.getOrNull(0) as? Int
-                                    if (what == 701) {
-                                        BtrSessionManager.notifyPlayerStall()
-                                    }
-                                    chain.proceed()
-                                }
-                            }
-                            "notifyOnBufferingUpdate" -> if (m.parameterTypes.size == 1) {
-                                module.hook(m).intercept { chain ->
-                                    val pct = chain.args.getOrNull(0) as? Int
-                                    if (pct != null && pct in 0..15) {
-                                        BtrSessionManager.notifyPlayerBufferHunger()
-                                    }
-                                    chain.proceed()
-                                }
-                            }
+                    if (m.name == "postEventFromNative" && m.parameterTypes.size >= 4) {
+                        if (!synchronized(hookedMethods) { hookedMethods.add(m) }) {
+                            hookedPostEvent = true
+                            continue
                         }
-                    } catch (_: Throwable) {}
+                        try {
+                            module.hook(m).intercept { chain ->
+                                val weakPlayer = (chain.args.getOrNull(0) as? WeakReference<*>)?.get()
+                                val sid = weakPlayer?.let { BtrSessionManager.getSessionForBuilder(it) }
+                                val what = chain.args.getOrNull(1) as? Int
+                                val arg1 = chain.args.getOrNull(2) as? Int
+                                if (what == 200 && arg1 == 701) {
+                                    BtrSessionManager.notifyPlayerStall(sid)
+                                } else if (what == 3 && arg1 != null && arg1 in 0..15) {
+                                    BtrSessionManager.notifyPlayerBufferHunger(sid)
+                                }
+                                chain.proceed()
+                            }
+                            hookedPostEvent = true
+                        } catch (_: Throwable) {}
+                    }
+                }
+            }
+            if (!hookedPostEvent) {
+                for (cls in eventClasses) {
+                    for (m in cls.declaredMethods) {
+                        try {
+                            when (m.name) {
+                                "notifyOnInfo" -> if (m.parameterTypes.size == 2 && synchronized(hookedMethods) { hookedMethods.add(m) }) {
+                                    module.hook(m).intercept { chain ->
+                                        val what = chain.args.getOrNull(0) as? Int
+                                        if (what == 701) {
+                                            val sid = chain.thisObject?.let { BtrSessionManager.getSessionForBuilder(it) }
+                                            BtrSessionManager.notifyPlayerStall(sid)
+                                        }
+                                        chain.proceed()
+                                    }
+                                }
+                                "notifyOnBufferingUpdate" -> if (m.parameterTypes.size == 1 && synchronized(hookedMethods) { hookedMethods.add(m) }) {
+                                    module.hook(m).intercept { chain ->
+                                        val pct = chain.args.getOrNull(0) as? Int
+                                        if (pct != null && pct in 0..15) {
+                                            val sid = chain.thisObject?.let { BtrSessionManager.getSessionForBuilder(it) }
+                                            BtrSessionManager.notifyPlayerBufferHunger(sid)
+                                        }
+                                        chain.proceed()
+                                    }
+                                }
+                            }
+                        } catch (_: Throwable) {}
+                    }
                 }
             }
 

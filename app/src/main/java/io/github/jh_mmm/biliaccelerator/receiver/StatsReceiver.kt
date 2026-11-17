@@ -31,7 +31,7 @@ class StatsReceiver : BroadcastReceiver() {
         private const val TAG = "BiliAccelerator-StatsReceiver"
         private val gson = Gson()
 
-        private val VALID_REASONS = setOf(
+        internal val VALID_REASONS = setOf(
             "szbdyd-source",
             "mountaintoys-source",
             "mcdn-proxy",
@@ -54,7 +54,8 @@ class StatsReceiver : BroadcastReceiver() {
             "live-pcdn-detected",
             "live-ok",
             "akamai-pass",
-            "akamai-redirect"
+            "akamai-redirect",
+            "pcdn-promote"
         )
 
         internal fun extractLegitimateBatch(batchJson: String?): List<RewriteResult> {
@@ -166,7 +167,7 @@ class StatsReceiver : BroadcastReceiver() {
         }
 
         val resolvedSenderPkg = when {
-            hasValidCreatorPkg -> creatorPackage
+            creatorPackage != null && BiliAcceleratorCore.isTargetPackage(creatorPackage) -> creatorPackage
             !sentFromPkg.isNullOrBlank() && BiliAcceleratorCore.isTargetPackage(sentFromPkg) -> sentFromPkg
             else -> intent.getStringExtra(EXTRA_CLIENT_PACKAGE)?.trim()?.takeIf { BiliAcceleratorCore.isTargetPackage(it) }
         }
@@ -184,6 +185,7 @@ class StatsReceiver : BroadcastReceiver() {
             val clientVer = intent.getStringExtra(EXTRA_CLIENT_VERSION)?.trim()?.take(64)
             val clientProc = intent.getStringExtra(EXTRA_CLIENT_PROCESS)?.trim()?.take(128)
 
+            applyHookStatusFromIntent(context, intent)
             StatsManager.recordHandshake(
                 pkg = resolvedSenderPkg,
                 version = clientVer,
@@ -191,24 +193,14 @@ class StatsReceiver : BroadcastReceiver() {
                 context = context
             )
 
-            intent.getStringExtra(EXTRA_HOOK_STATUS_JSON)?.let { hookJson ->
-                try {
-                    val mapType = object : TypeToken<Map<String, String?>>() {}.type
-                    val rawHookMap: Map<String, String?> = gson.fromJson(hookJson, mapType)
-                    val sanitizedMap = rawHookMap.entries
-                        .take(50)
-                        .filter { it.key.isNotBlank() && it.value != null }
-                        .associate { it.key.trim().take(64) to it.value!!.trim().take(256) }
-                    StatsManager.recordHookStatus(sanitizedMap, context)
-                } catch (_: Exception) {}
-            }
             // 反向推送最新配置至宿主 App（兜底 Android 11+ 包可见性拦截 StatsProvider 的场景）
-            StatsProvider.pushConfigToPackageAsync(context, resolvedSenderPkg)
+            pushConfigWithGoAsync(context, resolvedSenderPkg)
             Log.i(TAG, "通过 Broadcast 成功记录宿主握手心跳: pkg=$resolvedSenderPkg ver=$clientVer proc=$clientProc")
             return
         }
 
         // 4. 处理重定向统计广播 (ACTION_RECORD_REWRITE)
+        applyHookStatusFromIntent(context, intent)
         val batchJson = intent.getStringExtra(EXTRA_REWRITE_BATCH_JSON)
         val singleJson = intent.getStringExtra(EXTRA_REWRITE_RESULT)
         val reportProc = intent.getStringExtra(EXTRA_CLIENT_PROCESS)?.trim()?.take(128)
@@ -221,7 +213,7 @@ class StatsReceiver : BroadcastReceiver() {
             StatsManager.recordHeartbeat(context)
             if (!resolvedSenderPkg.isNullOrBlank()) {
                 StatsManager.recordHandshake(pkg = resolvedSenderPkg, version = null, process = reportProc, context = context)
-                StatsProvider.pushConfigToPackageAsync(context, resolvedSenderPkg)
+                pushConfigWithGoAsync(context, resolvedSenderPkg)
             }
             Log.i(TAG, "通过 Broadcast 成功记录批量重定向 (${results.size} 条)")
             return
@@ -234,9 +226,30 @@ class StatsReceiver : BroadcastReceiver() {
             StatsManager.recordHeartbeat(context)
             if (!resolvedSenderPkg.isNullOrBlank()) {
                 StatsManager.recordHandshake(pkg = resolvedSenderPkg, version = null, process = reportProc, context = context)
-                StatsProvider.pushConfigToPackageAsync(context, resolvedSenderPkg)
+                pushConfigWithGoAsync(context, resolvedSenderPkg)
             }
             Log.i(TAG, "通过 Broadcast 成功记录单条重定向: ${result.originalHost} -> ${result.targetHost}")
+        }
+    }
+
+    private fun applyHookStatusFromIntent(context: Context, intent: Intent) {
+        intent.getStringExtra(EXTRA_HOOK_STATUS_JSON)?.let { hookJson ->
+            try {
+                val mapType = object : TypeToken<Map<String, String?>>() {}.type
+                val rawHookMap: Map<String, String?> = gson.fromJson(hookJson, mapType) ?: return
+                val sanitizedMap = rawHookMap.entries
+                    .take(50)
+                    .filter { it.key.isNotBlank() && it.value != null }
+                    .associate { it.key.trim().take(64) to it.value!!.trim().take(256) }
+                StatsManager.recordHookStatus(sanitizedMap, context)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun pushConfigWithGoAsync(context: Context, targetPkg: String) {
+        val pendingResult = runCatching { goAsync() }.getOrNull()
+        StatsProvider.pushConfigToPackageAsync(context, targetPkg) {
+            runCatching { pendingResult?.finish() }
         }
     }
 }

@@ -15,9 +15,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.HelpOutline
+import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Code
-import androidx.compose.material.icons.outlined.HelpOutline
-import androidx.compose.material.icons.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.RocketLaunch
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -163,7 +163,7 @@ fun AboutScreen(
                     PreferenceActionItem(
                         title = "Releases 版本发布",
                         summary = "检查最新正式发布构建与更新日志",
-                        icon = Icons.Outlined.OpenInNew,
+                        icon = Icons.AutoMirrored.Outlined.OpenInNew,
                         onClick = { openUrl("https://github.com/jh-mmm/bilibili-accelerator-android/releases") }
                     )
 
@@ -172,7 +172,7 @@ fun AboutScreen(
                     PreferenceActionItem(
                         title = "问题反馈与建议",
                         summary = "提交 Issue 报告错误或提出建议",
-                        icon = Icons.Outlined.HelpOutline,
+                        icon = Icons.AutoMirrored.Outlined.HelpOutline,
                         onClick = { openUrl("https://github.com/jh-mmm/bilibili-accelerator-android/issues") }
                     )
                 }
@@ -187,7 +187,7 @@ fun AboutScreen(
                     PreferenceActionItem(
                         title = "realzza/bilibili-accelerator",
                         summary = "上游网页端加速逻辑与拦截规则参考",
-                        icon = Icons.Outlined.OpenInNew,
+                        icon = Icons.AutoMirrored.Outlined.OpenInNew,
                         onClick = { openUrl("https://github.com/realzza/bilibili-accelerator") }
                     )
 
@@ -196,7 +196,7 @@ fun AboutScreen(
                     PreferenceActionItem(
                         title = "MrTangLuyao/Bilibili-thread-ripper",
                         summary = "BTR 多线程并发 Range 切片调度思路参考",
-                        icon = Icons.Outlined.OpenInNew,
+                        icon = Icons.AutoMirrored.Outlined.OpenInNew,
                         onClick = { openUrl("https://github.com/MrTangLuyao/Bilibili-thread-ripper") }
                     )
                 }

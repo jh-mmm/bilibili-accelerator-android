@@ -183,9 +183,11 @@ object StatsManager {
             if (!hookJson.isNullOrEmpty()) {
                 try {
                     val map: Map<String, String> = gson.fromJson(hookJson, object : TypeToken<Map<String, String>>() {}.type)
+                    // btr_proxy 端口具有进程会话瞬时性，冷启动载入磁盘历史时不沿用旧进程残留端口
+                    val filteredMap = map.filterKeys { it != "btr_proxy" }
                     hookStatus.clear()
-                    hookStatus.putAll(map)
-                    io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.updateFromMap(map)
+                    hookStatus.putAll(filteredMap)
+                    io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker.updateFromMap(filteredMap)
                 } catch (_: Exception) {}
             }
 

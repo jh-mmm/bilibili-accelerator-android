@@ -6,6 +6,7 @@ import io.github.jh_mmm.biliaccelerator.hook.RemoteClient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -59,7 +60,12 @@ class BiliAcceleratorCoreTest {
         assertTrue(BiliAcceleratorCore.isRelayUrl("http://xy123.mcdn.bilivideo.cn/test.m4s"))
         assertTrue(BiliAcceleratorCore.isRelayUrl("https://proxy-tf-all-ws.bilivideo.com/?url=http%3A%2F%2Ftest.com"))
         assertTrue(BiliAcceleratorCore.isRelayUrl("http://somehost.com/v1/resource/12345.m4s"))
-        assertTrue(BiliAcceleratorCore.isRelayUrl("https://upos-sz-mirrorali.bilivideo.com/test.m4s?os=mcdn"))
+        assertTrue(BiliAcceleratorCore.isRelayUrl("https://edge-p2p.example.com/test.m4s?os=mcdn"))
+        assertTrue(BiliAcceleratorCore.isRelayUrl("https://upos-sz-mirrorali.bilivideo.com/v1/resource/12345.m4s?os=mcdn"))
+        assertFalse(
+            "Clean UPOS /upgcxcode/ stream with leftover ?os=mcdn must not be flagged as relay",
+            BiliAcceleratorCore.isRelayUrl("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s?os=mcdn")
+        )
         assertFalse(BiliAcceleratorCore.isRelayUrl("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s"))
     }
 
@@ -579,6 +585,22 @@ class BiliAcceleratorCoreTest {
             BiliAcceleratorCore.extractUrlDeadlineSeconds("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/123.m4s?deadline=1799999999&os=upos")
         )
         assertEquals(
+            1811111111L,
+            BiliAcceleratorCore.extractUrlDeadlineSeconds(
+                "https://proxy-tf-all-ws.bilivideo.com/?url=https%3A%2F%2Fxy1.mcdn.bilivideo.cn%2Fv1%2Fresource%2F123.m4s%3Fdeadline%3D1811111111"
+            )
+        )
+        assertEquals(
+            1822222222L,
+            BiliAcceleratorCore.extractUrlDeadlineSeconds(
+                "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/123.m4s?hdnts=exp=1822222222~acl=/*~hmac=abc"
+            )
+        )
+        assertEquals(
+            1833333333L,
+            BiliAcceleratorCore.extractUrlDeadlineSeconds("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/123.m4s?e=1833333333")
+        )
+        assertEquals(
             0L,
             BiliAcceleratorCore.extractUrlDeadlineSeconds("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/123.m4s?os=upos")
         )
@@ -751,6 +773,198 @@ class BiliAcceleratorCoreTest {
             // Reject false-positive /v1.0/ smtcdns unwrap in BiliAcceleratorCore too
             assertEquals("", BiliAcceleratorCore.unwrapSmtcdnsUrl("https://proxy.smtcdns.net/v1.0/live/room.m4s"))
             assertEquals("", BiliAcceleratorCore.unwrapSmtcdnsUrl("https://proxy.smtcdns.net/api.v2/upgcxcode/1/2/3.m4s"))
+        } finally {
+            PlayinfoRegistry.resetForTesting(clearDir = true)
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun testProtocolRelativeParseAndCustomCdnValidation() {
+        val parsedRelative = BiliAcceleratorCore.parseUri("//upos-sz-estgoss.bilivideo.com/upgcxcode/12/34/56.m4s?deadline=1900000000")
+        assertNotNull("Protocol-relative URL must parse cleanly", parsedRelative)
+        assertEquals("upos-sz-estgoss.bilivideo.com", parsedRelative?.host)
+        val rewrittenRel = BiliAcceleratorCore.rewriteUrl("//xy123.mcdn.bilivideo.cn/upgcxcode/12/34/56.m4s", defaultConfig)
+        assertTrue(rewrittenRel.changed)
+        assertTrue(rewrittenRel.finalUrl.startsWith("https://"))
+
+        assertTrue(BiliAcceleratorCore.isValidCustomCdnHost("upos-sz-mirrorali.bilivideo.com:443"))
+        assertFalse(BiliAcceleratorCore.isValidCustomCdnHost("evil.example.com"))
+        assertFalse(BiliAcceleratorCore.isValidCustomCdnHost("112.34.56.78"))
+        assertFalse(BiliAcceleratorCore.isValidCustomCdnHost("xy1.mcdn.bilivideo.cn"))
+        assertFalse(BiliAcceleratorCore.isValidCustomCdnHost("upos-hz-mirrorakam.akamaized.net"))
+        assertFalse(BiliAcceleratorCore.isValidCustomCdnHost("cdn.bstarstatic.com"))
+
+        val dirtyCfg = defaultConfig.copy(
+            targetHost = "evil.example.com",
+            customCdnPool = listOf(
+                "https://attacker.com/steal",
+                "112.34.56.78",
+                "xy.mcdn.bilivideo.cn",
+                "upos-sz-mirrorali.bilivideo.com:443"
+            )
+        )
+        val pool = BiliAcceleratorCore.getEffectiveCdnPool(dirtyCfg)
+        assertEquals(listOf("upos-sz-mirrorali.bilivideo.com"), pool)
+        assertEquals("upos-sz-mirrorali.bilivideo.com", BiliAcceleratorCore.resolveTargetHost(dirtyCfg))
+    }
+
+    @Test
+    fun testPlayinfoPromotesOfficialBackupOverPcdnAndRejectsDrmPromote() {
+        val tempDir = java.nio.file.Files.createTempDirectory("bili_promote_test").toFile()
+        try {
+            PlayinfoRegistry.resetForTesting(clearDir = true)
+            PlayinfoRegistry.configureSharedStateDir(tempDir)
+            val json = """
+                {
+                  "code": 0,
+                  "data": {
+                    "dash": {
+                      "video": [
+                        {
+                          "base_url": "https://xy111.szbdyd.com:8080/upgcxcode/11/22/777.m4s?deadline=1900000100",
+                          "backup_url": [
+                            "https://xy222.mcdn.bilivideo.cn/upgcxcode/11/22/777.m4s?deadline=1900000100",
+                            "https://upos-sz-estgoss.bilivideo.com/upgcxcode/11/22/777.m4s?deadline=1900000100"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+            """.trimIndent()
+            val entries = PlayinfoRegistry.ingestJson(json)
+            assertEquals(1, entries.size)
+            val pcdnLookup = PlayinfoRegistry.lookup("https://xy111.szbdyd.com:8080/upgcxcode/11/22/777.m4s")
+            assertNotNull(pcdnLookup)
+            assertTrue(
+                "Clean UPOS mirror must be promoted to Playinfo primaryUrl",
+                pcdnLookup!!.primaryUrl.contains("upos-sz-estgoss.bilivideo.com")
+            )
+            assertTrue(
+                "PCDN/MCDN mirrors must be excluded once clean UPOS exists",
+                pcdnLookup.backupUrls.none { it.contains("szbdyd.com") || it.contains("mcdn.bilivideo") }
+            )
+
+            // Fallback rewrite emits pcdn-promote when promoting clean backup
+            val fakePlayer = Any()
+            PlayerHook.clearBuilderBtrState(fakePlayer)
+            val promotedUrls = mutableListOf<RewriteResult>()
+            val fallbackCfg = defaultConfig.copy(enableBtr = false)
+            val promotedUrl = PlayerHook.rewriteFallbackDataSource(
+                original = "https://xy111.szbdyd.com:8080/upgcxcode/11/22/777.m4s?deadline=1900000100",
+                playerInstance = fakePlayer,
+                configOverride = fallbackCfg,
+                onRewrite = { promotedUrls.add(it) }
+            )
+            assertNotNull(promotedUrl)
+            assertTrue(promotedUrl!!.contains("upos-sz-estgoss.bilivideo.com"))
+            assertEquals("pcdn-promote", promotedUrls.lastOrNull()?.reason)
+            assertTrue(io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver.VALID_REASONS.contains("pcdn-promote"))
+        } finally {
+            PlayinfoRegistry.resetForTesting(clearDir = true)
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun testIsMediaUrlAndLiveQuerySafetyGuards() {
+        assertFalse(BiliAcceleratorCore.isMediaUrl("https://i0.hdslb.com/bfs/subtitle/123.json"))
+        assertFalse(BiliAcceleratorCore.isMediaUrl("http://test.bilivideo.com/data"))
+        assertFalse(BiliAcceleratorCore.hasMediaSignal("https://api.bstar.example/v1/info"))
+        assertTrue(BiliAcceleratorCore.isMediaUrl("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/22/33.m4s"))
+        assertTrue(
+            BiliAcceleratorCore.isMediaUrl(
+                "https://proxy-tf-all-ws.bilivideo.com/?url=https%3A%2F%2Fxy1.mcdn.bilivideo.cn%2Fv1%2Fresource%2F33.m4s"
+            )
+        )
+
+        val nonMediaSubtitle = "https://i0.hdslb.com/bfs/subtitle/123.json"
+        val resSub = BiliAcceleratorCore.rewriteUrl(nonMediaSubtitle, defaultConfig.copy(forceUpos = true))
+        assertFalse(resSub.changed)
+        assertEquals("ignored", resSub.reason)
+        assertNull(
+            PlayerHook.rewriteArgIfMedia(listOf(nonMediaSubtitle), configOverride = defaultConfig.copy(enableBtr = true), onRewrite = null)
+        )
+        assertNull(
+            PlayerHook.rewriteFallbackDataSource(nonMediaSubtitle, playerInstance = null, configOverride = defaultConfig.copy(enableBtr = true), onRewrite = null)
+        )
+
+        val vodWithLiveQuery = "http://112.34.56.78:8080/upgcxcode/11/22/33.m4s?ref=live.bilibili.com&tag=gotcha"
+        assertFalse(
+            "Query params mentioning live.bilibili.com or gotcha must not misclassify VOD as live",
+            BiliAcceleratorCore.isLiveMediaUrl("", vodWithLiveQuery)
+        )
+        val resVod = BiliAcceleratorCore.rewriteUrl(vodWithLiveQuery, defaultConfig)
+        assertTrue(resVod.changed)
+        assertEquals("pcdn-host", resVod.reason)
+    }
+
+    @Test
+    fun testPlayinfoRegistrySameSecondRefreshFileCollisionAndPcdnBackupExclusion() {
+        val tempDir = java.nio.file.Files.createTempDirectory("playinfo_sync_test").toFile()
+        try {
+            PlayinfoRegistry.resetForTesting(clearDir = true)
+            PlayinfoRegistry.configureSharedStateDir(tempDir)
+
+            val initialJson = """
+                {
+                  "code": 0,
+                  "data": {
+                    "dash": {
+                      "video": [
+                        {
+                          "base_url": "http://112.34.56.78:8080/upgcxcode/11/22/888.m4s?deadline=1800000000",
+                          "backup_url": [
+                            "https://edge.example.com:8443/upgcxcode/11/22/888.m4s?deadline=1800000000",
+                            "https://upos-sz-estgoss.bilivideo.com/upgcxcode/11/22/888.m4s?deadline=1800000000"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+            """.trimIndent()
+            PlayinfoRegistry.ingestJson(initialJson)
+            val firstLookup = PlayinfoRegistry.lookup("https://upos-sz-estgoss.bilivideo.com/upgcxcode/11/22/888.m4s")!!
+            assertTrue(
+                "Bare-IP and odd-port backups must be excluded once clean UPOS exists",
+                firstLookup.backupUrls.isEmpty()
+            )
+
+            // Same-second, same-byte-length deadline refresh with empty backups
+            val refreshedJson = """
+                {
+                  "code": 0,
+                  "data": {
+                    "dash": {
+                      "video": [
+                        {
+                          "base_url": "https://upos-sz-estgoss.bilivideo.com/upgcxcode/11/22/888.m4s?deadline=1900000000"
+                        }
+                      ]
+                    }
+                  }
+                }
+            """.trimIndent()
+            PlayinfoRegistry.ingestJson(refreshedJson)
+
+            // Generic filename under distinct parent directories must not collide
+            PlayinfoRegistry.ingestJson(
+                """{"code":0,"data":{"dash":{"video":[{"base_url":"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/roomA/index.m3u8?deadline=1900000000","is_drm":true}]}}}"""
+            )
+            PlayinfoRegistry.ingestJson(
+                """{"code":0,"data":{"dash":{"video":[{"base_url":"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/roomB/index.m3u8?deadline=1900000000","is_drm":false}]}}}"""
+            )
+            assertTrue(PlayinfoRegistry.lookup("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/roomA/index.m3u8")!!.hasDrm)
+            assertFalse(PlayinfoRegistry.lookup("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/roomB/index.m3u8")!!.hasDrm)
+            assertNull(PlayinfoRegistry.lookup("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/roomC/index.m3u8"))
+
+            // Simulate second process reading shared state file
+            PlayinfoRegistry.resetForTesting(clearDir = false)
+            val crossProc = PlayinfoRegistry.lookup("https://upos-sz-estgoss.bilivideo.com/upgcxcode/11/22/888.m4s", forceSharedReload = true)!!
+            assertEquals(1900000000L, crossProc.deadlineEpochSec)
+            assertTrue(crossProc.backupUrls.isEmpty())
         } finally {
             PlayinfoRegistry.resetForTesting(clearDir = true)
             tempDir.deleteRecursively()

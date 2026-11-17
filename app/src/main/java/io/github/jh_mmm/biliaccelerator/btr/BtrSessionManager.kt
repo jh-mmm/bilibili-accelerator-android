@@ -33,7 +33,9 @@ class SessionBanList {
     private val goodHosts = ConcurrentHashMap.newKeySet<String>()
     private val goodAddresses = ConcurrentHashMap.newKeySet<String>()
     private val emptyReplies = ConcurrentHashMap<String, Int>()
-    private val permanentBans = ConcurrentHashMap.newKeySet<String>()
+    @Volatile
+    private var permanentBans: Set<String> = emptySet()
+    private val judgeLock = Any()
     private val urlBlockedUntil = ConcurrentHashMap<String, Long>()
     private val urlFailures = ConcurrentHashMap<String, Int>()
     private val hostBlockedUntil = ConcurrentHashMap<String, Long>()
@@ -49,7 +51,7 @@ class SessionBanList {
         }.getOrElse { url }
     }
 
-    private fun judge() {
+    private fun judgeLocked() {
         val strikes = HashMap<String, Int>()
         for ((key, count) in emptyReplies) {
             val parts = key.split('\n')
@@ -67,33 +69,36 @@ class SessionBanList {
                 strikes[blamed] = (strikes[blamed] ?: 0) + count
             }
         }
-        permanentBans.clear()
+        val nextBans = HashSet<String>()
         for ((blamedKey, strikeCount) in strikes) {
             if (strikeCount >= 2) {
-                permanentBans.add(blamedKey)
+                nextBans.add(blamedKey)
             }
         }
+        permanentBans = nextBans
     }
 
     fun recordSuccess(url: String, host: String) {
         val address = addressOf(url)
-        var changed = false
         if (url.isNotBlank()) {
             urlBlockedUntil.remove(url)
             urlFailures.remove(url)
         }
-        if (address.isNotBlank() && goodAddresses.add(address)) {
-            changed = true
-        }
         if (host.isNotBlank()) {
             hostBlockedUntil.remove(host)
             hostFailures.remove(host)
-            if (goodHosts.add(host)) {
+        }
+        synchronized(judgeLock) {
+            var changed = false
+            if (address.isNotBlank() && goodAddresses.add(address)) {
                 changed = true
             }
-        }
-        if (changed) {
-            judge()
+            if (host.isNotBlank() && goodHosts.add(host)) {
+                changed = true
+            }
+            if (changed) {
+                judgeLocked()
+            }
         }
     }
 
@@ -119,8 +124,10 @@ class SessionBanList {
                 }
                 if (receivedBytes <= 0L && host.isNotBlank() && address.isNotBlank()) {
                     val key = "$host\n$address\nrefused"
-                    emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
-                    judge()
+                    synchronized(judgeLock) {
+                        emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
+                        judgeLocked()
+                    }
                 }
                 false
             }
@@ -130,8 +137,10 @@ class SessionBanList {
                     hostBlockedUntil[host] = now + ttl
                     if (receivedBytes <= 0L && address.isNotBlank()) {
                         val key = "$host\n$address\n"
-                        emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
-                        judge()
+                        synchronized(judgeLock) {
+                            emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
+                            judgeLocked()
+                        }
                     }
                 }
                 true
@@ -144,8 +153,10 @@ class SessionBanList {
                     hostBlockedUntil[host] = now + backoffMs
                     if (receivedBytes <= 0L && address.isNotBlank()) {
                         val key = "$host\n$address\n"
-                        emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
-                        judge()
+                        synchronized(judgeLock) {
+                            emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
+                            judgeLocked()
+                        }
                     }
                 }
                 true
@@ -167,17 +178,20 @@ class SessionBanList {
             hostBlockedUntil[host] = now + backoffMs
             if (receivedBytes <= 0L && url.isNotBlank()) {
                 val key = "$host\n${addressOf(url)}\n"
-                emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
-                judge()
+                synchronized(judgeLock) {
+                    emptyReplies[key] = (emptyReplies[key] ?: 0) + 1
+                    judgeLocked()
+                }
             }
         }
     }
 
     fun isPermanentlyBanned(url: String, host: String): Boolean {
         val address = addressOf(url)
-        return permanentBans.contains("node:$host") ||
-                permanentBans.contains("address:$address") ||
-                permanentBans.contains("pair:$host $address")
+        val bans = permanentBans
+        return bans.contains("node:$host") ||
+                bans.contains("address:$address") ||
+                bans.contains("pair:$host $address")
     }
 
     fun isBanned(url: String, host: String, now: Long = System.currentTimeMillis()): Boolean {
@@ -218,8 +232,20 @@ data class BtrMediaSession(
     val refreshInFlight: AtomicBoolean = AtomicBoolean(false),
     @Volatile var nextRefreshAllowedAtMs: Long = 0L,
     val refreshConsecutiveFailures: AtomicInteger = AtomicInteger(0),
-    @Volatile var refreshProvider: PlayinfoRefreshCallback? = null
-)
+    @Volatile var refreshProvider: PlayinfoRefreshCallback? = null,
+    val warmEnd: AtomicLong = AtomicLong(0L),
+    val unmeasuredTrialWaited: AtomicInteger = AtomicInteger(0),
+    val urlLock: Any = Any(),
+    val liveHostUrls: ConcurrentHashMap<String, String> = ConcurrentHashMap(),
+    @Volatile var liveCustomPoolOnly: Boolean = false,
+    val activeStreamSeq: AtomicLong = AtomicLong(0L),
+    val lastAbortedSeekHint: AtomicBoolean = AtomicBoolean(false),
+    val lastObservedStart: AtomicLong = AtomicLong(-1L)
+) {
+    fun currentCandidateUrls(): List<String> = synchronized(urlLock) {
+        (listOf(primaryUrl) + backupUrls).distinct()
+    }
+}
 
 object BtrSessionManager {
 
@@ -271,35 +297,42 @@ object BtrSessionManager {
 
         val cleanPrimaryLiveUrl = if (isLive) BtrLiveCore.unwrapProxyUrl(primaryUrl).ifBlank { primaryUrl } else primaryUrl
         val isFlvLive = isLive && cleanPrimaryLiveUrl.substringBefore('?').substringBefore('#').endsWith(".flv", ignoreCase = true)
+        val isConfirmedFmp4LiveSegment = isLive && BtrLiveCore.isLiveSegmentUrl(cleanPrimaryLiveUrl)
+        val liveHostUrlsMap = ConcurrentHashMap<String, String>()
+        var isLiveCustomOnly = false
 
         val pool: BtrLiveHostPool? = if (isLive) {
             val livePool = BtrLiveHostPool()
             val primaryHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cleanPrimaryLiveUrl)?.host).lowercase()
             if (primaryHost.isNotBlank() && !BtrLiveCore.isP2pUrl(cleanPrimaryLiveUrl)) {
                 livePool.add(primaryHost, proven = true)
+                liveHostUrlsMap[primaryHost] = cleanPrimaryLiveUrl
             }
-            // 仅对 fMP4 HLS 直播注入 KNOWN_FMP4_HOSTS；FLV 直播节点鉴权互不兼容，严禁混入（否则 403）
-            if (!isFlvLive) {
-                for (knownHost in BtrLiveCore.KNOWN_FMP4_HOSTS) {
-                    if (knownHost != primaryHost) {
-                        livePool.add(knownHost, proven = false)
-                    }
-                }
-            }
-            // 注入备用节点中包含的候选官方直播域名
+            // 注入备用节点中包含的候选官方直播域名（保留各线路完整 URL 含独立签名/extra 参数）
             for (backup in validBackups) {
                 val unwrappedBackup = BtrLiveCore.unwrapProxyUrl(backup).ifBlank { backup }
                 val bHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(unwrappedBackup)?.host).lowercase()
                 if (bHost.isNotBlank() && !BtrLiveCore.isP2pUrl(unwrappedBackup)) {
                     livePool.add(bHost, proven = false)
+                    liveHostUrlsMap.putIfAbsent(bHost, unwrappedBackup)
                 }
             }
-            // 注入用户自定义 CDN 池
-            if (config != null) {
-                for (custom in config.customCdnPool) {
-                    val cHost = BiliAcceleratorCore.cleanHost(custom).lowercase()
-                    if (cHost.isNotBlank() && !BtrLiveCore.isP2pUrl(cHost)) {
-                        livePool.add(cHost, proven = false)
+            // 对齐 BTR live-hook.js:124：配置自定义 CDN 池时仅使用自定义节点，不再混入默认 KNOWN_FMP4_HOSTS；
+            // 非自定义模式下仅对已确认的 .m4s 分片注入 KNOWN_FMP4_HOSTS，.m3u8 需在 pipePlaylist 确认 #EXT-X-MAP 后再注入，避免污染 HLS-TS
+            val validCustomLiveHosts = config?.customCdnPool
+                ?.map { BiliAcceleratorCore.cleanHost(it).lowercase().substringBefore(':') }
+                ?.filter { it.isNotBlank() && BiliAcceleratorCore.isValidCustomCdnHost(it) && !BtrLiveCore.isP2pUrl(it) }
+                ?.distinct()
+                .orEmpty()
+            if (validCustomLiveHosts.isNotEmpty()) {
+                isLiveCustomOnly = true
+                for (cHost in validCustomLiveHosts) {
+                    livePool.add(cHost, proven = false)
+                }
+            } else if (!isFlvLive && isConfirmedFmp4LiveSegment) {
+                for (knownHost in BtrLiveCore.KNOWN_FMP4_HOSTS) {
+                    if (knownHost != primaryHost) {
+                        livePool.add(knownHost, proven = false)
                     }
                 }
             }
@@ -318,27 +351,28 @@ object BtrSessionManager {
             } else {
                 validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
             }
-            val primaryHostLower = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(primaryUrl)?.host).lowercase()
+            val primaryHostLower = hostKeyOf(primaryUrl)
             val isPrimaryBstar = primaryHostLower.endsWith(".bstarstatic.com")
             val shouldSynthesize = !isPrimaryRelay && !isPrimaryBstar && (
                 config != null || isolated.none { !BiliAcceleratorCore.isAkamaiHost(it) }
             )
             if (shouldSynthesize) {
-                val donor = listOf(primaryUrl).plus(isolated).firstOrNull { candidate ->
-                    val ch = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(candidate)?.host).lowercase()
-                    !BiliAcceleratorCore.isRelayUrl(candidate) &&
+                val donor = (isolated + listOf(primaryUrl)).firstOrNull { candidate ->
+                    val ch = hostKeyOf(candidate)
+                    !candidate.contains("hdnts=", ignoreCase = true) &&
+                        !BiliAcceleratorCore.isRelayUrl(candidate) &&
                         !BiliAcceleratorCore.isAkamaiHost(candidate) &&
                         !BiliAcceleratorCore.hasDrmSignal(candidate) &&
                         !ch.endsWith(".bstarstatic.com")
                 } ?: primaryUrl
                 synthesizedList = synthesizeCompatibleBackups(donor, config, isEpisode = isEpisode)
-                (isolated + synthesizedList).distinct().filter { it != primaryUrl }
+                deduplicateUrlsByHost(isolated + synthesizedList, excludeHost = primaryHostLower)
             } else {
-                isolated
+                deduplicateUrlsByHost(isolated, excludeHost = primaryHostLower)
             }
         }
 
-        val deadlineSec = BiliAcceleratorCore.extractUrlDeadlineSeconds(cleanPrimaryLiveUrl)
+        val deadlineSec = extractDeadlineSeconds(cleanPrimaryLiveUrl)
         val refreshCb = if (!isLive) PlayinfoRegistry.findRefreshCallback(cleanPrimaryLiveUrl) else null
         val session = BtrMediaSession(
             sessionId = id,
@@ -353,7 +387,9 @@ object BtrSessionManager {
             config = config,
             synthesizedMirrors = synthesizedList,
             urlDeadlineEpochSec = deadlineSec,
-            refreshProvider = refreshCb
+            refreshProvider = refreshCb,
+            liveHostUrls = liveHostUrlsMap,
+            liveCustomPoolOnly = isLiveCustomOnly
         )
         sessions[id] = session
         latestSessionId = id
@@ -485,41 +521,126 @@ object BtrSessionManager {
         }
     }
 
+    private fun hostKeyOf(url: String): String {
+        val parsed = BiliAcceleratorCore.parseUri(url) ?: return ""
+        val host = BiliAcceleratorCore.cleanHost(parsed.host)
+            .lowercase()
+            .substringBefore(':')
+        if (host.isBlank()) return ""
+        val port = parsed.port
+        return if (port > 0 && port != 80 && port != 443) "$host:$port" else host
+    }
+
+    private fun deduplicateUrlsByHost(urls: List<String>, excludeHost: String = ""): List<String> {
+        if (urls.isEmpty()) return emptyList()
+        val seenHosts = HashSet<String>()
+        if (excludeHost.isNotBlank()) seenHosts.add(excludeHost.lowercase())
+        val out = ArrayList<String>(urls.size)
+        for (url in urls) {
+            if (url.isBlank()) continue
+            val host = hostKeyOf(url)
+            val dedupKey = host.ifBlank { url }
+            if (seenHosts.add(dedupKey)) {
+                out.add(url)
+            }
+        }
+        return out
+    }
+
+    private fun extractDeadlineSeconds(url: String): Long {
+        val direct = BiliAcceleratorCore.extractUrlDeadlineSeconds(url)
+        if (direct > 0L) return direct
+        val unwrapped = unwrapCandidateUrl(url)
+        return if (unwrapped != url) BiliAcceleratorCore.extractUrlDeadlineSeconds(unwrapped) else 0L
+    }
+
     fun refreshSignatureIfSamePath(primaryUrl: String, backupUrls: List<String>) {
-        val newDeadline = BiliAcceleratorCore.extractUrlDeadlineSeconds(primaryUrl)
+        val rawAll = (listOf(primaryUrl) + backupUrls).filter { it.isNotBlank() }.distinct()
+        if (rawAll.isEmpty()) return
+        val newDeadline = rawAll
+            .map { extractDeadlineSeconds(it) }
+            .filter { it > 0L }
+            .maxOrNull() ?: 0L
         if (newDeadline <= 0L) return
-        val newPath = extractNormalizedPathAndKey(primaryUrl).first
+        val newPath = rawAll.firstNotNullOfOrNull {
+            extractNormalizedPathAndKey(it).first.takeIf { p -> p.isNotBlank() }
+        }.orEmpty()
         if (newPath.isBlank()) return
+        val normalizedAll = rawAll.map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }.distinct()
+
         for (session in sessions.values) {
             if (session.isLive) continue
-            val existingPath = extractNormalizedPathAndKey(session.primaryUrl).first
-            if (existingPath == newPath && newDeadline > session.urlDeadlineEpochSec) {
-                session.primaryUrl = primaryUrl
-                session.urlDeadlineEpochSec = newDeadline
-                session.refreshConsecutiveFailures.set(0)
-                session.nextRefreshAllowedAtMs = 0L
-                val donor = listOf(primaryUrl).plus(backupUrls).firstOrNull { !BiliAcceleratorCore.isRelayUrl(it) && !BiliAcceleratorCore.isAkamaiHost(it) } ?: primaryUrl
-                if (session.config != null || session.synthesizedMirrors.isNotEmpty()) {
-                    session.synthesizedMirrors = synthesizeCompatibleBackups(donor, session.config, isEpisode = session.isEpisode)
-                }
-                val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(primaryUrl)
-                val validBackups = backupUrls.filter { it.isNotBlank() && it != primaryUrl }.distinct()
-                val isolatedBackups = if (isPrimaryRelay) {
-                    validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
-                } else {
-                    validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
-                }
-                session.backupUrls = if (!isPrimaryRelay && (session.config != null || session.synthesizedMirrors.isNotEmpty())) {
-                    (isolatedBackups + session.synthesizedMirrors).distinct().filter { it != primaryUrl }
-                } else if (isolatedBackups.isNotEmpty()) {
-                    isolatedBackups
-                } else {
-                    session.backupUrls.filter { url ->
-                        val d = BiliAcceleratorCore.extractUrlDeadlineSeconds(url)
-                        d <= 0L || d >= newDeadline
+            synchronized(session.urlLock) {
+                val existingPath = extractNormalizedPathAndKey(session.primaryUrl).first
+                if (existingPath == newPath && newDeadline > session.urlDeadlineEpochSec) {
+                    val isExistingCleanUpgcxcode = BiliAcceleratorCore.isCleanUposDonor(
+                        session.primaryUrl,
+                        requireUpgcxcode = true
+                    )
+                    val isExistingRelay = BiliAcceleratorCore.isRelayUrl(session.primaryUrl)
+                    val cleanDonorFromRefresh = normalizedAll.firstOrNull { BiliAcceleratorCore.isCleanUposDonor(it) }
+                    val rewrittenPrimary = session.config?.let { cfg ->
+                        val candidate = normalizedAll.firstOrNull { !BiliAcceleratorCore.isRelayUrl(it) } ?: primaryUrl
+                        val res = BiliAcceleratorCore.rewriteUrl(candidate, cfg)
+                        res.finalUrl.takeIf { res.changed && BiliAcceleratorCore.isCleanUposDonor(it) }
                     }
+                    val preservedCleanUposPrimary = if (isExistingCleanUpgcxcode && cleanDonorFromRefresh == null && rewrittenPrimary == null) {
+                        val existingHost = BiliAcceleratorCore.cleanHost(
+                            BiliAcceleratorCore.parseUri(session.primaryUrl)?.host
+                        ).substringBefore(':')
+                        val freshUpgcxcode = normalizedAll.firstOrNull {
+                            !BiliAcceleratorCore.isRelayUrl(it) &&
+                                BiliAcceleratorCore.parseUri(it)?.path?.contains("/upgcxcode/") == true
+                        }
+                        freshUpgcxcode?.let { fresh ->
+                            BiliAcceleratorCore.parseUri(fresh)?.replaceAuthority(existingHost)
+                        }?.takeIf { BiliAcceleratorCore.isCleanUposDonor(it, requireUpgcxcode = true) }
+                    } else {
+                        null
+                    }
+
+                    val resolvedPrimary = cleanDonorFromRefresh
+                        ?: rewrittenPrimary
+                        ?: preservedCleanUposPrimary
+                        ?: if (isExistingRelay) {
+                            primaryUrl
+                        } else {
+                            normalizedAll.firstOrNull { !BiliAcceleratorCore.isRelayUrl(it) } ?: primaryUrl
+                        }
+
+                    session.primaryUrl = resolvedPrimary
+                    session.urlDeadlineEpochSec = newDeadline
+                    session.refreshConsecutiveFailures.set(0)
+                    session.nextRefreshAllowedAtMs = 0L
+
+                    val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(resolvedPrimary)
+                    val donor = (normalizedAll + listOf(resolvedPrimary))
+                        .firstOrNull { !it.contains("hdnts=", ignoreCase = true) && BiliAcceleratorCore.isCleanUposDonor(it) }
+                        ?: resolvedPrimary
+                    if (!isPrimaryRelay && (session.config != null || session.synthesizedMirrors.isNotEmpty())) {
+                        session.synthesizedMirrors = synthesizeCompatibleBackups(donor, session.config, isEpisode = session.isEpisode)
+                    } else if (isPrimaryRelay) {
+                        session.synthesizedMirrors = emptyList()
+                    }
+                    val validBackups = normalizedAll.filter { it.isNotBlank() && it != resolvedPrimary }.distinct()
+                    val isolatedBackups = if (isPrimaryRelay) {
+                        rawAll.filter { it.isNotBlank() && it != resolvedPrimary && BiliAcceleratorCore.isRelayUrl(it) }.distinct()
+                    } else {
+                        validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
+                    }
+                    val primaryHostLower = hostKeyOf(resolvedPrimary)
+                    session.backupUrls = if (!isPrimaryRelay && (session.config != null || session.synthesizedMirrors.isNotEmpty())) {
+                        deduplicateUrlsByHost(isolatedBackups + session.synthesizedMirrors, excludeHost = primaryHostLower)
+                    } else if (isolatedBackups.isNotEmpty()) {
+                        deduplicateUrlsByHost(isolatedBackups, excludeHost = primaryHostLower)
+                    } else {
+                        session.backupUrls.filter { url ->
+                            val d = extractDeadlineSeconds(url)
+                            d <= 0L || d >= newDeadline
+                        }
+                    }
+                    scheduleProactiveRefresh(session)
                 }
-                scheduleProactiveRefresh(session)
             }
         }
     }
@@ -553,35 +674,87 @@ object BtrSessionManager {
 
     fun updateBackups(sessionId: String, backups: List<String>) {
         val current = sessions[sessionId] ?: return
-        val validBackups = backups.filter { it.isNotBlank() && it != current.primaryUrl }.distinct()
-        val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(current.primaryUrl)
-        val isolatedBackups = if (isPrimaryRelay) {
-            validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
-        } else {
-            validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
-        }
-        if (isolatedBackups.isNotEmpty()) {
-            val shouldKeepSynthesized = !current.isLive && !isPrimaryRelay && (
-                current.config != null ||
-                    (current.synthesizedMirrors.isNotEmpty() && isolatedBackups.none { !BiliAcceleratorCore.isAkamaiHost(it) })
-                )
-            current.backupUrls = if (shouldKeepSynthesized) {
-                val preservedAkamai = current.backupUrls.filter { BiliAcceleratorCore.isAkamaiHost(it) }
-                (isolatedBackups + preservedAkamai + current.synthesizedMirrors)
-                    .distinct()
-                    .filter { it != current.primaryUrl }
-            } else {
-                isolatedBackups
-            }
-        }
+        synchronized(current.urlLock) {
+            val validBackups = backups.filter { it.isNotBlank() && it != current.primaryUrl }.distinct()
+            val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(current.primaryUrl)
+            val currentPath = extractNormalizedPathAndKey(current.primaryUrl).first
 
-        // 若为直播会话，同时同步至直播节点池
-        current.liveHostPool?.let { pool ->
-            for (b in isolatedBackups) {
-                val unwrappedBackup = BtrLiveCore.unwrapProxyUrl(b).ifBlank { b }
-                val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(unwrappedBackup)?.host).lowercase()
-                if (host.isNotBlank() && !BtrLiveCore.isP2pUrl(unwrappedBackup)) {
-                    pool.add(host, proven = false)
+            // 当初始 URL 为带 /upgcxcode/ 的 MCDN/PCDN（含代理包装）且后续补充到同资产官方 UPOS 备用镜像时，升级主地址并释放全池镜像
+            val promotedUposDonor = if (
+                !current.isLive &&
+                currentPath.contains("/upgcxcode/") &&
+                !BiliAcceleratorCore.isCleanUposDonor(current.primaryUrl, requireUpgcxcode = true)
+            ) {
+                validBackups
+                    .map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }
+                    .firstOrNull { backup ->
+                        !backup.contains("hdnts=", ignoreCase = true) &&
+                            BiliAcceleratorCore.isCleanUposDonor(backup, requireUpgcxcode = true) &&
+                            extractNormalizedPathAndKey(backup).first == currentPath
+                    }
+            } else {
+                null
+            }
+            if (promotedUposDonor != null) {
+                current.primaryUrl = promotedUposDonor
+                val deadlineSec = extractDeadlineSeconds(promotedUposDonor)
+                if (deadlineSec > current.urlDeadlineEpochSec) {
+                    current.urlDeadlineEpochSec = deadlineSec
+                }
+                if (current.config != null || current.synthesizedMirrors.isNotEmpty() || isPrimaryRelay) {
+                    current.synthesizedMirrors = synthesizeCompatibleBackups(
+                        promotedUposDonor,
+                        current.config,
+                        isEpisode = current.isEpisode
+                    )
+                }
+                val ordinaryBackups = validBackups
+                    .map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }
+                    .filter { !BiliAcceleratorCore.isRelayUrl(it) }
+                current.backupUrls = deduplicateUrlsByHost(
+                    ordinaryBackups + current.synthesizedMirrors,
+                    excludeHost = hostKeyOf(current.primaryUrl)
+                )
+                scheduleProactiveRefresh(current)
+                return
+            }
+
+            val isolatedBackups = if (isPrimaryRelay) {
+                validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
+            } else {
+                validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
+            }
+            if (isolatedBackups.isNotEmpty()) {
+                val primaryHostLower = hostKeyOf(current.primaryUrl)
+                val existingSynth = current.synthesizedMirrors.toSet()
+                val existingRealBackups = current.backupUrls.filter { it !in existingSynth }
+                val shouldKeepSynthesized = !current.isLive && !isPrimaryRelay && (
+                    current.config != null ||
+                        (current.synthesizedMirrors.isNotEmpty() && isolatedBackups.none { !BiliAcceleratorCore.isAkamaiHost(it) })
+                    )
+                current.backupUrls = if (shouldKeepSynthesized) {
+                    val preservedAkamai = current.backupUrls.filter { BiliAcceleratorCore.isAkamaiHost(it) }
+                    deduplicateUrlsByHost(
+                        isolatedBackups + existingRealBackups + preservedAkamai + current.synthesizedMirrors,
+                        excludeHost = primaryHostLower
+                    )
+                } else {
+                    deduplicateUrlsByHost(
+                        isolatedBackups + existingRealBackups,
+                        excludeHost = primaryHostLower
+                    )
+                }
+            }
+
+            // 若为直播会话，同时同步至直播节点池及逐线路 URL 映射表
+            current.liveHostPool?.let { pool ->
+                for (b in isolatedBackups) {
+                    val unwrappedBackup = BtrLiveCore.unwrapProxyUrl(b).ifBlank { b }
+                    val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(unwrappedBackup)?.host).lowercase()
+                    if (host.isNotBlank() && !BtrLiveCore.isP2pUrl(unwrappedBackup)) {
+                        pool.add(host, proven = false)
+                        current.liveHostUrls.putIfAbsent(host, unwrappedBackup)
+                    }
                 }
             }
         }
@@ -666,8 +839,9 @@ object BtrSessionManager {
         if (!path.contains("/upgcxcode/")) return emptyList()
 
         val host = uri.host.lowercase().substringBefore(':')
-        // 中继地址、DRM 加密流与 bstarstatic.com 区域专属流严禁合成普通 UPOS 镜像
-        if (BiliAcceleratorCore.isRelayUrl(primaryUrl) ||
+        // 中继地址、DRM 加密流、hdnts 绑定签名流与 bstarstatic.com 区域专属流严禁合成普通 UPOS 镜像
+        if (primaryUrl.contains("hdnts=", ignoreCase = true) ||
+            BiliAcceleratorCore.isRelayUrl(primaryUrl) ||
             path.startsWith("/v1/resource/") ||
             BiliAcceleratorCore.hasDrmSignal(primaryUrl) ||
             host.endsWith(".bstarstatic.com")
@@ -675,7 +849,6 @@ object BtrSessionManager {
             return emptyList()
         }
 
-        val isAkamai = BiliAcceleratorCore.isAkamaiHost(host)
         val isHkRegional = host.contains("cn-hk-eq")
         val isCustom = config != null && config.customCdnPool.isNotEmpty()
 

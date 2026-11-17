@@ -6,6 +6,7 @@ import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.PlayinfoRefreshCallback
 import io.github.jh_mmm.biliaccelerator.core.PlayinfoRegistry
 import io.github.libxposed.api.XposedModule
+import java.lang.reflect.Constructor
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -17,7 +18,6 @@ import java.util.WeakHashMap
 import java.util.concurrent.Executor
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
 
 object MossGrpcHook {
 
@@ -28,6 +28,8 @@ object MossGrpcHook {
         internal set
 
     private val hookedClasses = Collections.newSetFromMap(WeakHashMap<Class<*>, Boolean>())
+    private val hookedMethods = Collections.newSetFromMap(WeakHashMap<Method, Boolean>())
+    private val hookedConstructors = Collections.newSetFromMap(WeakHashMap<Constructor<*>, Boolean>())
     private val inPlayinfoInspect = ThreadLocal.withInitial { false }
     private val inGrpcRefresh = ThreadLocal.withInitial { false }
     private val inHttpRefresh = ThreadLocal.withInitial { false }
@@ -39,7 +41,20 @@ object MossGrpcHook {
         val capturedAtMs: Long
     )
 
-    private val lastHttpPlayurlCall = AtomicReference<CapturedHttpPlayurlCall?>(null)
+    private data class CapturedGrpcCallMeta(
+        val channel: Any,
+        val methodDesc: Any,
+        val callOptions: Any
+    )
+
+    private const val MAX_RECENT_HTTP_CALLS = 16
+    private const val HTTP_CALL_TTL_MS = 10_000L
+
+    private val recentCallsLock = Any()
+    private val recentCapturedCalls = ArrayDeque<CapturedHttpPlayurlCall>()
+    private val requestToCapturedCall = Collections.synchronizedMap(WeakHashMap<Any, CapturedHttpPlayurlCall>())
+    private val bodyToCapturedCall = Collections.synchronizedMap(WeakHashMap<Any, CapturedHttpPlayurlCall>())
+    private val clientCallToMeta = Collections.synchronizedMap(WeakHashMap<Any, CapturedGrpcCallMeta>())
 
     private val RUNTIME_HELPER_CLASSES = listOf(
         "com.bilibili.lib.moss.utils.RuntimeHelper",
@@ -175,11 +190,18 @@ object MossGrpcHook {
     }
 
     internal fun resetPlayinfoCaptureForTesting() {
-        lastHttpPlayurlCall.set(null)
+        synchronized(recentCallsLock) {
+            recentCapturedCalls.clear()
+        }
+        requestToCapturedCall.clear()
+        bodyToCapturedCall.clear()
+        clientCallToMeta.clear()
     }
 
     internal fun hasCapturedHttpPlayurlCallForTesting(): Boolean {
-        return lastHttpPlayurlCall.get() != null
+        return synchronized(recentCallsLock) { recentCapturedCalls.isNotEmpty() } ||
+            requestToCapturedCall.isNotEmpty() ||
+            bodyToCapturedCall.isNotEmpty()
     }
 
     internal fun inspectPlayViewReplyIfEnabled(
@@ -211,10 +233,87 @@ object MossGrpcHook {
         return m.invoke(target)
     }
 
+    private fun pruneExpiredHttpCallsLocked(nowMs: Long) {
+        while (recentCapturedCalls.isNotEmpty()) {
+            val oldest = recentCapturedCalls.first()
+            if (nowMs - oldest.capturedAtMs > HTTP_CALL_TTL_MS || nowMs < oldest.capturedAtMs) {
+                recentCapturedCalls.removeFirst()
+                requestToCapturedCall.remove(oldest.request)
+            } else {
+                break
+            }
+        }
+        while (recentCapturedCalls.size > MAX_RECENT_HTTP_CALLS) {
+            val evicted = recentCapturedCalls.removeFirst()
+            requestToCapturedCall.remove(evicted.request)
+        }
+    }
+
+    private fun consumeMatchingHttpCaller(
+        bodyObj: Any?,
+        nowMs: Long
+    ): CapturedHttpPlayurlCall? {
+        if (bodyObj != null) {
+            val bound = bodyToCapturedCall.remove(bodyObj)
+            if (bound != null) {
+                synchronized(recentCallsLock) {
+                    recentCapturedCalls.remove(bound)
+                    pruneExpiredHttpCallsLocked(nowMs)
+                }
+                requestToCapturedCall.remove(bound.request)
+                val ageMs = nowMs - bound.capturedAtMs
+                if (ageMs in 0L..HTTP_CALL_TTL_MS) {
+                    return bound
+                }
+            }
+        }
+        return synchronized(recentCallsLock) {
+            pruneExpiredHttpCallsLocked(nowMs)
+            val recent = if (recentCapturedCalls.isNotEmpty()) recentCapturedCalls.removeLast() else null
+            if (recent != null) {
+                requestToCapturedCall.remove(recent.request)
+            }
+            recent
+        }
+    }
+
+    internal fun bindResponseBodyPlayurlCall(
+        responseObj: Any?,
+        bodyObj: Any?,
+        nowMs: Long = System.currentTimeMillis()
+    ): Boolean {
+        if (!RemoteClient.getCachedConfig().enabled || responseObj == null || bodyObj == null) return false
+        val respReq = runCatching { invokeZeroArgAccessible(responseObj, "request") }.getOrNull()
+        val matched = if (respReq != null) {
+            requestToCapturedCall.remove(respReq)?.also { found ->
+                synchronized(recentCallsLock) {
+                    recentCapturedCalls.remove(found)
+                }
+            } ?: run {
+                val respUrl = runCatching { invokeZeroArgAccessible(respReq, "url")?.toString() }.getOrNull()
+                if (respUrl != null) {
+                    synchronized(recentCallsLock) {
+                        pruneExpiredHttpCallsLocked(nowMs)
+                        val idx = recentCapturedCalls.indexOfLast { it.url == respUrl }
+                        if (idx >= 0) {
+                            recentCapturedCalls.removeAt(idx).also { requestToCapturedCall.remove(it.request) }
+                        } else null
+                    }
+                } else null
+            }
+        } else null
+        if (matched != null && (nowMs - matched.capturedAtMs) in 0L..HTTP_CALL_TTL_MS) {
+            bodyToCapturedCall[bodyObj] = matched
+            return true
+        }
+        return false
+    }
+
     internal fun inspectHttpPlayinfoJsonIfEnabled(
         text: String?,
         allowRefreshCallback: Boolean,
-        nowMs: Long = System.currentTimeMillis()
+        nowMs: Long = System.currentTimeMillis(),
+        bodyObj: Any? = null
     ): Boolean {
         if (!RemoteClient.getCachedConfig().enabled) return false
         if (text == null || inPlayinfoInspect.get() == true || (allowRefreshCallback && inHttpRefresh.get() == true)) {
@@ -223,28 +322,13 @@ object MossGrpcHook {
         if (!fastLooksLikePlayinfoJson(text)) return false
         inPlayinfoInspect.set(true)
         return try {
-            val caller = if (allowRefreshCallback) lastHttpPlayurlCall.get() else null
-            val recentCaller = if (caller != null) {
-                val ageMs = nowMs - caller.capturedAtMs
-                if (ageMs in 0L..10_000L) {
-                    caller
-                } else {
-                    if (ageMs > 10_000L) {
-                        lastHttpPlayurlCall.compareAndSet(caller, null)
-                    }
-                    null
-                }
-            } else null
+            val recentCaller = if (allowRefreshCallback) consumeMatchingHttpCaller(bodyObj, nowMs) else null
             val recentRefreshCb = recentCaller?.let { buildHttpRefreshCallback(it) }
-            val ingested = PlayinfoRegistry.ingestJson(
+            PlayinfoRegistry.ingestJson(
                 text,
                 sourceUrl = recentCaller?.url.orEmpty(),
                 refreshCallback = recentRefreshCb
             ).isNotEmpty()
-            if (ingested && recentCaller != null) {
-                lastHttpPlayurlCall.compareAndSet(recentCaller, null)
-            }
-            ingested
         } catch (_: Throwable) {
             false
         } finally {
@@ -262,7 +346,13 @@ object MossGrpcHook {
         val methodStr = runCatching { invokeZeroArgAccessible(req, "method")?.toString() }.getOrNull()
         val urlStr = runCatching { invokeZeroArgAccessible(req, "url")?.toString() }.getOrNull()
         if (methodStr.equals("GET", ignoreCase = true) && urlStr != null && isPlayurlApiUrl(urlStr)) {
-            lastHttpPlayurlCall.set(CapturedHttpPlayurlCall(client, req, urlStr, nowMs))
+            val captured = CapturedHttpPlayurlCall(client, req, urlStr, nowMs)
+            requestToCapturedCall[req] = captured
+            synchronized(recentCallsLock) {
+                pruneExpiredHttpCallsLocked(nowMs)
+                recentCapturedCalls.addLast(captured)
+                pruneExpiredHttpCallsLocked(nowMs)
+            }
             return true
         }
         return false
@@ -314,7 +404,8 @@ object MossGrpcHook {
 
     internal fun attachFuturePlayViewListener(
         futureObj: Any?,
-        executor: Executor = Executor { runnable -> runnable.run() }
+        executor: Executor = Executor { runnable -> runnable.run() },
+        refreshCallback: PlayinfoRefreshCallback? = null
     ): Boolean {
         if (!RemoteClient.getCachedConfig().enabled) return false
         if (futureObj !is Future<*> || inGrpcRefresh.get() == true) return false
@@ -329,7 +420,11 @@ object MossGrpcHook {
                     if (!RemoteClient.getCachedConfig().enabled) return@Runnable
                     val doneVal = runCatching { futureObj.get() }.getOrNull()
                     if (doneVal != null && looksLikePlayViewObject(doneVal)) {
-                        inspectPlayViewReplyIfEnabled(doneVal, sourceTag = "grpc-future")
+                        inspectPlayViewReplyIfEnabled(
+                            doneVal,
+                            sourceTag = "grpc-future",
+                            refreshCallback = refreshCallback
+                        )
                     }
                 },
                 executor
@@ -341,7 +436,8 @@ object MossGrpcHook {
     internal fun wrapAsyncStreamObserver(
         streamObserverClass: Class<*>,
         origObserver: Any?,
-        classLoader: ClassLoader = streamObserverClass.classLoader ?: MossGrpcHook::class.java.classLoader
+        classLoader: ClassLoader = streamObserverClass.classLoader ?: MossGrpcHook::class.java.classLoader,
+        refreshCallback: PlayinfoRefreshCallback? = null
     ): Any? {
         if (!RemoteClient.getCachedConfig().enabled) return null
         if (origObserver == null || !streamObserverClass.isInstance(origObserver) || inGrpcRefresh.get() == true) {
@@ -355,7 +451,11 @@ object MossGrpcHook {
                 if (method.name == "onNext" && proxyArgs != null && proxyArgs.isNotEmpty() && RemoteClient.getCachedConfig().enabled) {
                     val value = proxyArgs[0]
                     if (value != null && looksLikePlayViewObject(value)) {
-                        inspectPlayViewReplyIfEnabled(value, sourceTag = "grpc-async")
+                        inspectPlayViewReplyIfEnabled(
+                            value,
+                            sourceTag = "grpc-async",
+                            refreshCallback = refreshCallback
+                        )
                     }
                 }
                 if (!method.isAccessible) {
@@ -370,6 +470,94 @@ object MossGrpcHook {
         }.getOrNull()
     }
 
+    private val KNOWN_GRPC_CHANNEL_CLASSES = listOf(
+        "io.grpc.internal.ManagedChannelImpl",
+        "io.grpc.internal.ManagedChannelImpl\$RealChannel",
+        "io.grpc.ClientInterceptors\$InterceptorChannel",
+        "io.grpc.internal.ManagedChannelOrphanWrapper",
+        "io.grpc.internal.ForwardingManagedChannel"
+    )
+
+    internal fun isPlayViewMethodDescriptor(methodDesc: Any?): Boolean {
+        if (methodDesc == null) return false
+        val fullMethodName = runCatching {
+            invokeZeroArgAccessible(methodDesc, "getFullMethodName")?.toString()
+        }.getOrNull().orEmpty()
+        return fullMethodName.contains("PlayView", ignoreCase = true) ||
+            fullMethodName.contains("PlayURL", ignoreCase = true)
+    }
+
+    internal fun recordClientCallMetaForTesting(
+        clientCall: Any,
+        channel: Any,
+        methodDesc: Any,
+        callOptions: Any
+    ) {
+        if (isPlayViewMethodDescriptor(methodDesc)) {
+            clientCallToMeta[clientCall] = CapturedGrpcCallMeta(channel, methodDesc, callOptions)
+        }
+    }
+
+    internal fun resolveGrpcRefreshCallbackFromArgs(
+        blockingMethod: Method?,
+        args: List<Any?>
+    ): PlayinfoRefreshCallback? {
+        if (blockingMethod == null) return null
+        if (args.size >= 4) {
+            return buildGrpcRefreshCallback(blockingMethod, args)
+        }
+        if (args.size >= 2) {
+            val clientCall = args[0] ?: return null
+            val reqMsg = args[1] ?: return null
+            val meta = clientCallToMeta.remove(clientCall) ?: return null
+            return buildGrpcRefreshCallback(
+                blockingMethod,
+                listOf(meta.channel, meta.methodDesc, meta.callOptions, reqMsg)
+            )
+        }
+        return null
+    }
+
+    private fun hookChannelNewCall(module: XposedModule, channelClass: Class<*>?) {
+        if (channelClass == null || Modifier.isAbstract(channelClass.modifiers)) return
+        val newlyAdded = synchronized(hookedClasses) { hookedClasses.add(channelClass) }
+        if (!newlyAdded) return
+        runCatching {
+            var cls: Class<*>? = channelClass
+            while (cls != null && cls != Any::class.java) {
+                for (m in cls.declaredMethods) {
+                    if (m.name == "newCall" &&
+                        !Modifier.isAbstract(m.modifiers) &&
+                        m.parameterTypes.size == 2
+                    ) {
+                        val shouldHook = synchronized(hookedMethods) { hookedMethods.add(m) }
+                        if (!shouldHook) continue
+                        runCatching {
+                            module.hook(m).intercept { chain ->
+                                val clientCall = chain.proceed()
+                                if (clientCall != null &&
+                                    RemoteClient.getCachedConfig().enabled &&
+                                    inGrpcRefresh.get() != true
+                                ) {
+                                    val channel = chain.thisObject
+                                    val methodDesc = chain.args.getOrNull(0)
+                                    val callOptions = chain.args.getOrNull(1)
+                                    if (channel != null && methodDesc != null && callOptions != null &&
+                                        isPlayViewMethodDescriptor(methodDesc)
+                                    ) {
+                                        clientCallToMeta[clientCall] = CapturedGrpcCallMeta(channel, methodDesc, callOptions)
+                                    }
+                                }
+                                clientCall
+                            }
+                        }
+                    }
+                }
+                cls = cls.superclass
+            }
+        }
+    }
+
     private fun hookGrpcClientCalls(module: XposedModule, classLoader: ClassLoader): Boolean {
         val clientCallsClass = try {
             classLoader.loadClass("io.grpc.stub.ClientCalls")
@@ -382,37 +570,70 @@ object MossGrpcHook {
 
         var anyHooked = false
         try {
+            val channelInterfaceClass = runCatching { classLoader.loadClass("io.grpc.Channel") }.getOrNull()
+            for (chName in KNOWN_GRPC_CHANNEL_CLASSES) {
+                runCatching { classLoader.loadClass(chName) }.getOrNull()?.let { hookChannelNewCall(module, it) }
+            }
+            val abstractStubClass = runCatching { classLoader.loadClass("io.grpc.stub.AbstractStub") }.getOrNull()
+            if (abstractStubClass != null && synchronized(hookedClasses) { hookedClasses.add(abstractStubClass) }) {
+                for (ctor in abstractStubClass.declaredConstructors) {
+                    if (synchronized(hookedConstructors) { hookedConstructors.add(ctor) }) {
+                        runCatching {
+                            module.hook(ctor).intercept { chain ->
+                                val channelArg = chain.args.firstOrNull { arg ->
+                                    arg != null && (channelInterfaceClass == null || channelInterfaceClass.isInstance(arg))
+                                }
+                                if (channelArg != null) {
+                                    hookChannelNewCall(module, channelArg.javaClass)
+                                }
+                                chain.proceed()
+                            }
+                        }
+                    }
+                }
+            }
+
             val methods = (clientCallsClass.declaredMethods + clientCallsClass.methods).distinct()
+            val blockingUnaryMethod = methods.firstOrNull {
+                it.name == "blockingUnaryCall" && it.parameterTypes.size == 4
+            }
             val directExecutor = Executor { runnable -> runnable.run() }
             val streamObserverClass = runCatching { classLoader.loadClass("io.grpc.stub.StreamObserver") }.getOrNull()
 
             for (m in methods) {
                 if (m.name == "blockingUnaryCall") {
+                    if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
                     module.hook(m).intercept { chain ->
                         if (!RemoteClient.getCachedConfig().enabled) {
                             RemoteClient.refreshConfigAsyncIfStale()
                             return@intercept chain.proceed()
                         }
+                        if (chain.args.size >= 4) {
+                            chain.args.getOrNull(0)?.let { hookChannelNewCall(module, it.javaClass) }
+                        }
                         val res = chain.proceed()
                         if (RemoteClient.getCachedConfig().enabled && res != null && inGrpcRefresh.get() != true && looksLikePlayViewObject(res)) {
-                            val refreshCb = buildGrpcRefreshCallback(m, chain.args)
+                            val refreshCb = resolveGrpcRefreshCallbackFromArgs(blockingUnaryMethod ?: m, chain.args)
                             inspectPlayViewReplyIfEnabled(res, sourceTag = "grpc-blocking", refreshCallback = refreshCb)
                         }
                         res
                     }
                     anyHooked = true
                 } else if (m.name == "futureUnaryCall") {
+                    if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
                     module.hook(m).intercept { chain ->
                         if (!RemoteClient.getCachedConfig().enabled) {
                             RemoteClient.refreshConfigAsyncIfStale()
                             return@intercept chain.proceed()
                         }
+                        val refreshCb = resolveGrpcRefreshCallbackFromArgs(blockingUnaryMethod, chain.args)
                         val futureObj = chain.proceed()
-                        attachFuturePlayViewListener(futureObj, directExecutor)
+                        attachFuturePlayViewListener(futureObj, directExecutor, refreshCallback = refreshCb)
                         futureObj
                     }
                     anyHooked = true
                 } else if (m.name == "asyncUnaryCall" && streamObserverClass != null && m.parameterTypes.lastOrNull() == streamObserverClass) {
+                    if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
                     module.hook(m).intercept { chain ->
                         if (!RemoteClient.getCachedConfig().enabled) {
                             RemoteClient.refreshConfigAsyncIfStale()
@@ -421,7 +642,13 @@ object MossGrpcHook {
                         val args = chain.args
                         val observerIdx = args.lastIndex
                         val origObserver = args.getOrNull(observerIdx)
-                        val proxyObserver = wrapAsyncStreamObserver(streamObserverClass, origObserver, classLoader)
+                        val refreshCb = resolveGrpcRefreshCallbackFromArgs(blockingUnaryMethod, args)
+                        val proxyObserver = wrapAsyncStreamObserver(
+                            streamObserverClass,
+                            origObserver,
+                            classLoader,
+                            refreshCallback = refreshCb
+                        )
                         if (proxyObserver != null) {
                             val newArgs = args.toTypedArray().apply { this[observerIdx] = proxyObserver }
                             return@intercept chain.proceed(newArgs)
@@ -442,17 +669,12 @@ object MossGrpcHook {
     }
 
     internal fun buildGrpcRefreshCallback(method: Method, args: List<Any?>): PlayinfoRefreshCallback? {
-        if (args.size != 4) return null
+        if (args.size < 4) return null
         val channel = args[0] ?: return null
         val methodDesc = args[1] ?: return null
         val rawCallOptions = args[2] ?: return null
         val reqMsg = args[3] ?: return null
-        val fullMethodName = runCatching {
-            invokeZeroArgAccessible(methodDesc, "getFullMethodName")?.toString()
-        }.getOrNull().orEmpty()
-        if (!fullMethodName.contains("PlayView", ignoreCase = true) &&
-            !fullMethodName.contains("PlayURL", ignoreCase = true)
-        ) {
+        if (!isPlayViewMethodDescriptor(methodDesc)) {
             return null
         }
 
@@ -488,21 +710,44 @@ object MossGrpcHook {
     private fun hookHttpPlayinfo(module: XposedModule, classLoader: ClassLoader): Boolean {
         var anyHooked = false
 
-        // 1. OkHttp ResponseBody.string() + OkHttpClient.newCall()
+        // 1. OkHttp ResponseBody.string() + Response.body() + OkHttpClient.newCall()
         val responseBodyClass = runCatching { classLoader.loadClass("okhttp3.ResponseBody") }.getOrNull()
         if (responseBodyClass != null && synchronized(hookedClasses) { hookedClasses.add(responseBodyClass) }) {
             runCatching {
                 val strMethod = responseBodyClass.getDeclaredMethod("string")
-                module.hook(strMethod).intercept { chain ->
-                    if (!RemoteClient.getCachedConfig().enabled) {
-                        RemoteClient.refreshConfigAsyncIfStale()
-                        return@intercept chain.proceed()
+                if (synchronized(hookedMethods) { hookedMethods.add(strMethod) }) {
+                    module.hook(strMethod).intercept { chain ->
+                        if (!RemoteClient.getCachedConfig().enabled) {
+                            RemoteClient.refreshConfigAsyncIfStale()
+                            return@intercept chain.proceed()
+                        }
+                        val text = chain.proceed() as? String
+                        inspectHttpPlayinfoJsonIfEnabled(
+                            text,
+                            allowRefreshCallback = true,
+                            bodyObj = chain.thisObject
+                        )
+                        text
                     }
-                    val text = chain.proceed() as? String
-                    inspectHttpPlayinfoJsonIfEnabled(text, allowRefreshCallback = true)
-                    text
+                    anyHooked = true
                 }
-                anyHooked = true
+            }
+        }
+
+        val responseClass = runCatching { classLoader.loadClass("okhttp3.Response") }.getOrNull()
+        if (responseClass != null && synchronized(hookedClasses) { hookedClasses.add(responseClass) }) {
+            runCatching {
+                val bodyMethod = responseClass.getDeclaredMethod("body")
+                if (synchronized(hookedMethods) { hookedMethods.add(bodyMethod) }) {
+                    module.hook(bodyMethod).intercept { chain ->
+                        val bodyObj = chain.proceed()
+                        if (bodyObj != null && RemoteClient.getCachedConfig().enabled) {
+                            bindResponseBodyPlayurlCall(chain.thisObject, bodyObj)
+                        }
+                        bodyObj
+                    }
+                    anyHooked = true
+                }
             }
         }
 
@@ -511,15 +756,17 @@ object MossGrpcHook {
         if (okClientClass != null && reqClass != null && synchronized(hookedClasses) { hookedClasses.add(okClientClass) }) {
             runCatching {
                 val newCallMethod = okClientClass.getDeclaredMethod("newCall", reqClass)
-                module.hook(newCallMethod).intercept { chain ->
-                    if (RemoteClient.getCachedConfig().enabled) {
-                        captureHttpPlayurlCallIfEnabled(chain.thisObject, chain.args.firstOrNull())
-                    } else {
-                        RemoteClient.refreshConfigAsyncIfStale()
+                if (synchronized(hookedMethods) { hookedMethods.add(newCallMethod) }) {
+                    module.hook(newCallMethod).intercept { chain ->
+                        if (RemoteClient.getCachedConfig().enabled) {
+                            captureHttpPlayurlCallIfEnabled(chain.thisObject, chain.args.firstOrNull())
+                        } else {
+                            RemoteClient.refreshConfigAsyncIfStale()
+                        }
+                        chain.proceed()
                     }
-                    chain.proceed()
+                    anyHooked = true
                 }
-                anyHooked = true
             }
         }
 
@@ -606,7 +853,10 @@ object MossGrpcHook {
             host == "biliapi.com" || host.endsWith(".biliapi.com") ||
             host == "biliintl.com" || host.endsWith(".biliintl.com") ||
             host == "bilibili.tv" || host.endsWith(".bilibili.tv")
-        return isBiliApiHost && parsed.path.contains("/playurl", ignoreCase = true)
+        return isBiliApiHost && (
+            parsed.path.contains("/playurl", ignoreCase = true) ||
+                parsed.path.contains("/playview", ignoreCase = true)
+            )
     }
 
     internal fun looksLikePlayViewObject(obj: Any): Boolean {

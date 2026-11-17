@@ -233,12 +233,13 @@ fun PreferenceActionItem(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     icon: ImageVector? = null,
-    tintColor: Color? = null
+    tintColor: Color? = null,
+    enabled: Boolean = true
 ) {
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -246,7 +247,9 @@ fun PreferenceActionItem(
             Icon(
                 imageVector = icon,
                 contentDescription = null,
-                tint = tintColor ?: MaterialTheme.colorScheme.primary,
+                tint = (tintColor ?: MaterialTheme.colorScheme.primary).let {
+                    if (enabled) it else it.copy(alpha = 0.4f)
+                },
                 modifier = Modifier.size(24.dp)
             )
             Spacer(Modifier.width(12.dp))
@@ -260,14 +263,18 @@ fun PreferenceActionItem(
                 text = title,
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Medium,
-                color = tintColor ?: MaterialTheme.colorScheme.onSurface
+                color = (tintColor ?: MaterialTheme.colorScheme.onSurface).let {
+                    if (enabled) it else it.copy(alpha = 0.4f)
+                }
             )
             if (!summary.isNullOrEmpty()) {
                 Spacer(Modifier.height(2.dp))
                 Text(
                     text = summary,
                     fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.let {
+                        if (enabled) it else it.copy(alpha = 0.4f)
+                    },
                     lineHeight = 16.sp
                 )
             }
@@ -276,7 +283,7 @@ fun PreferenceActionItem(
         Icon(
             imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
             contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 0.6f else 0.25f),
             modifier = Modifier.size(20.dp)
         )
     }
@@ -403,7 +410,7 @@ fun MiuixSlider(
 
         if (isAtBoundary) {
             if (!edgeFeedbackFired) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     view.performHapticFeedback(HapticFeedbackConstants.GESTURE_THRESHOLD_ACTIVATE)
                 } else {
                     view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
@@ -413,9 +420,7 @@ fun MiuixSlider(
         } else {
             edgeFeedbackFired = false
             if (newValue != lastHapticValue) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                }
+                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
             }
         }
         lastHapticValue = newValue

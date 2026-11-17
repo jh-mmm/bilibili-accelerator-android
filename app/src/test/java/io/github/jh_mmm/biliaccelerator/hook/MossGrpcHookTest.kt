@@ -558,4 +558,112 @@ class MossGrpcHookTest {
             assertEquals("observer boom", e.message)
         }
     }
+
+    @Test
+    fun testPlayviewUrlAndFutureAsyncRefreshCallbacks() {
+        assertTrue(MossGrpcHook.isPlayurlApiUrl("https://api.bilibili.com/ogv/player/playview?ep_id=123"))
+        assertTrue(MossGrpcHook.isPlayurlApiUrl("https://api.bilibili.com/x/player/wbi/playurl?cid=123"))
+
+        FakeGrpcClientCallsHelper.callCount = 0
+        FakeGrpcClientCallsHelper.lastDeadlineSeen = -1L
+        RemoteClient.setCachedConfigForTesting(AcceleratorConfig(enabled = true))
+        val blockingMethod = FakeGrpcClientCallsHelper::class.java.getMethod(
+            "blockingUnaryCall",
+            Any::class.java,
+            Any::class.java,
+            Any::class.java,
+            Any::class.java
+        )
+        val playViewDesc = PackagePrivateNetworkFakes.newMethodDescriptor("bilibili.app.playerunite.v1.Player/PlayViewUnite")
+        val asyncArgs5 = listOf(Any(), playViewDesc, PackagePrivateNetworkFakes.newCallOptions(), Any(), Any())
+        val refreshCbFrom5 = MossGrpcHook.buildGrpcRefreshCallback(blockingMethod, asyncArgs5)
+        assertNotNull("buildGrpcRefreshCallback must accept 5-arg asyncUnaryCall arg list", refreshCbFrom5)
+
+        val futureUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/96001.m4s?deadline=1899999999"
+        val refreshedUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/96001.m4s?deadline=1980000000"
+        FakeGrpcClientCallsHelper.replyToReturn = FakePlayViewReply(baseUrl = refreshedUrl)
+
+        val future = PackagePrivateNetworkFakes.newListenableFuture<FakePlayViewReply>()
+        val directExec = Executor { it.run() }
+        assertTrue(MossGrpcHook.attachFuturePlayViewListener(future, directExec, refreshCallback = refreshCbFrom5))
+        future.complete(FakePlayViewReply(baseUrl = futureUrl))
+        val cb = PlayinfoRegistry.findRefreshCallback(futureUrl)
+        assertNotNull("Future listener must bind refreshCallback", cb)
+        assertTrue(cb!!.refresh())
+        assertEquals(1980000000L, PlayinfoRegistry.lookup(futureUrl)!!.deadlineEpochSec)
+    }
+
+    @Test
+    fun testConcurrentHttpPlayurlBindingAndTwoThreeArgGrpcRefresh() {
+        RemoteClient.setCachedConfigForTesting(AcceleratorConfig(enabled = true))
+
+        // 1. Concurrent OkHttp calls: body1 completes after call2 was started
+        val pgcUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/97001.m4s?deadline=1800000000"
+        val pgcFreshUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/97001.m4s?deadline=1990000001"
+        val ugcUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/97002.m4s?deadline=1800000000"
+        val ugcFreshUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/97002.m4s?deadline=1990000002"
+
+        val pgcJson = """{"code":0,"data":{"dash":{"video":[{"id":80,"baseUrl":"$pgcUrl","is_drm":false}]}}}"""
+        val pgcFreshJson = """{"code":0,"data":{"dash":{"video":[{"id":80,"baseUrl":"$pgcFreshUrl","is_drm":false}]}}}"""
+        val ugcJson = """{"code":0,"data":{"dash":{"video":[{"id":80,"baseUrl":"$ugcUrl","is_drm":false}]}}}"""
+        val ugcFreshJson = """{"code":0,"data":{"dash":{"video":[{"id":80,"baseUrl":"$ugcFreshUrl","is_drm":false}]}}}"""
+
+        val client1 = OkHttpClient.Builder().addInterceptor { chain ->
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                .body(pgcFreshJson.toResponseBody("application/json".toMediaType())).build()
+        }.build()
+        val client2 = OkHttpClient.Builder().addInterceptor { chain ->
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                .body(ugcFreshJson.toResponseBody("application/json".toMediaType())).build()
+        }.build()
+
+        val req1 = Request.Builder().url("https://api.bilibili.com/pgc/player/web/playurl?ep_id=101").get().build()
+        val req2 = Request.Builder().url("https://api.bilibili.com/x/player/wbi/playurl?bvid=BV1concurrent").get().build()
+        val resp1 = Response.Builder().request(req1).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+            .body(pgcJson.toResponseBody("application/json".toMediaType())).build()
+        val resp2 = Response.Builder().request(req2).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+            .body(ugcJson.toResponseBody("application/json".toMediaType())).build()
+
+        val t0 = 500_000L
+        assertTrue(MossGrpcHook.captureHttpPlayurlCallIfEnabled(client1, req1, nowMs = t0))
+        assertTrue(MossGrpcHook.captureHttpPlayurlCallIfEnabled(client2, req2, nowMs = t0 + 10L))
+        assertTrue(MossGrpcHook.bindResponseBodyPlayurlCall(resp1, resp1.body, nowMs = t0 + 20L))
+        assertTrue(MossGrpcHook.bindResponseBodyPlayurlCall(resp2, resp2.body, nowMs = t0 + 30L))
+
+        // Out-of-order body string consumption must preserve per-call association
+        assertTrue(MossGrpcHook.inspectHttpPlayinfoJsonIfEnabled(pgcJson, allowRefreshCallback = true, nowMs = t0 + 50L, bodyObj = resp1.body))
+        assertTrue(MossGrpcHook.inspectHttpPlayinfoJsonIfEnabled(ugcJson, allowRefreshCallback = true, nowMs = t0 + 60L, bodyObj = resp2.body))
+
+        assertTrue("PGC response must retain PGC episode flag", PlayinfoRegistry.lookup(pgcUrl)!!.isEpisode)
+        assertFalse("UGC response must not be tainted by concurrent PGC call", PlayinfoRegistry.lookup(ugcUrl)!!.isEpisode)
+        assertTrue(PlayinfoRegistry.findRefreshCallback(pgcUrl)!!.refresh())
+        assertTrue(PlayinfoRegistry.findRefreshCallback(ugcUrl)!!.refresh())
+        assertEquals(1990000001L, PlayinfoRegistry.lookup(pgcUrl)!!.deadlineEpochSec)
+        assertEquals(1990000002L, PlayinfoRegistry.lookup(ugcUrl)!!.deadlineEpochSec)
+
+        // 2. Standard 2-arg futureUnaryCall & 3-arg asyncUnaryCall via Channel.newCall metadata
+        FakeGrpcClientCallsHelper.callCount = 0
+        val blockingMethod = FakeGrpcClientCallsHelper::class.java.getMethod(
+            "blockingUnaryCall",
+            Any::class.java, Any::class.java, Any::class.java, Any::class.java
+        )
+        val playViewDesc = PackagePrivateNetworkFakes.newMethodDescriptor("bilibili.app.playerunite.v1.Player/PlayViewUnite")
+        val callOptions = PackagePrivateNetworkFakes.newCallOptions()
+
+        val fakeClientCallFuture = Any()
+        MossGrpcHook.recordClientCallMetaForTesting(fakeClientCallFuture, Any(), playViewDesc, callOptions)
+        val futureCb = MossGrpcHook.resolveGrpcRefreshCallbackFromArgs(blockingMethod, listOf(fakeClientCallFuture, Any()))
+        assertNotNull("2-arg futureUnaryCall must resolve refreshCallback via ClientCall meta", futureCb)
+        val futureRefreshUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/97003.m4s?deadline=1800000000"
+        val futureRefreshUrlNew = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/97003.m4s?deadline=1990000003"
+        MossGrpcHook.inspectPlayViewReplyIfEnabled(FakePlayViewReply(baseUrl = futureRefreshUrl), "grpc-future", refreshCallback = futureCb)
+        FakeGrpcClientCallsHelper.replyToReturn = FakePlayViewReply(baseUrl = futureRefreshUrlNew)
+        assertTrue(PlayinfoRegistry.findRefreshCallback(futureRefreshUrl)!!.refresh())
+        assertEquals(1990000003L, PlayinfoRegistry.lookup(futureRefreshUrl)!!.deadlineEpochSec)
+
+        val fakeClientCallAsync = Any()
+        MossGrpcHook.recordClientCallMetaForTesting(fakeClientCallAsync, Any(), playViewDesc, callOptions)
+        val asyncCb = MossGrpcHook.resolveGrpcRefreshCallbackFromArgs(blockingMethod, listOf(fakeClientCallAsync, Any(), Any()))
+        assertNotNull("3-arg asyncUnaryCall must resolve refreshCallback via ClientCall meta", asyncCb)
+    }
 }

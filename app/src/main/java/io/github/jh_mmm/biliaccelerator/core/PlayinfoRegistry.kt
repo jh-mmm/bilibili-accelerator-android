@@ -9,10 +9,13 @@ import com.google.gson.reflect.TypeToken
 import io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager
 import java.io.File
 import java.lang.reflect.Method
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.zip.CRC32
 
 data class PlayinfoTrackEntry(
     val pathKey: String,
@@ -57,16 +60,24 @@ object PlayinfoRegistry {
 
     private const val MAX_ENTRIES = 512
     private const val ENTRY_TTL_MS = 6L * 60L * 60L * 1000L
-    private const val MAX_SHARED_ENTRIES = 32
+    private const val MAX_SHARED_ENTRIES = 128
     private const val SHARED_DIR_NAME = "btr_shared_state"
     private const val TRACKS_FILE_NAME = "playinfo_tracks.json"
     private const val CONCURRENCY_FILE_NAME = "concurrency_state.json"
 
     private val gson = Gson()
     private val byPathKey = ConcurrentHashMap<String, PlayinfoTrackEntry>()
+    private val byParentFileKey = ConcurrentHashMap<String, PlayinfoTrackEntry>()
     private val byFileKey = ConcurrentHashMap<String, PlayinfoTrackEntry>()
     private val refreshersByPath = ConcurrentHashMap<String, PlayinfoRefreshCallback>()
+    private val refreshersByParentFile = ConcurrentHashMap<String, PlayinfoRefreshCallback>()
     private val refreshersByFile = ConcurrentHashMap<String, PlayinfoRefreshCallback>()
+
+    private val DISTINCTIVE_ID_REGEX = Regex("""\d{5,}""")
+    private val GENERIC_FILE_KEYS = setOf(
+        "index.m3u8", "master.m3u8", "playlist.m3u8", "video.m4s", "audio.m4s",
+        "stream.m4s", "stream.mp4", "stream.flv", "init.m4s", "chunk.m4s"
+    )
 
     @Volatile
     private var sharedStateDir: File? = null
@@ -76,6 +87,8 @@ object PlayinfoRegistry {
     private var lastTracksFileMtime = 0L
     @Volatile
     private var lastTracksFileLength = -1L
+    @Volatile
+    private var lastTracksContentHash = 0L
     private val lastConcurrencyFileCheckMs = AtomicLong(0L)
     @Volatile
     private var lastConcurrencyFileMtime = 0L
@@ -95,12 +108,15 @@ object PlayinfoRegistry {
 
     internal fun resetForTesting(clearDir: Boolean = true) {
         byPathKey.clear()
+        byParentFileKey.clear()
         byFileKey.clear()
         refreshersByPath.clear()
+        refreshersByParentFile.clear()
         refreshersByFile.clear()
         lastTracksFileCheckMs.set(0L)
         lastTracksFileMtime = 0L
         lastTracksFileLength = -1L
+        lastTracksContentHash = 0L
         lastConcurrencyFileCheckMs.set(0L)
         lastConcurrencyFileMtime = 0L
         lastConcurrencyFileLength = -1L
@@ -139,11 +155,32 @@ object PlayinfoRegistry {
         return step1
     }
 
-    fun normalizePathAndFileKey(rawUrl: String): Pair<String, String> {
+    private fun normalizeKeys(rawUrl: String): Triple<String, String, String> {
         val effectiveUrl = unwrapPlayinfoLookupUrl(rawUrl)
-        val parsed = BiliAcceleratorCore.parseUri(effectiveUrl) ?: return "" to ""
+        val parsed = BiliAcceleratorCore.parseUri(effectiveUrl) ?: return Triple("", "", "")
         val path = parsed.path.trim().trimEnd('/').lowercase()
         val fileKey = path.substringAfterLast('/')
+        val parentAndFile = path.trimStart('/').split('/').let { segs ->
+            if (segs.size >= 2) "${segs[segs.size - 2]}/${segs.last()}" else ""
+        }
+        return Triple(path, parentAndFile, fileKey)
+    }
+
+    private fun isDistinctiveFileKey(fileKey: String): Boolean {
+        if (fileKey.isBlank()) return false
+        val lower = fileKey.lowercase()
+        if (lower in GENERIC_FILE_KEYS || lower.startsWith("chunk-") || lower.startsWith("chunk_")) return false
+        return DISTINCTIVE_ID_REGEX.containsMatchIn(lower) || lower.length >= 16
+    }
+
+    private fun parentFileKeyFromPath(pathKey: String): String {
+        val trimmed = pathKey.trimStart('/')
+        val segs = trimmed.split('/')
+        return if (segs.size >= 2) "${segs[segs.size - 2]}/${segs.last()}" else ""
+    }
+
+    fun normalizePathAndFileKey(rawUrl: String): Pair<String, String> {
+        val (path, _, fileKey) = normalizeKeys(rawUrl)
         return path to fileKey
     }
 
@@ -288,6 +325,80 @@ object PlayinfoRegistry {
         }
     }
 
+    private fun appendResolvedTrackEntries(
+        rawPrimary: String,
+        rawBackups: List<String>,
+        hasDrm: Boolean,
+        isPreview: Boolean,
+        isEpisode: Boolean,
+        isAudio: Boolean,
+        cid: Long,
+        epId: Long,
+        nowMs: Long,
+        out: MutableList<PlayinfoTrackEntry>
+    ) {
+        val unwrappedPrimary = BiliAcceleratorCore.unwrapSmtcdnsUrl(rawPrimary).ifBlank { rawPrimary }
+        val unwrappedBackups = rawBackups
+            .filter { it.isNotBlank() }
+            .map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }
+            .distinct()
+        val allNormalized = (listOf(unwrappedPrimary) + unwrappedBackups).filter { it.isNotBlank() }.distinct()
+        if (allNormalized.isEmpty()) return
+
+        val hasCleanOfficial = !hasDrm && !isPreview && allNormalized.any { BiliAcceleratorCore.isCleanUposDonor(it) }
+        val effectivePrimary = if (!hasDrm && !isPreview && !BiliAcceleratorCore.isCleanUposDonor(unwrappedPrimary)) {
+            allNormalized.firstOrNull { BiliAcceleratorCore.isCleanUposDonor(it) } ?: unwrappedPrimary
+        } else {
+            unwrappedPrimary
+        }
+
+        val effectiveBackups = allNormalized.filter { it != effectivePrimary }.let { remaining ->
+            if (hasCleanOfficial) {
+                remaining.filter { url ->
+                    val parsed = BiliAcceleratorCore.parseUri(url) ?: return@filter false
+                    val host = BiliAcceleratorCore.cleanHost(parsed.host)
+                        .lowercase()
+                        .substringBefore(':')
+                    val oddPort = parsed.port != -1 && parsed.port != 80 && parsed.port != 443
+                    val hasOsMcdn = parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
+                    !BiliAcceleratorCore.isIpAddress(host) &&
+                        !BiliAcceleratorCore.isKnownP2pHost(host) &&
+                        !BiliAcceleratorCore.isMcdnHost(host) &&
+                        !BiliAcceleratorCore.isSchedulerHost(host) &&
+                        !oddPort &&
+                        !hasOsMcdn
+                }
+            } else {
+                remaining
+            }
+        }.distinct()
+
+        val deadlineUrls = (listOf(effectivePrimary) + effectiveBackups).ifEmpty { allNormalized }
+        val deadline = extractEarliestDeadline(deadlineUrls)
+        val seenKeys = HashSet<String>()
+        val keyUrls = (listOf(rawPrimary) + rawBackups + allNormalized).filter { it.isNotBlank() }.distinct()
+        for (u in keyUrls) {
+            val (pathKey, fileKey) = normalizePathAndFileKey(u)
+            if (pathKey.isBlank() || !seenKeys.add(pathKey)) continue
+            out.add(
+                PlayinfoTrackEntry(
+                    pathKey = pathKey,
+                    fileKey = fileKey,
+                    primaryUrl = effectivePrimary,
+                    backupUrls = effectiveBackups,
+                    deadlineEpochSec = deadline,
+                    isAudio = isAudio,
+                    hasDrm = hasDrm,
+                    isPreview = isPreview,
+                    isEpisode = isEpisode,
+                    cid = cid,
+                    epId = epId,
+                    updatedAtMs = nowMs
+                )
+            )
+        }
+    }
+
     private fun addTrackFromJsonObject(
         obj: JsonObject,
         isAudioHint: Boolean,
@@ -313,28 +424,18 @@ object PlayinfoRegistry {
         val isPreview = rootPreview || hasJsonPreviewSignal(obj) || allUrls.any { BiliAcceleratorCore.isEpisodePreview(it) }
         val isEpisode = rootEpisode || allUrls.any { BiliAcceleratorCore.isEpisodeMediaUrl(it) }
         val isAudio = isAudioHint || BiliAcceleratorCore.isAudioTrack(primary)
-        val deadline = extractEarliestDeadline(allUrls)
-
-        for (u in allUrls) {
-            val (pathKey, fileKey) = normalizePathAndFileKey(u)
-            if (pathKey.isBlank()) continue
-            out.add(
-                PlayinfoTrackEntry(
-                    pathKey = pathKey,
-                    fileKey = fileKey,
-                    primaryUrl = primary,
-                    backupUrls = backups.distinct(),
-                    deadlineEpochSec = deadline,
-                    isAudio = isAudio,
-                    hasDrm = hasDrm,
-                    isPreview = isPreview,
-                    isEpisode = isEpisode,
-                    cid = cid,
-                    epId = epId,
-                    updatedAtMs = nowMs
-                )
-            )
-        }
+        appendResolvedTrackEntries(
+            rawPrimary = primary,
+            rawBackups = backups,
+            hasDrm = hasDrm,
+            isPreview = isPreview,
+            isEpisode = isEpisode,
+            isAudio = isAudio,
+            cid = cid,
+            epId = epId,
+            nowMs = nowMs,
+            out = out
+        )
     }
 
     fun ingestJson(
@@ -384,28 +485,18 @@ object PlayinfoRegistry {
             val isPreview = flags.isPreview || t.isPreview || allUrls.any { BiliAcceleratorCore.isEpisodePreview(it) }
             val isEpisode = flags.isEpisode || t.isEpisode || allUrls.any { BiliAcceleratorCore.isEpisodeMediaUrl(it) }
             val isAudio = t.isAudio || BiliAcceleratorCore.isAudioTrack(t.primaryUrl)
-            val deadline = extractEarliestDeadline(allUrls)
-
-            for (u in allUrls) {
-                val (pathKey, fileKey) = normalizePathAndFileKey(u)
-                if (pathKey.isBlank()) continue
-                entries.add(
-                    PlayinfoTrackEntry(
-                        pathKey = pathKey,
-                        fileKey = fileKey,
-                        primaryUrl = t.primaryUrl,
-                        backupUrls = t.backupUrls.distinct(),
-                        deadlineEpochSec = deadline,
-                        isAudio = isAudio,
-                        hasDrm = hasDrm,
-                        isPreview = isPreview,
-                        isEpisode = isEpisode,
-                        cid = flags.cid,
-                        epId = flags.epId,
-                        updatedAtMs = nowMs
-                    )
-                )
-            }
+            appendResolvedTrackEntries(
+                rawPrimary = t.primaryUrl,
+                rawBackups = t.backupUrls,
+                hasDrm = hasDrm,
+                isPreview = isPreview,
+                isEpisode = isEpisode,
+                isAudio = isAudio,
+                cid = flags.cid,
+                epId = flags.epId,
+                nowMs = nowMs,
+                out = entries
+            )
         }
         return entries.distinctBy { "${it.pathKey}|${it.primaryUrl}" }
     }
@@ -719,12 +810,19 @@ object PlayinfoRegistry {
                 entry
             }
             byPathKey[entry.pathKey] = merged
-            if (entry.fileKey.isNotBlank()) {
+            val parentFileKey = parentFileKeyFromPath(entry.pathKey)
+            if (parentFileKey.isNotBlank()) {
+                byParentFileKey[parentFileKey] = merged
+            }
+            if (isDistinctiveFileKey(entry.fileKey)) {
                 byFileKey[entry.fileKey] = merged
             }
             if (refreshCallback != null) {
                 refreshersByPath[entry.pathKey] = refreshCallback
-                if (entry.fileKey.isNotBlank()) {
+                if (parentFileKey.isNotBlank()) {
+                    refreshersByParentFile[parentFileKey] = refreshCallback
+                }
+                if (isDistinctiveFileKey(entry.fileKey)) {
                     refreshersByFile[entry.fileKey] = refreshCallback
                 }
             }
@@ -745,13 +843,15 @@ object PlayinfoRegistry {
 
     fun lookup(url: String, forceSharedReload: Boolean = false): PlayinfoTrackEntry? {
         if (url.isBlank()) return null
-        val (pathKey, fileKey) = normalizePathAndFileKey(url)
+        val (pathKey, parentFileKey, fileKey) = normalizeKeys(url)
         if (pathKey.isBlank() && fileKey.isBlank()) return null
+        val useBareFileKey = isDistinctiveFileKey(fileKey)
 
         val now = System.currentTimeMillis()
         if (!forceSharedReload) {
             val cached = (if (pathKey.isNotBlank()) byPathKey[pathKey] else null)
-                ?: (if (fileKey.isNotBlank()) byFileKey[fileKey] else null)
+                ?: (if (parentFileKey.isNotBlank()) byParentFileKey[parentFileKey] else null)
+                ?: (if (useBareFileKey) byFileKey[fileKey] else null)
             if (cached != null && (now - cached.updatedAtMs) <= ENTRY_TTL_MS) {
                 return cached
             }
@@ -760,7 +860,8 @@ object PlayinfoRegistry {
         // Cross-process shared lookup fallback (e.g. main process parsed PlayViewReply, :ijkservice plays it)
         loadSharedTracksIfUpdated(force = forceSharedReload)
         val fromShared = (if (pathKey.isNotBlank()) byPathKey[pathKey] else null)
-            ?: (if (fileKey.isNotBlank()) byFileKey[fileKey] else null)
+            ?: (if (parentFileKey.isNotBlank()) byParentFileKey[parentFileKey] else null)
+            ?: (if (useBareFileKey) byFileKey[fileKey] else null)
         return if (fromShared != null && (now - fromShared.updatedAtMs) <= ENTRY_TTL_MS) fromShared else null
     }
 
@@ -771,11 +872,14 @@ object PlayinfoRegistry {
     }
 
     fun findRefreshCallback(url: String): PlayinfoRefreshCallback? {
-        val (pathKey, fileKey) = normalizePathAndFileKey(url)
+        val (pathKey, parentFileKey, fileKey) = normalizeKeys(url)
         if (pathKey.isNotBlank()) {
             refreshersByPath[pathKey]?.let { return it }
         }
-        if (fileKey.isNotBlank()) {
+        if (parentFileKey.isNotBlank()) {
+            refreshersByParentFile[parentFileKey]?.let { return it }
+        }
+        if (isDistinctiveFileKey(fileKey)) {
             refreshersByFile[fileKey]?.let { return it }
         }
         return null
@@ -790,6 +894,13 @@ object PlayinfoRegistry {
                 byPathKey.remove(oldestKey)
             }
         }
+        if (byParentFileKey.size > MAX_ENTRIES) {
+            byParentFileKey.entries.removeIf { now - it.value.updatedAtMs > ENTRY_TTL_MS }
+            while (byParentFileKey.size > MAX_ENTRIES) {
+                val oldestKey = byParentFileKey.entries.minByOrNull { it.value.updatedAtMs }?.key ?: break
+                byParentFileKey.remove(oldestKey)
+            }
+        }
         if (byFileKey.size > MAX_ENTRIES) {
             byFileKey.entries.removeIf { now - it.value.updatedAtMs > ENTRY_TTL_MS }
             while (byFileKey.size > MAX_ENTRIES) {
@@ -800,9 +911,18 @@ object PlayinfoRegistry {
         if (refreshersByPath.size > MAX_ENTRIES) {
             refreshersByPath.entries.removeIf { !byPathKey.containsKey(it.key) }
         }
+        if (refreshersByParentFile.size > MAX_ENTRIES) {
+            refreshersByParentFile.entries.removeIf { !byParentFileKey.containsKey(it.key) }
+        }
         if (refreshersByFile.size > MAX_ENTRIES) {
             refreshersByFile.entries.removeIf { !byFileKey.containsKey(it.key) }
         }
+    }
+
+    private fun crc32Of(bytes: ByteArray): Long {
+        val crc = CRC32()
+        crc.update(bytes)
+        return crc.value
     }
 
     private fun persistSharedTracks(newEntries: List<PlayinfoTrackEntry>) {
@@ -824,6 +944,7 @@ object PlayinfoRegistry {
                     }
                     val bestBackups = when {
                         keepPrevUrls -> prev!!.backupUrls
+                        prev != null && e.deadlineEpochSec > prev.deadlineEpochSec -> e.backupUrls
                         e.backupUrls.isNotEmpty() -> e.backupUrls
                         else -> prev?.backupUrls.orEmpty()
                     }
@@ -843,14 +964,30 @@ object PlayinfoRegistry {
                 val trimmed = existing.values
                     .sortedByDescending { it.updatedAtMs }
                     .take(MAX_SHARED_ENTRIES)
-                val tmp = File(dir, "$TRACKS_FILE_NAME.tmp.${android.os.Process.myPid()}")
-                tmp.writeText(gson.toJson(trimmed), Charsets.UTF_8)
-                if (!tmp.renameTo(file)) {
-                    file.writeText(gson.toJson(trimmed), Charsets.UTF_8)
-                    tmp.delete()
+                val jsonBytes = gson.toJson(trimmed).toByteArray(Charsets.UTF_8)
+                val tmp = File(dir, "$TRACKS_FILE_NAME.tmp.${android.os.Process.myPid()}.${System.nanoTime()}")
+                try {
+                    tmp.writeBytes(jsonBytes)
+                    try {
+                        Files.move(
+                            tmp.toPath(),
+                            file.toPath(),
+                            StandardCopyOption.REPLACE_EXISTING,
+                            StandardCopyOption.ATOMIC_MOVE
+                        )
+                    } catch (_: Throwable) {
+                        Files.move(
+                            tmp.toPath(),
+                            file.toPath(),
+                            StandardCopyOption.REPLACE_EXISTING
+                        )
+                    }
+                } finally {
+                    if (tmp.exists()) tmp.delete()
                 }
                 lastTracksFileMtime = file.lastModified()
                 lastTracksFileLength = file.length()
+                lastTracksContentHash = crc32Of(jsonBytes)
             }
         }
     }
@@ -863,12 +1000,17 @@ object PlayinfoRegistry {
         runCatching {
             val file = File(dir, TRACKS_FILE_NAME)
             if (!file.exists()) return
-            val mtime = file.lastModified()
-            val len = file.length()
-            if (mtime <= 0L || (mtime == lastTracksFileMtime && len == lastTracksFileLength)) return
+            val bytes = file.readBytes()
+            if (bytes.isEmpty()) return
+            val crc = crc32Of(bytes)
+            val len = bytes.size.toLong()
+            if (!force && len == lastTracksFileLength && crc == lastTracksContentHash && lastTracksContentHash != 0L) {
+                return
+            }
             synchronized(sharedFileLock) {
-                val list = readSharedTracksFile(file).values
-                for (s in list) {
+                val type = object : TypeToken<List<SharedTrackSummary>>() {}.type
+                val parsedList: List<SharedTrackSummary> = gson.fromJson(String(bytes, Charsets.UTF_8), type) ?: emptyList()
+                for (s in parsedList) {
                     if (s.pathKey.isBlank() || (now - s.updatedAtMs) > ENTRY_TTL_MS) continue
                     val existing = byPathKey[s.pathKey]
                     val incomingFresher = existing == null ||
@@ -877,11 +1019,16 @@ object PlayinfoRegistry {
                     if (incomingFresher) {
                         val useIncomingUrls = s.primaryUrl.isNotBlank() &&
                             (existing == null || s.deadlineEpochSec >= existing.deadlineEpochSec)
+                        val resolvedBackups = when {
+                            existing != null && s.deadlineEpochSec > existing.deadlineEpochSec -> s.backupUrls
+                            useIncomingUrls && s.backupUrls.isNotEmpty() -> s.backupUrls
+                            else -> existing?.backupUrls.orEmpty()
+                        }
                         val entry = PlayinfoTrackEntry(
                             pathKey = s.pathKey,
                             fileKey = s.fileKey,
                             primaryUrl = if (useIncomingUrls) s.primaryUrl else existing?.primaryUrl.orEmpty(),
-                            backupUrls = if (useIncomingUrls && s.backupUrls.isNotEmpty()) s.backupUrls else existing?.backupUrls.orEmpty(),
+                            backupUrls = resolvedBackups,
                             deadlineEpochSec = maxOf(s.deadlineEpochSec, existing?.deadlineEpochSec ?: 0L),
                             isAudio = s.isAudio,
                             hasDrm = s.hasDrm || (existing?.hasDrm == true),
@@ -890,13 +1037,18 @@ object PlayinfoRegistry {
                             updatedAtMs = maxOf(s.updatedAtMs, existing?.updatedAtMs ?: 0L)
                         )
                         byPathKey[s.pathKey] = entry
-                        if (s.fileKey.isNotBlank()) {
+                        val parentFileKey = parentFileKeyFromPath(s.pathKey)
+                        if (parentFileKey.isNotBlank()) {
+                            byParentFileKey[parentFileKey] = entry
+                        }
+                        if (isDistinctiveFileKey(s.fileKey)) {
                             byFileKey[s.fileKey] = entry
                         }
                     }
                 }
                 lastTracksFileMtime = file.lastModified()
-                lastTracksFileLength = file.length()
+                lastTracksFileLength = len
+                lastTracksContentHash = crc
             }
         }
     }

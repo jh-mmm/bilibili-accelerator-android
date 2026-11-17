@@ -80,7 +80,7 @@ object BtrLocalProxyServer {
                         client = ss.accept() ?: break
                         val accepted = client
                         clientThreadPool.execute {
-                            handleClientSocket(accepted, currentConcurrency, currentChunkSizeKb, currentAutoConcurrency, currentAutoChunkSize)
+                            handleClientSocket(accepted)
                         }
                     } catch (e: Exception) {
                         runCatching { client?.close() }
@@ -114,7 +114,7 @@ object BtrLocalProxyServer {
         port = -1
     }
 
-    private fun handleClientSocket(socket: Socket, concurrency: Int, chunkSizeKb: Int, autoConcurrency: Boolean, autoChunkSize: Boolean) {
+    private fun handleClientSocket(socket: Socket) {
         socket.use { s ->
             try {
                 // 网络协议栈调优：开启 tcpNoDelay 消除 Nagle 算法 40ms 延迟，调大发送缓冲区
@@ -146,18 +146,29 @@ object BtrLocalProxyServer {
                     val method = parts[0].uppercase()
                     val path = parts[1]
                     val httpVersion = if (parts.size >= 3) parts[2].uppercase() else "HTTP/1.1"
+                    if (method != "GET" && method != "HEAD") {
+                        sendError(out, 405, "Method Not Allowed")
+                        break
+                    }
                     val isHeadOnly = method == "HEAD"
 
                     val headers = mutableMapOf<String, String>()
-                    var line: String?
-                    while (reader.readLine().also { line = it } != null && line!!.isNotEmpty()) {
-                        val colonIdx = line!!.indexOf(':')
+                    var eofMidHeaders = false
+                    while (true) {
+                        val line = reader.readLine()
+                        if (line == null) {
+                            eofMidHeaders = true
+                            break
+                        }
+                        if (line.isEmpty()) break
+                        val colonIdx = line.indexOf(':')
                         if (colonIdx > 0) {
-                            val k = line!!.substring(0, colonIdx).trim().lowercase()
-                            val v = line!!.substring(colonIdx + 1).trim()
+                            val k = line.substring(0, colonIdx).trim().lowercase()
+                            val v = line.substring(colonIdx + 1).trim()
                             headers[k] = v
                         }
                     }
+                    if (eofMidHeaders) break
 
                     // HTTP/1.1 默认启用 Keep-Alive，除非客户端显式请求 Connection: close
                     val clientConn = headers["connection"]?.lowercase()
@@ -185,10 +196,18 @@ object BtrLocalProxyServer {
                     // 仅按单次请求透传合法 User-Agent / Referer，避免探测或异常请求头永久污染 session 共享状态
                     val reqUserAgent = headers["user-agent"]
                         ?.trim()
-                        ?.takeIf { it.isNotBlank() && !it.startsWith("Dalvik/", ignoreCase = true) }
+                        ?.takeIf {
+                            it.isNotBlank() &&
+                                !it.startsWith("Dalvik/", ignoreCase = true) &&
+                                !it.startsWith("Java/", ignoreCase = true)
+                        }
                         ?: session.userAgent
                     if (session.userAgent.isNullOrBlank() && !reqUserAgent.isNullOrBlank()) {
-                        session.userAgent = reqUserAgent
+                        synchronized(session.urlLock) {
+                            if (session.userAgent.isNullOrBlank()) {
+                                session.userAgent = reqUserAgent
+                            }
+                        }
                     }
                     val reqReferer = headers["referer"]
                         ?.trim()
@@ -198,13 +217,39 @@ object BtrLocalProxyServer {
                     val keepConnectionAlive = if (session.isLive) {
                         when {
                             path.contains(".m3u8") -> {
-                                BtrLiveEngine.pipePlaylist(session, path, headers, out, port, keepAlive = shouldKeepAlive, requestUserAgent = reqUserAgent, requestReferer = reqReferer)
+                                BtrLiveEngine.pipePlaylist(
+                                    session = session,
+                                    requestPath = path,
+                                    headers = headers,
+                                    clientOut = out,
+                                    proxyPort = port,
+                                    keepAlive = shouldKeepAlive,
+                                    isHeadOnly = isHeadOnly,
+                                    requestUserAgent = reqUserAgent,
+                                    requestReferer = reqReferer
+                                )
                             }
                             path.contains(".flv") -> {
-                                BtrLiveEngine.pipeLiveFlvStream(session, headers, out, requestUserAgent = reqUserAgent, requestReferer = reqReferer)
+                                BtrLiveEngine.pipeLiveFlvStream(
+                                    session = session,
+                                    headers = headers,
+                                    clientOut = out,
+                                    isHeadOnly = isHeadOnly,
+                                    requestUserAgent = reqUserAgent,
+                                    requestReferer = reqReferer
+                                )
                             }
                             else -> {
-                                BtrLiveEngine.pipeSegment(session, path, headers, out, keepAlive = shouldKeepAlive, requestUserAgent = reqUserAgent, requestReferer = reqReferer)
+                                BtrLiveEngine.pipeSegment(
+                                    session = session,
+                                    requestPath = path,
+                                    headers = headers,
+                                    clientOut = out,
+                                    keepAlive = shouldKeepAlive,
+                                    isHeadOnly = isHeadOnly,
+                                    requestUserAgent = reqUserAgent,
+                                    requestReferer = reqReferer
+                                )
                             }
                         }
                     } else {
@@ -212,16 +257,21 @@ object BtrLocalProxyServer {
                         val rangeHeader = headers["range"]
                         val parsedRange = parseRangeHeader(rangeHeader)
 
+                        val reqConcurrency = currentConcurrency
+                        val reqChunkSizeKb = currentChunkSizeKb
+                        val reqAutoConcurrency = currentAutoConcurrency
+                        val reqAutoChunkSize = currentAutoChunkSize
+
                         BtrChunkEngine.pipeStream(
                             session = session,
                             requestedStart = parsedRange.start,
                             requestedEnd = parsedRange.end,
                             isHeadOnly = isHeadOnly,
                             clientOut = out,
-                            concurrency = concurrency,
-                            chunkSizeKb = chunkSizeKb,
-                            autoConcurrency = autoConcurrency,
-                            autoChunkSize = autoChunkSize,
+                            concurrency = reqConcurrency,
+                            chunkSizeKb = reqChunkSizeKb,
+                            autoConcurrency = reqAutoConcurrency,
+                            autoChunkSize = reqAutoChunkSize,
                             proxyPort = port,
                             parsedRange = parsedRange,
                             keepAlive = shouldKeepAlive,

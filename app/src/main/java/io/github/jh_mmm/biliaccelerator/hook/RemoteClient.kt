@@ -67,6 +67,8 @@ object RemoteClient {
     private var remotePrefsRef: SharedPreferences? = null
     @Volatile
     private var remotePrefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+    @Volatile
+    private var lastSyncedHookStatus: Map<String, String> = emptyMap()
 
     fun getCachedConfig(): AcceleratorConfig = cachedConfig
 
@@ -166,6 +168,7 @@ object RemoteClient {
             )
             if (proxy.isStarted) {
                 HookStatusTracker.recordStatus("btr_proxy", "127.0.0.1:${proxy.port}")
+                syncHookStatusIfDirtyAsync()
             }
         } else {
             proxy.updateParameters(
@@ -185,6 +188,7 @@ object RemoteClient {
                     "btr_proxy",
                     if (config.enabled && config.enableBtr) "ready (on-demand)" else "disabled"
                 )
+                syncHookStatusIfDirtyAsync()
                 return
             }
             val proxy = io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer
@@ -212,6 +216,7 @@ object RemoteClient {
                 }
                 HookStatusTracker.recordStatus("btr_proxy", "disabled")
             }
+            syncHookStatusIfDirtyAsync()
         } catch (t: Throwable) {
             Log.w(TAG, "Failed to sync BTR proxy state: ${t.message}")
         }
@@ -347,6 +352,8 @@ object RemoteClient {
                 syncBtrProxyState(direct)
                 return direct
             }
+            // Provider 不可达时设置 5 秒退避，防止后续每次 Hook 调用都在调用线程上同步阻塞
+            lastConfigFetchTime.compareAndSet(0L, now - CONFIG_CACHE_TTL + 5_000L)
         }
 
         fetchConfigAsync(context) { newConfig ->
@@ -402,6 +409,19 @@ object RemoteClient {
         }
     }
 
+    fun syncHookStatusIfDirtyAsync() {
+        val ctx = appContext ?: return
+        if (!contextInitialized.get()) return
+        val current = HookStatusTracker.getSnapshot()
+        if (current.isEmpty() || current == lastSyncedHookStatus) return
+        configExecutor.execute {
+            val latest = HookStatusTracker.getSnapshot()
+            if (latest.isNotEmpty() && latest != lastSyncedHookStatus) {
+                sendHandshakeDirect(ctx)
+            }
+        }
+    }
+
     internal fun resolveProcessName(context: Context? = null): String? {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
             runCatching { android.app.Application.getProcessName() }
@@ -427,7 +447,8 @@ object RemoteClient {
         val pm = context.packageManager
         val pInfo = runCatching { pm.getPackageInfo(pkgName, 0) }.getOrNull()
         val verName = pInfo?.versionName ?: "unknown"
-        val hookSnapshotJson = gson.toJson(HookStatusTracker.getSnapshot())
+        val hookSnapshot = HookStatusTracker.getSnapshot()
+        val hookSnapshotJson = gson.toJson(hookSnapshot)
         var handshakeOk = false
 
         // 1. 优先尝试 ContentProvider 握手
@@ -446,6 +467,7 @@ object RemoteClient {
             )
             if (res?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true) {
                 handshakeOk = true
+                lastSyncedHookStatus = hookSnapshot
                 Log.i(TAG, "Successfully sent handshake to module provider from $pkgName ($procName, v$verName)")
             }
         } catch (t: Throwable) {
@@ -475,6 +497,7 @@ object RemoteClient {
                     putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, authToken)
                 }
                 context.sendBroadcast(intent)
+                lastSyncedHookStatus = hookSnapshot
                 Log.i(TAG, "Successfully sent handshake to module via broadcast fallback from $pkgName ($procName, v$verName)")
             } catch (t: Throwable) {
                 Log.w(TAG, "sendHandshakeDirect via broadcast failed: ${t.message}")
@@ -535,12 +558,19 @@ object RemoteClient {
         }
 
         val json = gson.toJson(batch)
+        val currentHooks = HookStatusTracker.getSnapshot()
+        val dirtyHooksJson = if (currentHooks.isNotEmpty() && currentHooks != lastSyncedHookStatus) {
+            gson.toJson(currentHooks)
+        } else null
         var reported = false
 
         // 1. 优先尝试 ContentProvider 批量 IPC
         try {
             val extras = Bundle().apply {
                 putString(StatsProvider.EXTRA_REWRITE_BATCH_JSON, json)
+                if (dirtyHooksJson != null) {
+                    putString(StatsProvider.EXTRA_HOOK_STATUS_JSON, dirtyHooksJson)
+                }
             }
             val response = context.contentResolver.call(
                 StatsProvider.CONTENT_URI,
@@ -550,6 +580,9 @@ object RemoteClient {
             )
             if (response?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true) {
                 reported = true
+                if (dirtyHooksJson != null) {
+                    lastSyncedHookStatus = currentHooks
+                }
                 Log.i(TAG, "[Provider] 批量上报成功 (${batch.size} 条重定向)")
             }
         } catch (t: Throwable) {
@@ -581,8 +614,14 @@ object RemoteClient {
                         putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, authToken)
                         putExtra(StatsReceiver.EXTRA_CLIENT_PACKAGE, context.packageName)
                         putExtra(StatsReceiver.EXTRA_CLIENT_PROCESS, procName)
+                        if (dirtyHooksJson != null) {
+                            putExtra(StatsReceiver.EXTRA_HOOK_STATUS_JSON, dirtyHooksJson)
+                        }
                     }
                     context.sendBroadcast(intent)
+                    if (dirtyHooksJson != null) {
+                        lastSyncedHookStatus = currentHooks
+                    }
                     Log.i(TAG, "[Broadcast] 备用通道批量发送成功 (${batch.size} 条重定向)")
                 } catch (t: Throwable) {
                     Log.w(TAG, "[Broadcast] 发送异常: $t")

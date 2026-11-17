@@ -805,4 +805,127 @@ class PlayerHookBackupTest {
             BtrSessionManager.remove(sid)
         }
     }
+
+    @Test
+    fun testAkamaiWithBtrPreservesAkamaiWhenNoUposDonorAndPromotesWhenDonorExists() {
+        val akamaiUrl = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/94001.m4s?hdnts=exp=1899999999~hmac=sig"
+        val btrAkamaiCfg = config.copy(enableBtr = true, rewriteAkamai = true)
+
+        // 1. No clean UPOS donor: must keep original signed Akamai primaryUrl instead of sending hdnts= to UPOS
+        val setBackupMethod = FakeSegmentBuilder::class.java.getMethod("setBackupUrls", List::class.java)
+        val builder1 = FakeSegmentBuilder()
+        @Suppress("UNCHECKED_CAST")
+        PlayerHook.interceptSetBackupUrls(
+            builder = builder1,
+            method = setBackupMethod,
+            rawArg = listOf(akamaiUrl),
+            config = btrAkamaiCfg,
+            onRewrite = null,
+            proceedOriginal = { builder1.setBackupUrls(listOf(akamaiUrl)) },
+            proceedWithArg = { arg -> builder1.setBackupUrls(arg as List<String>) }
+        )
+        val res1 = PlayerHook.rewriteArgIfMedia(listOf(akamaiUrl), builder1, btrAkamaiCfg, onRewrite = null)
+        assertTrue((res1?.get(0) as? String)?.startsWith("http://127.0.0.1:") == true)
+        val sid1 = BtrSessionManager.getSessionForBuilder(builder1)!!
+        try {
+            val session1 = BtrSessionManager.get(sid1)!!
+            assertEquals("Without clean UPOS donor, primaryUrl must remain Akamai", akamaiUrl, session1.primaryUrl)
+            assertTrue(
+                "Session backups must never carry hdnts= onto non-Akamai UPOS hosts",
+                session1.backupUrls.none { !it.contains("akamaized.net") && it.contains("hdnts=") }
+            )
+        } finally {
+            BtrSessionManager.remove(sid1)
+        }
+
+        // 2. Clean UPOS donor exists in PlayinfoRegistry: must promote UPOS donor and emit pcdn-promote
+        val akamaiUrl2 = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/94002.m4s?hdnts=exp=1899999999~hmac=sig"
+        val cleanUpos = "https://upos-sz-estgoss.bilivideo.com/upgcxcode/54/12/94002.m4s?deadline=1899999999"
+        val json = """{"code":0,"data":{"dash":{"video":[{"id":80,"baseUrl":"$akamaiUrl2","backupUrl":["$cleanUpos"]}]}}}"""
+        assertTrue(PlayinfoRegistry.ingestJson(json).isNotEmpty())
+
+        val builder2 = FakeSegmentBuilder()
+        val emitted = mutableListOf<io.github.jh_mmm.biliaccelerator.core.RewriteResult>()
+        val res2 = PlayerHook.rewriteArgIfMedia(listOf(akamaiUrl2), builder2, btrAkamaiCfg, onRewrite = { emitted.add(it) })
+        assertTrue((res2?.get(0) as? String)?.startsWith("http://127.0.0.1:") == true)
+        val sid2 = BtrSessionManager.getSessionForBuilder(builder2)!!
+        try {
+            val session2 = BtrSessionManager.get(sid2)!!
+            assertEquals("Clean UPOS donor must be promoted as primaryUrl", cleanUpos, session2.primaryUrl)
+            assertTrue("Original Akamai URL must stay as fallback", session2.backupUrls.contains(akamaiUrl2))
+            assertEquals("pcdn-promote", emitted.lastOrNull()?.reason)
+        } finally {
+            BtrSessionManager.remove(sid2)
+        }
+    }
+
+    @Test
+    fun testSynthesizedPendingBackupsDoNotFakePcdnPromoteOverMcdnProxy() {
+        val nonBtrCfg = config.copy(enableBtr = false, mcdnStrategy = "proxy-all")
+        val builder = FakeSegmentBuilder()
+        val setBackupMethod = FakeSegmentBuilder::class.java.getMethod("setBackupUrls", List::class.java)
+        val pcdnOnlyBackups = listOf("http://112.34.56.78:8080/upgcxcode/54/12/77889.m4s?deadline=1899999999")
+
+        @Suppress("UNCHECKED_CAST")
+        PlayerHook.interceptSetBackupUrls(
+            builder = builder,
+            method = setBackupMethod,
+            rawArg = pcdnOnlyBackups,
+            config = nonBtrCfg,
+            onRewrite = null,
+            proceedOriginal = { builder.setBackupUrls(pcdnOnlyBackups) },
+            proceedWithArg = { arg -> builder.setBackupUrls(arg as List<String>) }
+        )
+        assertTrue("Synthesized mirrors should be placed into builder backups", builder.backups.isNotEmpty())
+
+        val mcdnUrl = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/77889.m4s?os=mcdn"
+        val emitted = mutableListOf<io.github.jh_mmm.biliaccelerator.core.RewriteResult>()
+        val rewrittenArgs = PlayerHook.rewriteArgIfMedia(
+            args = listOf(mcdnUrl),
+            builderInstance = builder,
+            configOverride = nonBtrCfg,
+            onRewrite = { emitted.add(it) }
+        )
+        val finalUrl = rewrittenArgs?.get(0) as? String
+        assertTrue("MCDN must still route through mcdn-proxy instead of synthesized PCDN promotion", finalUrl?.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url=") == true)
+        assertEquals("mcdn-proxy", emitted.lastOrNull()?.reason)
+    }
+
+    @Test
+    fun testNonBtrLiveFallbackPreservesCandidateQueryAndNetworkSecurityConcreteResolution() {
+        val nonBtrCfg = config.copy(enableBtr = false)
+        val builder = FakeSegmentBuilder()
+        val setBackupMethod = FakeSegmentBuilder::class.java.getMethod("setBackupUrls", List::class.java)
+        val cleanLive = "https://d1--cn-gotcha208.bilivideo.com/live-bvc/999/live_999.flv?txSecret=clean_sig"
+        val pcdnLive = "http://112.34.56.78:8080/live-bvc/999/live_999.flv?os=mcdn&pcdnToken=bad"
+
+        @Suppress("UNCHECKED_CAST")
+        PlayerHook.interceptSetBackupUrls(
+            builder = builder,
+            method = setBackupMethod,
+            rawArg = listOf(pcdnLive, cleanLive),
+            config = nonBtrCfg,
+            onRewrite = null,
+            proceedOriginal = { builder.setBackupUrls(listOf(pcdnLive, cleanLive)) },
+            proceedWithArg = { arg -> builder.setBackupUrls(arg as List<String>) }
+        )
+
+        val rewrittenArgs = PlayerHook.rewriteArgIfMedia(
+            args = listOf(pcdnLive),
+            builderInstance = builder,
+            configOverride = nonBtrCfg,
+            onRewrite = null
+        )
+        assertEquals(
+            "Non-BTR live fallback must preserve clean live host's full query auth",
+            cleanLive,
+            rewrittenArgs?.get(0)
+        )
+
+        assertTrue(NetworkSecurityHook.isLocalLoopbackHost("127.0.0.1:45678"))
+        assertTrue(NetworkSecurityHook.isLocalLoopbackHost("localhost"))
+        assertFalse(NetworkSecurityHook.isLocalLoopbackHost("upos-sz-mirrorcos.bilivideo.com"))
+        // Should not throw on JVM Android framework stubs
+        NetworkSecurityHook.resolveConcretePolicyClasses(this::class.java.classLoader!!)
+    }
 }

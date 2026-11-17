@@ -155,6 +155,9 @@ class HookEntry : XposedModule() {
         // 在 onPackageLoaded 与 onPackageReady 均尝试挂载播放器与 Moss Hook（内部按 Class 去重），兼顾自定义 AppComponentFactory / 插件化 ClassLoader
         PlayerHook.init(this, classLoader)
         MossGrpcHook.init(this, classLoader)
+
+        // 若 onPackageReady 阶段新挂载了 Hook 且上下文已初始化，补同步最新 Hook 状态至模块 UI
+        RemoteClient.syncHookStatusIfDirtyAsync()
     }
 
     private fun captureApplicationContext(packageName: String, classLoader: ClassLoader) {
@@ -167,8 +170,8 @@ class HookEntry : XposedModule() {
                 val result = chain.proceed()
                 val ctx = (chain.thisObject as? Context) ?: (chain.args.firstOrNull() as? Context)
                 if (ctx != null) {
-                    RemoteClient.setAppContext(ctx)
                     HookStatusTracker.recordStatus("app_context", "Application.attach ($packageName)")
+                    RemoteClient.setAppContext(ctx)
                 }
                 result
             }
@@ -185,8 +188,8 @@ class HookEntry : XposedModule() {
                 hook(onCreateMethod).intercept { chain ->
                     val result = chain.proceed()
                     (chain.thisObject as? Context)?.let { ctx ->
-                        RemoteClient.setAppContext(ctx)
                         HookStatusTracker.recordStatus("app_context", "Application.onCreate ($packageName)")
+                        RemoteClient.setAppContext(ctx)
                     }
                     result
                 }
