@@ -928,4 +928,66 @@ class PlayerHookBackupTest {
         // Should not throw on JVM Android framework stubs
         NetworkSecurityHook.resolveConcretePolicyClasses(this::class.java.classLoader!!)
     }
+
+    @Test
+    fun testExpiredPlayinfoNotPromotedAndPcdnOrForceUposPreservesOriginalFallback() {
+        val nowSec = System.currentTimeMillis() / 1000L
+        val expiredPlayinfoUrl = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/99100.m4s?deadline=${nowSec - 300}"
+        val freshPcdnUrl = "http://112.34.56.78:8080/upgcxcode/54/12/99100.m4s?deadline=${nowSec + 3600}"
+        val json = """{"code":0,"data":{"dash":{"video":[{"id":80,"baseUrl":"$expiredPlayinfoUrl"}]}}}"""
+        assertTrue(PlayinfoRegistry.ingestJson(json).isNotEmpty())
+
+        // 1. Expired PlayinfoRegistry entry must NOT be promoted over fresher originalUrl
+        val btrCfg = config.copy(enableBtr = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
+        val builder1 = FakeSegmentBuilder()
+        val args1 = PlayerHook.rewriteArgIfMedia(listOf(freshPcdnUrl), builder1, btrCfg, onRewrite = null)
+        assertTrue((args1?.get(0) as? String)?.startsWith("http://127.0.0.1:") == true)
+        val sid1 = BtrSessionManager.getSessionForBuilder(builder1)!!
+        try {
+            val session1 = BtrSessionManager.get(sid1)!!
+            assertFalse("Expired Playinfo mirrorali must NOT be promoted", session1.primaryUrl.contains("mirrorali"))
+            assertTrue("Rewritten fresh targetHost must be primary", session1.primaryUrl.contains("upos-sz-mirrorcos.bilivideo.com"))
+            assertTrue("Original URL must be kept as 403 fallback when no clean official backup exists", session1.backupUrls.contains(freshPcdnUrl))
+        } finally {
+            BtrSessionManager.remove(sid1)
+        }
+
+        // 2. forceUpos rewrite preserves original issued URL as 403 fallback inside BTR session
+        val issuedHw = "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/54/12/99101.m4s?deadline=${nowSec + 3600}&sign=hw"
+        val builder2 = FakeSegmentBuilder()
+        val args2 = PlayerHook.rewriteArgIfMedia(
+            listOf(issuedHw),
+            builder2,
+            btrCfg.copy(forceUpos = true, targetHost = "upos-sz-mirrorali.bilivideo.com"),
+            onRewrite = null
+        )
+        assertTrue((args2?.get(0) as? String)?.startsWith("http://127.0.0.1:") == true)
+        val sid2 = BtrSessionManager.getSessionForBuilder(builder2)!!
+        try {
+            val session2 = BtrSessionManager.get(sid2)!!
+            assertTrue(session2.primaryUrl.contains("upos-sz-mirrorali.bilivideo.com"))
+            assertTrue("Original mirrorhw URL must remain in session backupUrls as 403 fallback", session2.backupUrls.contains(issuedHw))
+        } finally {
+            BtrSessionManager.remove(sid2)
+        }
+
+        // 3. Disguised os=mcdn rewritten with mcdnStrategy=replace must NOT synthesize UPOS mirrors and must preserve originalUrl
+        val osMcdnUrl = "https://edge-p2p.example.com/upgcxcode/54/12/99102.m4s?os=mcdn&deadline=${nowSec + 3600}"
+        val builder3 = FakeSegmentBuilder()
+        val args3 = PlayerHook.rewriteArgIfMedia(
+            listOf(osMcdnUrl),
+            builder3,
+            btrCfg.copy(proxyMcdn = false, blockPcdn = true, targetHost = "upos-sz-mirrorali.bilivideo.com"),
+            onRewrite = null
+        )
+        assertTrue((args3?.get(0) as? String)?.startsWith("http://127.0.0.1:") == true)
+        val sid3 = BtrSessionManager.getSessionForBuilder(builder3)!!
+        try {
+            val session3 = BtrSessionManager.get(sid3)!!
+            assertTrue("os=mcdn URL must not synthesize extra UPOS mirrors", session3.synthesizedMirrors.isEmpty())
+            assertTrue("Original os=mcdn URL must be kept as 403 fallback", session3.backupUrls.contains(osMcdnUrl))
+        } finally {
+            BtrSessionManager.remove(sid3)
+        }
+    }
 }

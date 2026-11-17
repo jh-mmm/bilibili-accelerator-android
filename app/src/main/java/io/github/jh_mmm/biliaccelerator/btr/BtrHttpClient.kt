@@ -68,10 +68,11 @@ object BtrHttpClient {
         .callTimeout(CHUNK_ATTEMPT_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .build()
 
-    // 探针专用客户端：更紧凑的超时控制
+    // 探针专用客户端：更紧凑的超时控制，附带总调用超时避免慢节点卡死起播
     val probeClient: OkHttpClient = client.newBuilder()
-        .connectTimeout(4000, TimeUnit.MILLISECONDS)
-        .readTimeout(6000, TimeUnit.MILLISECONDS)
+        .connectTimeout(3500, TimeUnit.MILLISECONDS)
+        .readTimeout(4500, TimeUnit.MILLISECONDS)
+        .callTimeout(5500, TimeUnit.MILLISECONDS)
         .build()
 
     // 兜底直连专用客户端

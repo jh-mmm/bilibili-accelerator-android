@@ -382,10 +382,9 @@ object BiliAcceleratorCore {
     }
 
     /**
-     * 识别中继/MCDN/P2P资源流（对齐 BTR Issue #47）：
-     * 这类流的路径和鉴权签名由边缘中继专享，普通 UPOS 镜像无法解析，换 Host 必报 403。
-     * 注意：仅当路径为 /v1/resource/ 或非干净官方 UPOS/CDN 节点时，?os=mcdn 才视作中继流，
-     * 避免已改写为 UPOS 的 /upgcxcode/ 流因保留查询参数而被误判为中继从而丢失备用镜像池。
+     * 识别中继/MCDN/P2P资源流（对齐 BTR cdn-resolver.js isRelayUrl）：
+     * 这类流（含 *.mcdn.*、/v1/resource/、以及 ?os=mcdn）的路径与鉴权签名仅由边缘中继节点接受，
+     * 普通 UPOS 节点一律返回 HTTP 403；即使域名曾被改写为 upos-*，只要带 ?os=mcdn 仍属于中继签名。
      */
     fun isRelayUrl(url: String): Boolean {
         if (url.isBlank()) return false
@@ -399,16 +398,16 @@ object BiliAcceleratorCore {
         ) {
             return true
         }
-        val hasOsMcdn = parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
-        if (!hasOsMcdn) return false
-        val isCleanOfficialUpos = isBiliCdnHost(host) &&
-                !isAkamaiHost(host) &&
-                !isSchedulerHost(host) &&
-                !isIpAddress(host) &&
-                !host.endsWith(".bstarstatic.com") &&
-                (parsed.port == -1 || parsed.port == 80 || parsed.port == 443)
-        return !isCleanOfficialUpos
+        return parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
     }
+
+    fun isUposHost(hostname: String): Boolean {
+        val h = cleanHost(hostname).lowercase().substringBefore(':')
+        if (h.isBlank() || isKnownP2pHost(h)) return false
+        return UPOS_HOST_REGEX.matches(h)
+    }
+
+    private val UPOS_HOST_REGEX = Regex("""^upos-[a-z0-9-]+\.bilivideo\.com$""", RegexOption.IGNORE_CASE)
 
     fun isAkamaiHost(hostname: String): Boolean {
         val h = cleanHost(hostname).lowercase().substringBefore(':')
@@ -841,6 +840,24 @@ object BiliAcceleratorCore {
             return noChange(original, "mcdn-v1-pass", isPcdn = isPcdn, isMcdn = false, segmentKey = segKey)
         }
 
+        // 2.5 非 *.mcdn.* 主机但携带 ?os=mcdn 鉴权参数的伪装中继流：开启 proxyMcdn 且命中代理策略时优先走官方中继代理，避免换 UPOS 报 403
+        if (queryMcdn && config.proxyMcdn && shouldProxyMcdn(true, parsed.path, config)) {
+            val rewritten = parsed.proxyWrap(cleanProxyHost)
+            if (rewritten != original) {
+                return RewriteResult(
+                    changed = true,
+                    originalUrl = original,
+                    finalUrl = rewritten,
+                    originalHost = hostname,
+                    targetHost = cleanProxyHost,
+                    reason = "mcdn-proxy",
+                    isPcdn = true,
+                    isMcdn = true,
+                    segmentKey = segKey
+                )
+            }
+        }
+
         // 3. Akamai 节点处理：默认放行官方 Akamai 鉴权线路；杜绝非 BTR 模式下直接改写 Host 导致 403 播放失败
         val isAkamai = isAkamaiHost(hostname)
         val isBstar = hostname.endsWith(".bstarstatic.com", ignoreCase = true)
@@ -896,7 +913,7 @@ object BiliAcceleratorCore {
         if (parsed.port != -1 && parsed.port != 80 && parsed.port != 443) return false
         if (isRelayUrl(url) || hasDrmSignal(url) || isEpisodePreview(url)) return false
         if (requireUpgcxcode && !parsed.path.contains("/upgcxcode/")) return false
-        return isBiliCdnHost(host)
+        return isUposHost(host) || (host.startsWith("cn-hk-eq-") && host.endsWith(".bilivideo.com"))
     }
 
     fun filterAndFillBackupUrls(
@@ -933,8 +950,8 @@ object BiliAcceleratorCore {
             if (res.changed) {
                 onRewrite?.invoke(res)
                 filtered.add(res.finalUrl)
-                // 对齐 BTR：在 BTR 开启且改写 Akamai 为 UPOS 时保留原签名 Akamai 地址作为 403 兜底
-                if (res.reason == "akamai-redirect") {
+                // 对齐 BTR / realzza：改写 Akamai 或 forceUpos 强制改写官方节点时，保留原地址及独立签名作为 403 兜底
+                if (res.reason == "akamai-redirect" || res.reason == "force-upos") {
                     filtered.add(url)
                 }
             } else if (!res.isPcdn || !config.blockPcdn) {

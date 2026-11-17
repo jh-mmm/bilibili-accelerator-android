@@ -2008,4 +2008,105 @@ class BtrEngineTest {
             flvThread.interrupt()
         }
     }
+
+    @Test
+    fun testProbeRecoversFromPrimary403UsingFallbackBatchAndKeepsRelayFallback() {
+        val payload = ByteArray(96 * 1024) { (it and 0x7F).toByte() }
+
+        // Mock primary server returning 403, and backup server at index >= 3 (fallback batch) returning 206
+        val bad403Server = ServerSocket(0)
+        val goodFallbackServer = ServerSocket(0)
+        val tBad = Thread {
+            while (!bad403Server.isClosed) {
+                val sock = try { bad403Server.accept() } catch (_: Throwable) { break }
+                Thread {
+                    sock.use { s ->
+                        val r = s.getInputStream().bufferedReader()
+                        while (true) {
+                            val l = r.readLine() ?: break
+                            if (l.isEmpty()) break
+                        }
+                        s.getOutputStream().write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                        s.getOutputStream().flush()
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val tGood = Thread {
+            while (!goodFallbackServer.isClosed) {
+                val sock = try { goodFallbackServer.accept() } catch (_: Throwable) { break }
+                Thread {
+                    sock.use { s ->
+                        val r = s.getInputStream().bufferedReader()
+                        var rangeHeader: String? = null
+                        while (true) {
+                            val l = r.readLine() ?: break
+                            if (l.isEmpty()) break
+                            if (l.startsWith("Range:", ignoreCase = true)) {
+                                rangeHeader = l.substringAfter(":").trim()
+                            }
+                        }
+                        val (start, end) = BtrLocalProxyServer.parseRangeHeaderPair(rangeHeader)
+                        val actualEnd = minOf(end ?: (payload.size - 1L), payload.size - 1L)
+                        val slice = payload.copyOfRange(start.toInt(), actualEnd.toInt() + 1)
+                        val out = s.getOutputStream()
+                        out.write(
+                            ("HTTP/1.1 206 Partial Content\r\n" +
+                                "Content-Type: video/mp4\r\n" +
+                                "Content-Range: bytes $start-$actualEnd/${payload.size}\r\n" +
+                                "Content-Length: ${slice.size}\r\n" +
+                                "Connection: close\r\n\r\n").toByteArray()
+                        )
+                        out.write(slice)
+                        out.flush()
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+        }.apply { isDaemon = true; start() }
+
+        var sid = ""
+        try {
+            BtrLocalProxyServer.start()
+            val primary403 = "http://127.0.0.1:${bad403Server.localPort}/upgcxcode/77/88/probe403.m4s?tag=p"
+            val relayBackup = "https://proxy-tf-all-ws.bilivideo.com/?url=https%3A%2F%2Fxy.mcdn.bilivideo.cn%2Fupgcxcode%2F77%2F88%2Fprobe403.m4s"
+            val nonRelayBad1 = "http://127.0.0.1:${bad403Server.localPort}/upgcxcode/77/88/probe403.m4s?tag=b1"
+            val nonRelayBad2 = "http://127.0.0.1:${bad403Server.localPort}/upgcxcode/77/88/probe403.m4s?tag=b2"
+            val goodFallback = "http://localhost:${goodFallbackServer.localPort}/upgcxcode/77/88/probe403.m4s?tag=good"
+
+            // Verify non-relay session retains relay fallback at tail
+            val relayCheckSid = BtrSessionManager.register(
+                primaryUrl = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/77/88/probe403.m4s",
+                backupUrls = listOf(relayBackup),
+                config = null
+            )
+            val relayCheckSession = BtrSessionManager.get(relayCheckSid)!!
+            assertTrue("Non-relay session must keep relay backup at tail as 403 fallback", relayCheckSession.backupUrls.contains(relayBackup))
+            BtrSessionManager.remove(relayCheckSid)
+
+            // Verify probe recovers across fallback batch when primary + first 2 backups return 403
+            sid = BtrSessionManager.register(
+                primaryUrl = primary403,
+                backupUrls = listOf(nonRelayBad1, nonRelayBad2, goodFallback),
+                config = null
+            )
+            // Inject nonRelayBad1/2 explicitly (deduplicateUrlsByHost keeps unique hosts; use distinct port/host keys via direct session list)
+            val session = BtrSessionManager.get(sid)!!
+            synchronized(session.urlLock) {
+                session.backupUrls = listOf(nonRelayBad1, nonRelayBad2, goodFallback)
+            }
+
+            val conn = java.net.URL("http://127.0.0.1:${BtrLocalProxyServer.port}/stream/$sid.m4s").openConnection() as java.net.HttpURLConnection
+            assertEquals(200, conn.responseCode)
+            val received = conn.inputStream.readBytes()
+            conn.disconnect()
+            assertTrue("Fallback batch must recover from 403 and deliver exact payload", payload.contentEquals(received))
+        } finally {
+            if (sid.isNotBlank()) BtrSessionManager.remove(sid)
+            runCatching { bad403Server.close() }
+            runCatching { goodFallbackServer.close() }
+            tBad.interrupt()
+            tGood.interrupt()
+        }
+    }
 }

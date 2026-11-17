@@ -1726,7 +1726,6 @@ object BtrChunkEngine {
                     .header("Range", "bytes=$offset-$reqEnd")
                     .header("Referer", referer)
                     .header("User-Agent", userAgent)
-                    .header("Connection", "keep-alive")
                     .build()
                 val call = okClient.newCall(req)
                 registerStreamCall(streamCallKey, session.sessionId, call)
@@ -1845,7 +1844,8 @@ object BtrChunkEngine {
         streamCallKey: String?,
         sawForbidden403: AtomicBoolean?,
         sawRangeNotSatisfiable416: AtomicBoolean? = null,
-        totalLengthFrom416: AtomicLong? = null
+        totalLengthFrom416: AtomicLong? = null,
+        primaryFailReason: AtomicReference<String?>? = null
     ): ProbeResult? {
         if (isDecided?.get() == true) return null
         val host = extractHostname(url)
@@ -1856,7 +1856,6 @@ object BtrChunkEngine {
             .header("Range", "bytes=$startOffset-$endOffset")
             .header("Referer", referer)
             .header("User-Agent", userAgent)
-            .header("Connection", "keep-alive")
             .build()
 
         val call = okClient.newCall(request)
@@ -1868,12 +1867,13 @@ object BtrChunkEngine {
             call.execute().use { response ->
                 if (isDecided?.get() == true) return null
                 val code = response.code
+                val responseHost = response.request.url.host.ifBlank { host }
                 if (code == 200 || code == 206) {
                     val cr = response.header("Content-Range")
                     if (code == 200 && !cr.isNullOrBlank()) {
                         session.banList.recordHttpFailure(url, host, 410)
                         if (host == primaryHost) {
-                            reportFailover(host, "首片 HTTP 200 携带异常 Content-Range ($cr)", session.sessionId)
+                            primaryFailReason?.compareAndSet(null, "首片 HTTP 200 携带异常 Content-Range ($cr)")
                         }
                         return null
                     }
@@ -1885,7 +1885,7 @@ object BtrChunkEngine {
                     if (!isNonRange && !isValidContentRange(code, cr, startOffset, session)) {
                         session.banList.recordHttpFailure(url, host, 410)
                         if (host == primaryHost) {
-                            reportFailover(host, "首片 Content-Range 异常 ($cr)", session.sessionId)
+                            primaryFailReason?.compareAndSet(null, "首片 Content-Range 异常 ($cr)")
                         }
                         return null
                     }
@@ -1899,7 +1899,7 @@ object BtrChunkEngine {
                         session.banList.recordTransportFailure(host, 20_000L, url = url)
                         penalizeHost(host, 20_000L)
                         if (host == primaryHost) {
-                            reportFailover(host, "首片探测返回 0KB 空数据熔断", session.sessionId)
+                            primaryFailReason?.compareAndSet(null, "首片探测返回 0KB 空数据熔断")
                         }
                         return null
                     }
@@ -1908,7 +1908,7 @@ object BtrChunkEngine {
                     if (data.isNotEmpty()) {
                         recordRouteSpeed(url, data.size.toLong(), latency)
                     }
-                    ProbeResult(url, total, cl, ct, data, host, latency, isNonRange = isNonRange)
+                    ProbeResult(url, total, cl, ct, data, responseHost, latency, isNonRange = isNonRange)
                 } else if (code == 416) {
                     sawRangeNotSatisfiable416?.set(true)
                     val total416 = response.header("Content-Range")
@@ -1930,7 +1930,12 @@ object BtrChunkEngine {
                         penalizeHost(host, penaltyTime)
                     }
                     if (host == primaryHost) {
-                        reportFailover(host, "HTTP $code 错误", session.sessionId)
+                        val detail = if (!responseHost.equals(host, ignoreCase = true)) {
+                            "HTTP $code 错误 (跳转 $responseHost)"
+                        } else {
+                            "HTTP $code 错误"
+                        }
+                        primaryFailReason?.compareAndSet(null, detail)
                     }
                     null
                 }
@@ -1940,7 +1945,7 @@ object BtrChunkEngine {
                 session.banList.recordTransportFailure(host, 15_000L, url = url)
                 penalizeHost(host, 12_000L)
                 if (host == primaryHost) {
-                    reportFailover(host, e.message ?: "连接超时", session.sessionId)
+                    primaryFailReason?.compareAndSet(null, e.message ?: "连接超时")
                 }
             }
             null
@@ -1949,6 +1954,120 @@ object BtrChunkEngine {
             if (streamCallKey != null) {
                 unregisterStreamCall(streamCallKey, call)
             }
+        }
+    }
+
+    private fun raceProbeBatch(
+        batch: List<String>,
+        delaysMs: LongArray,
+        waitTimeoutMs: Long,
+        session: BtrMediaSession,
+        startOffset: Long,
+        chunkSize: Long,
+        userAgent: String,
+        referer: String,
+        okClient: okhttp3.OkHttpClient,
+        primaryHost: String,
+        concurrencyController: DynamicConcurrencyController?,
+        streamCallKey: String?,
+        sawForbidden403: AtomicBoolean,
+        saw416: AtomicBoolean,
+        total416: AtomicLong,
+        primaryFailReason: AtomicReference<String?>
+    ): ProbeResult? {
+        if (batch.isEmpty()) return null
+        if (batch.size == 1) {
+            return executeSingleProbe(
+                batch[0], session, startOffset, chunkSize, userAgent, referer,
+                okClient, primaryHost, concurrencyController,
+                activeCalls = null, isDecided = null, streamCallKey = streamCallKey,
+                sawForbidden403 = sawForbidden403,
+                sawRangeNotSatisfiable416 = saw416,
+                totalLengthFrom416 = total416,
+                primaryFailReason = primaryFailReason
+            )
+        }
+        val isDecided = AtomicBoolean(false)
+        val resultFuture = CompletableFuture<ProbeResult?>()
+        val activeCalls = ConcurrentHashMap.newKeySet<Call>()
+        val failedCount = AtomicInteger(0)
+        val staggerLock = Object()
+
+        for (i in batch.indices) {
+            val url = batch[i]
+            val delayMs = delaysMs.getOrElse(i) { delaysMs.lastOrNull() ?: 200L }
+            try {
+                hedgeWorkerPool.execute {
+                    var outcomeRecorded = false
+                    try {
+                        if (delayMs > 0L) {
+                            val deadline = System.currentTimeMillis() + delayMs
+                            synchronized(staggerLock) {
+                                while (!isDecided.get() && failedCount.get() < i) {
+                                    val rem = deadline - System.currentTimeMillis()
+                                    if (rem <= 0L) break
+                                    try {
+                                        staggerLock.wait(rem)
+                                    } catch (_: InterruptedException) {
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                        if (isDecided.get()) {
+                            outcomeRecorded = true
+                            return@execute
+                        }
+
+                        val probeRes = executeSingleProbe(
+                            url, session, startOffset, chunkSize, userAgent, referer,
+                            okClient, primaryHost, concurrencyController,
+                            activeCalls, isDecided, streamCallKey, sawForbidden403,
+                            sawRangeNotSatisfiable416 = saw416,
+                            totalLengthFrom416 = total416,
+                            primaryFailReason = primaryFailReason
+                        )
+                        if (probeRes != null && isDecided.compareAndSet(false, true)) {
+                            outcomeRecorded = true
+                            resultFuture.complete(probeRes)
+                            synchronized(staggerLock) { staggerLock.notifyAll() }
+                            activeCalls.forEach { call -> runCatching { call.cancel() } }
+                        } else if (!isDecided.get()) {
+                            outcomeRecorded = true
+                            val failures = failedCount.incrementAndGet()
+                            synchronized(staggerLock) { staggerLock.notifyAll() }
+                            if (failures >= batch.size && isDecided.compareAndSet(false, true)) {
+                                resultFuture.complete(null)
+                            }
+                        } else {
+                            outcomeRecorded = true
+                        }
+                    } catch (_: Throwable) {
+                    } finally {
+                        if (!outcomeRecorded && !isDecided.get()) {
+                            val failures = failedCount.incrementAndGet()
+                            synchronized(staggerLock) { staggerLock.notifyAll() }
+                            if (failures >= batch.size && isDecided.compareAndSet(false, true)) {
+                                resultFuture.complete(null)
+                            }
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+                val failures = failedCount.incrementAndGet()
+                synchronized(staggerLock) { staggerLock.notifyAll() }
+                if (failures >= batch.size && isDecided.compareAndSet(false, true)) {
+                    resultFuture.complete(null)
+                }
+            }
+        }
+
+        return try {
+            resultFuture.get(waitTimeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {
+            isDecided.set(true)
+            activeCalls.forEach { call -> runCatching { call.cancel() } }
+            null
         }
     }
 
@@ -1969,123 +2088,86 @@ object BtrChunkEngine {
         val sawForbidden403 = AtomicBoolean(false)
         val saw416 = AtomicBoolean(false)
         val total416 = AtomicLong(-1L)
+        val primaryFailReason = AtomicReference<String?>(null)
+
+        fun finalizeOutcome(winner: ProbeResult?): ProbeOutcome {
+            val failReason = primaryFailReason.get()
+            if (failReason != null) {
+                val target = winner?.servingHost?.takeIf { it.isNotBlank() } ?: "备用镜像/CDN"
+                reportFailover(primaryHost, failReason, session.sessionId, targetHost = target)
+            }
+            return if (winner != null) {
+                ProbeOutcome(winner, sawForbidden403.get())
+            } else {
+                ProbeOutcome(
+                    result = null,
+                    sawForbidden403 = sawForbidden403.get(),
+                    sawRangeNotSatisfiable416 = saw416.get(),
+                    totalLengthFrom416 = total416.get().takeIf { it > 0L }
+                )
+            }
+        }
 
         val raceCandidates = sortedUrls.take(3)
         val fallbackCandidates = sortedUrls.drop(3)
 
-        if (raceCandidates.size == 1) {
-            executeSingleProbe(
-                raceCandidates[0], session, startOffset, chunkSize, userAgent, referer,
-                okClient, primaryHost, concurrencyController,
-                activeCalls = null, isDecided = null, streamCallKey = streamCallKey,
-                sawForbidden403 = sawForbidden403,
-                sawRangeNotSatisfiable416 = saw416,
-                totalLengthFrom416 = total416
-            )?.let { return ProbeOutcome(it, sawForbidden403.get()) }
-        } else {
-            val isDecided = AtomicBoolean(false)
-            val resultFuture = CompletableFuture<ProbeResult?>()
-            val activeCalls = ConcurrentHashMap.newKeySet<Call>()
-            val failedCount = AtomicInteger(0)
-            val staggerLock = Object()
-            val delaysMs = longArrayOf(0L, 120L, 300L)
-
-            for (i in raceCandidates.indices) {
-                val url = raceCandidates[i]
-                val delayMs = delaysMs.getOrElse(i) { 300L }
-                try {
-                    hedgeWorkerPool.execute {
-                        var outcomeRecorded = false
-                        try {
-                            if (delayMs > 0L) {
-                                val deadline = System.currentTimeMillis() + delayMs
-                                synchronized(staggerLock) {
-                                    while (!isDecided.get() && failedCount.get() < i) {
-                                        val rem = deadline - System.currentTimeMillis()
-                                        if (rem <= 0L) break
-                                        try {
-                                            staggerLock.wait(rem)
-                                        } catch (_: InterruptedException) {
-                                            break
-                                        }
-                                    }
-                                }
-                            }
-                            if (isDecided.get()) {
-                                outcomeRecorded = true
-                                return@execute
-                            }
-
-                            val probeRes = executeSingleProbe(
-                                url, session, startOffset, chunkSize, userAgent, referer,
-                                okClient, primaryHost, concurrencyController,
-                                activeCalls, isDecided, streamCallKey, sawForbidden403,
-                                sawRangeNotSatisfiable416 = saw416,
-                                totalLengthFrom416 = total416
-                            )
-                            if (probeRes != null && isDecided.compareAndSet(false, true)) {
-                                outcomeRecorded = true
-                                resultFuture.complete(probeRes)
-                                synchronized(staggerLock) { staggerLock.notifyAll() }
-                                activeCalls.forEach { call -> runCatching { call.cancel() } }
-                            } else if (!isDecided.get()) {
-                                outcomeRecorded = true
-                                val failures = failedCount.incrementAndGet()
-                                synchronized(staggerLock) { staggerLock.notifyAll() }
-                                if (failures >= raceCandidates.size && isDecided.compareAndSet(false, true)) {
-                                    resultFuture.complete(null)
-                                }
-                            } else {
-                                outcomeRecorded = true
-                            }
-                        } catch (_: Throwable) {
-                        } finally {
-                            if (!outcomeRecorded && !isDecided.get()) {
-                                val failures = failedCount.incrementAndGet()
-                                synchronized(staggerLock) { staggerLock.notifyAll() }
-                                if (failures >= raceCandidates.size && isDecided.compareAndSet(false, true)) {
-                                    resultFuture.complete(null)
-                                }
-                            }
-                        }
-                    }
-                } catch (_: Throwable) {
-                    val failures = failedCount.incrementAndGet()
-                    synchronized(staggerLock) { staggerLock.notifyAll() }
-                    if (failures >= raceCandidates.size && isDecided.compareAndSet(false, true)) {
-                        resultFuture.complete(null)
-                    }
-                }
-            }
-
-            try {
-                val winner = resultFuture.get(15, TimeUnit.SECONDS)
-                if (winner != null) return ProbeOutcome(winner, sawForbidden403.get())
-            } catch (_: Exception) {
-                isDecided.set(true)
-                activeCalls.forEach { call -> runCatching { call.cancel() } }
-            }
+        val primaryWinner = raceProbeBatch(
+            batch = raceCandidates,
+            delaysMs = longArrayOf(0L, 120L, 300L),
+            waitTimeoutMs = 7_500L,
+            session = session,
+            startOffset = startOffset,
+            chunkSize = chunkSize,
+            userAgent = userAgent,
+            referer = referer,
+            okClient = okClient,
+            primaryHost = primaryHost,
+            concurrencyController = concurrencyController,
+            streamCallKey = streamCallKey,
+            sawForbidden403 = sawForbidden403,
+            saw416 = saw416,
+            total416 = total416,
+            primaryFailReason = primaryFailReason
+        )
+        if (primaryWinner != null) {
+            return finalizeOutcome(primaryWinner)
         }
 
-        for (url in fallbackCandidates) {
-            if (sawForbidden403.get() && isUrlExpired(session)) break
+        val nowSec = System.currentTimeMillis() / 1000L
+        for (batch in fallbackCandidates.chunked(3)) {
+            if (sawForbidden403.get() && isUrlExpired(session) &&
+                batch.all { u ->
+                    val d = BiliAcceleratorCore.extractUrlDeadlineSeconds(u)
+                    d > 0L && d <= nowSec
+                }
+            ) {
+                break
+            }
             val knownTotal416 = total416.get()
             if (saw416.get() && !sawForbidden403.get() && knownTotal416 > 0L && startOffset >= knownTotal416) break
-            executeSingleProbe(
-                url, session, startOffset, chunkSize, userAgent, referer,
-                okClient, primaryHost, concurrencyController,
-                activeCalls = null, isDecided = null, streamCallKey = streamCallKey,
+            val fallbackWinner = raceProbeBatch(
+                batch = batch,
+                delaysMs = longArrayOf(0L, 80L, 180L),
+                waitTimeoutMs = 6_500L,
+                session = session,
+                startOffset = startOffset,
+                chunkSize = chunkSize,
+                userAgent = userAgent,
+                referer = referer,
+                okClient = okClient,
+                primaryHost = primaryHost,
+                concurrencyController = concurrencyController,
+                streamCallKey = streamCallKey,
                 sawForbidden403 = sawForbidden403,
-                sawRangeNotSatisfiable416 = saw416,
-                totalLengthFrom416 = total416
-            )?.let { return ProbeOutcome(it, sawForbidden403.get()) }
+                saw416 = saw416,
+                total416 = total416,
+                primaryFailReason = primaryFailReason
+            )
+            if (fallbackWinner != null) {
+                return finalizeOutcome(fallbackWinner)
+            }
         }
-        return ProbeOutcome(
-            result = null,
-            sawForbidden403 = sawForbidden403.get(),
-            sawRangeNotSatisfiable416 = saw416.get(),
-            totalLengthFrom416 = total416.get().takeIf { it > 0L }
-        )
+        return finalizeOutcome(null)
     }
 
     private fun fetchChunkWithFailover(
@@ -2368,7 +2450,6 @@ object BtrChunkEngine {
             .header("Range", "bytes=$requestStart-${task.endByte}")
             .header("Referer", referer)
             .header("User-Agent", userAgent)
-            .header("Connection", "keep-alive")
             .build()
 
         val okClient = if (session.isAudio) BtrHttpClient.chunkAudioClient else BtrHttpClient.chunkClient
@@ -2675,7 +2756,6 @@ object BtrChunkEngine {
             .header("Range", "bytes=${task.startByte}-${task.endByte}")
             .header("Referer", referer)
             .header("User-Agent", userAgent)
-            .header("Connection", "keep-alive")
             .build()
 
         val okClient = if (session.isAudio) BtrHttpClient.audioClient else BtrHttpClient.fallbackClient
@@ -2747,13 +2827,18 @@ object BtrChunkEngine {
         return penalty > System.currentTimeMillis()
     }
 
-    private fun reportFailover(badHost: String, reason: String, sessionId: String) {
+    private fun reportFailover(
+        badHost: String,
+        reason: String,
+        sessionId: String,
+        targetHost: String = "备用镜像/CDN"
+    ) {
         val result = RewriteResult(
             changed = true,
             originalUrl = "",
             finalUrl = "",
             originalHost = badHost,
-            targetHost = "备用镜像/CDN",
+            targetHost = targetHost,
             reason = "BTR节点熔断: $reason",
             isPcdn = false,
             isMcdn = false,

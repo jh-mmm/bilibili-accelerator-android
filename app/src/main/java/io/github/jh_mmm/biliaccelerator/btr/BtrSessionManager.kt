@@ -351,6 +351,12 @@ object BtrSessionManager {
             } else {
                 validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
             }
+            // 非中继会话不主动丢弃原列表中的中继/代理备选，而是降级置于末尾作 403 兜底（绝不作为 Donor 合成普通 UPOS）
+            val relayFallbacks = if (isPrimaryRelay) {
+                emptyList()
+            } else {
+                validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
+            }
             val primaryHostLower = hostKeyOf(primaryUrl)
             val isPrimaryBstar = primaryHostLower.endsWith(".bstarstatic.com")
             val shouldSynthesize = !isPrimaryRelay && !isPrimaryBstar && (
@@ -366,9 +372,9 @@ object BtrSessionManager {
                         !ch.endsWith(".bstarstatic.com")
                 } ?: primaryUrl
                 synthesizedList = synthesizeCompatibleBackups(donor, config, isEpisode = isEpisode)
-                deduplicateUrlsByHost(isolated + synthesizedList, excludeHost = primaryHostLower)
+                deduplicateUrlsByHost(isolated + synthesizedList + relayFallbacks, excludeHost = primaryHostLower)
             } else {
-                deduplicateUrlsByHost(isolated, excludeHost = primaryHostLower)
+                deduplicateUrlsByHost(isolated + relayFallbacks, excludeHost = primaryHostLower)
             }
         }
 
@@ -724,10 +730,20 @@ object BtrSessionManager {
             } else {
                 validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
             }
-            if (isolatedBackups.isNotEmpty()) {
+            val incomingRelayFallbacks = if (!current.isLive && !isPrimaryRelay) {
+                validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
+            } else {
+                emptyList()
+            }
+            if (isolatedBackups.isNotEmpty() || incomingRelayFallbacks.isNotEmpty()) {
                 val primaryHostLower = hostKeyOf(current.primaryUrl)
                 val existingSynth = current.synthesizedMirrors.toSet()
-                val existingRealBackups = current.backupUrls.filter { it !in existingSynth }
+                val existingRealNonRelay = current.backupUrls.filter { it !in existingSynth && !BiliAcceleratorCore.isRelayUrl(it) }
+                val existingRelayFallbacks = if (!current.isLive && !isPrimaryRelay) {
+                    current.backupUrls.filter { BiliAcceleratorCore.isRelayUrl(it) }
+                } else {
+                    emptyList()
+                }
                 val shouldKeepSynthesized = !current.isLive && !isPrimaryRelay && (
                     current.config != null ||
                         (current.synthesizedMirrors.isNotEmpty() && isolatedBackups.none { !BiliAcceleratorCore.isAkamaiHost(it) })
@@ -735,12 +751,12 @@ object BtrSessionManager {
                 current.backupUrls = if (shouldKeepSynthesized) {
                     val preservedAkamai = current.backupUrls.filter { BiliAcceleratorCore.isAkamaiHost(it) }
                     deduplicateUrlsByHost(
-                        isolatedBackups + existingRealBackups + preservedAkamai + current.synthesizedMirrors,
+                        isolatedBackups + existingRealNonRelay + preservedAkamai + current.synthesizedMirrors + incomingRelayFallbacks + existingRelayFallbacks,
                         excludeHost = primaryHostLower
                     )
                 } else {
                     deduplicateUrlsByHost(
-                        isolatedBackups + existingRealBackups,
+                        isolatedBackups + existingRealNonRelay + incomingRelayFallbacks + existingRelayFallbacks,
                         excludeHost = primaryHostLower
                     )
                 }

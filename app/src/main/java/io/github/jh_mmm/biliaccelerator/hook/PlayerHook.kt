@@ -90,6 +90,7 @@ object PlayerHook {
     private val builderResolvedNonBtr = IdentityWeakMap<Boolean>()
     private val builderCleanLiveUrls = IdentityWeakMap<List<String>>()
     private val builderBtrUrl = IdentityWeakMap<String>()
+    private val builderRequestHeaders = IdentityWeakMap<MutableMap<String, String>>()
     private val suppressBackupHook = ThreadLocal.withInitial { false }
     private val livePathCleanUrls = object : LinkedHashMap<String, List<String>>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<String>>?): Boolean = size > 32
@@ -436,6 +437,50 @@ object PlayerHook {
             }
         }
 
+        // 3.5 捕获 Builder 上设置的自定义 HTTP Header / User-Agent / Referer，避免 BTR 请求丢失客户端特征头导致 403
+        val headerMapSetters = methods.filter {
+            (it.name == "setHeaders" || it.name == "setHttpHeaders" || it.name == "addHeaders") &&
+                it.parameterTypes.size == 1 && Map::class.java.isAssignableFrom(it.parameterTypes[0])
+        }
+        for (m in headerMapSetters) {
+            if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
+            try {
+                module.hook(m).intercept { chain ->
+                    val b = chain.thisObject
+                    val rawMap = chain.args.firstOrNull() as? Map<*, *>
+                    if (b != null && rawMap != null && rawMap.isNotEmpty()) {
+                        val existing = builderRequestHeaders[b] ?: LinkedHashMap<String, String>().also { builderRequestHeaders[b] = it }
+                        for ((k, v) in rawMap) {
+                            val ks = k?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+                            val vs = v?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+                            existing[ks] = vs
+                        }
+                    }
+                    chain.proceed()
+                }
+            } catch (_: Throwable) {}
+        }
+
+        val singleHeaderSetters = methods.filter {
+            (it.name == "setUserAgent" || it.name == "setReferer") &&
+                it.parameterTypes.size == 1 && it.parameterTypes[0] == String::class.java
+        }
+        for (m in singleHeaderSetters) {
+            if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
+            try {
+                val hdrKey = if (m.name == "setUserAgent") "User-Agent" else "Referer"
+                module.hook(m).intercept { chain ->
+                    val b = chain.thisObject
+                    val value = (chain.args.firstOrNull() as? String)?.trim()?.takeIf { it.isNotEmpty() }
+                    if (b != null && value != null) {
+                        val existing = builderRequestHeaders[b] ?: LinkedHashMap<String, String>().also { builderRequestHeaders[b] = it }
+                        existing[hdrKey] = value
+                    }
+                    chain.proceed()
+                }
+            } catch (_: Throwable) {}
+        }
+
         // 4. 兜底 Hook build()/create()：确保 Builder 仅有 setBackupUrls 而无 setUrl 时也能正确刷出暂缓的备用地址
         val buildMethods = methods.filter { (it.name == "build" || it.name == "create") && it.parameterTypes.isEmpty() }
         for (m in buildMethods) {
@@ -602,8 +647,15 @@ object PlayerHook {
 
         val rawBackups = builderInstance?.let { builderRawBackups[it] }.orEmpty()
         val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty().toMutableList()
+        val nowSec = System.currentTimeMillis() / 1000L
+        val origDeadlineSec = BiliAcceleratorCore.extractUrlDeadlineSeconds(originalUrl)
+        val isPlayinfoUrlsFresh = playinfoTrack != null && (
+            playinfoTrack.deadlineEpochSec <= 0L ||
+                (playinfoTrack.deadlineEpochSec > nowSec &&
+                    (origDeadlineSec <= 0L || playinfoTrack.deadlineEpochSec >= origDeadlineSec))
+            )
 
-        if (playinfoTrack != null && playinfoTrack.backupUrls.isNotEmpty()) {
+        if (isPlayinfoUrlsFresh && playinfoTrack.backupUrls.isNotEmpty()) {
             val filteredPlayinfoBackups = if (config.blockPcdn || config.proxyMcdn || config.forceUpos || (config.rewriteAkamai && config.enableBtr)) {
                 filterAndFillBackupUrls(playinfoTrack.backupUrls, config, null)
             } else {
@@ -643,11 +695,16 @@ object PlayerHook {
             effectiveResult = result
         }
 
-        // 对齐 BTR / realzza：BTR 模式下将 Akamai 重写至 UPOS 节点时，必须保留原签名 Akamai 地址作为 403 兜底备用源
-        if (!isLive && (result.reason == "akamai-redirect" || BiliAcceleratorCore.isAkamaiHost(result.originalHost))) {
-            if (originalUrl != targetUrl && !pendingBackups.contains(originalUrl)) {
-                pendingBackups.add(originalUrl)
-            }
+        // 对齐 BTR / realzza：BTR 模式下发生域名改写（Akamai/force-upos/或无干净 UPOS 时的 PCDN/MCDN/解包）时，
+        // 保留原始地址置于末尾作为 403 兜底，避免改写后的 UPOS 节点拒绝边缘签名导致无源可退
+        val shouldKeepOriginalFallback = !isLive && originalUrl != targetUrl && (
+            result.reason == "akamai-redirect" ||
+                BiliAcceleratorCore.isAkamaiHost(result.originalHost) ||
+                result.reason == "force-upos" ||
+                (result.changed && cleanOfficialBackup == null)
+            )
+        if (shouldKeepOriginalFallback && !pendingBackups.contains(originalUrl)) {
+            pendingBackups.add(originalUrl)
         }
 
         if (isLive) {
@@ -762,9 +819,10 @@ object PlayerHook {
             return null
         }
 
+        val capturedHeaders = builderInstance?.let { builderRequestHeaders[it] }
         if (isLive) {
             if (config.enableLiveAcceleration) {
-                val btrOutcome = tryRewriteToBtr(originalUrl, result, config, builderInstance)
+                val btrOutcome = tryRewriteToBtr(originalUrl, result, config, builderInstance, capturedHeaders)
                 if (btrOutcome != null) {
                     if (btrOutcome.effectiveResult.changed && shouldReportResult(btrOutcome.effectiveResult)) {
                         onRewrite?.invoke(btrOutcome.effectiveResult)
@@ -809,7 +867,7 @@ object PlayerHook {
             return null
         }
 
-        val btrOutcome = tryRewriteToBtr(originalUrl, result, config, builderInstance)
+        val btrOutcome = tryRewriteToBtr(originalUrl, result, config, builderInstance, capturedHeaders)
         if (btrOutcome != null) {
             if (btrOutcome.effectiveResult.changed && shouldReportResult(btrOutcome.effectiveResult)) {
                 onRewrite?.invoke(btrOutcome.effectiveResult)
@@ -860,14 +918,30 @@ object PlayerHook {
             BiliAcceleratorCore.isRelayUrl(originalUrl) ||
             result.reason == "akamai-redirect"
         if (!shouldPromote) return null
+        val nowSec = System.currentTimeMillis() / 1000L
+        val origDeadlineSec = BiliAcceleratorCore.extractUrlDeadlineSeconds(originalUrl)
         val playinfoEntry = PlayinfoRegistry.lookup(originalUrl)
             ?: if (result.changed) PlayinfoRegistry.lookup(result.finalUrl) else null
-        val playinfoUrls = listOfNotNull(playinfoEntry?.primaryUrl) + playinfoEntry?.backupUrls.orEmpty()
+        val isPlayinfoFresh = playinfoEntry != null && (
+            playinfoEntry.deadlineEpochSec <= 0L ||
+                (playinfoEntry.deadlineEpochSec > nowSec &&
+                    (origDeadlineSec <= 0L || playinfoEntry.deadlineEpochSec >= origDeadlineSec))
+            )
+        val playinfoUrls = if (isPlayinfoFresh) {
+            listOfNotNull(playinfoEntry?.primaryUrl) + playinfoEntry?.backupUrls.orEmpty()
+        } else {
+            emptyList()
+        }
         val candidateBackups = (rawBackups + playinfoUrls)
             .map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }
             .distinct()
         return candidateBackups.firstOrNull { backup ->
-            BiliAcceleratorCore.isCleanUposDonor(backup)
+            if (!BiliAcceleratorCore.isCleanUposDonor(backup)) return@firstOrNull false
+            val candDeadline = BiliAcceleratorCore.extractUrlDeadlineSeconds(backup)
+            // 禁止从旧缓存中提权已过期或早于当前 URL 有效期的备选地址，防止提权即 403
+            if (candDeadline > 0L && candDeadline <= nowSec) return@firstOrNull false
+            if (origDeadlineSec > 0L && candDeadline in 1 until origDeadlineSec) return@firstOrNull false
+            true
         }
     }
 

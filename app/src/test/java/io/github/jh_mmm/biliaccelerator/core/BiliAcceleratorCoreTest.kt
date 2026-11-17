@@ -62,8 +62,8 @@ class BiliAcceleratorCoreTest {
         assertTrue(BiliAcceleratorCore.isRelayUrl("http://somehost.com/v1/resource/12345.m4s"))
         assertTrue(BiliAcceleratorCore.isRelayUrl("https://edge-p2p.example.com/test.m4s?os=mcdn"))
         assertTrue(BiliAcceleratorCore.isRelayUrl("https://upos-sz-mirrorali.bilivideo.com/v1/resource/12345.m4s?os=mcdn"))
-        assertFalse(
-            "Clean UPOS /upgcxcode/ stream with leftover ?os=mcdn must not be flagged as relay",
+        assertTrue(
+            "Any URL carrying ?os=mcdn must stay flagged as relay even if host was swapped to UPOS (BTR parity)",
             BiliAcceleratorCore.isRelayUrl("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s?os=mcdn")
         )
         assertFalse(BiliAcceleratorCore.isRelayUrl("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s"))
@@ -969,5 +969,36 @@ class BiliAcceleratorCoreTest {
             PlayinfoRegistry.resetForTesting(clearDir = true)
             tempDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun testStrictUposDonorAndDisguisedOsMcdnProxyAndForceUposBackupPreservation() {
+        // 1. Only genuine upos-* (and HK cn-hk-eq-*) are valid UPOS donors; regional BCache cn-* nodes must be excluded
+        assertTrue(BiliAcceleratorCore.isCleanUposDonor("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/56.m4s?deadline=1900000000"))
+        assertTrue(BiliAcceleratorCore.isCleanUposDonor("https://cn-hk-eq-01-01.bilivideo.com/upgcxcode/12/34/56.m4s?deadline=1900000000"))
+        assertFalse(
+            "Regional edge cn-* BCache host must not be treated as cross-UPOS donor",
+            BiliAcceleratorCore.isCleanUposDonor("https://cn-gdgz-cm-01-02.bilivideo.com/upgcxcode/12/34/56.m4s?deadline=1900000000")
+        )
+        assertFalse(
+            "URL carrying ?os=mcdn must never be treated as clean UPOS donor",
+            BiliAcceleratorCore.isCleanUposDonor("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/56.m4s?os=mcdn")
+        )
+
+        // 2. Disguised non-*.mcdn.* URL carrying ?os=mcdn routes through proxy-tf-all-ws when proxyMcdn=true (proxy-all)
+        val disguisedOsMcdn = "https://112.34.56.78:8080/upgcxcode/12/34/56.m4s?os=mcdn&deadline=1900000000"
+        val proxiedRes = BiliAcceleratorCore.rewriteUrl(disguisedOsMcdn, defaultConfig.copy(proxyMcdn = true, mcdnStrategy = "proxy-all"))
+        assertTrue(proxiedRes.changed)
+        assertEquals("mcdn-proxy", proxiedRes.reason)
+        assertTrue(proxiedRes.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
+
+        // 3. forceUpos in filterAndFillBackupUrls must preserve original independently-signed backup URLs alongside targetHost
+        val origHw = "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/12/34/56.m4s?sign=hw_only"
+        val origAli = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/56.m4s?sign=ali_only"
+        val forceCfg = defaultConfig.copy(forceUpos = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
+        val filled = BiliAcceleratorCore.filterAndFillBackupUrls(listOf(origHw, origAli), forceCfg)
+        assertTrue("Rewritten targetHost mirror must be included", filled.any { it.contains("upos-sz-mirrorcos.bilivideo.com") })
+        assertTrue("Original mirrorhw signature must stay preserved as fallback", filled.contains(origHw))
+        assertTrue("Original mirrorali signature must stay preserved as fallback", filled.contains(origAli))
     }
 }

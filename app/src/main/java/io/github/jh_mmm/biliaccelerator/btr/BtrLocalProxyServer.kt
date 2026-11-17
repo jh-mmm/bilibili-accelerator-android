@@ -211,7 +211,14 @@ object BtrLocalProxyServer {
                     }
                     val reqReferer = headers["referer"]
                         ?.trim()
-                        ?.takeIf { it.isNotBlank() && it.contains("bilibili.com", ignoreCase = true) }
+                        ?.takeIf { ref ->
+                            ref.isNotBlank() && (
+                                ref.contains("bilibili.com", ignoreCase = true) ||
+                                    ref.contains("biliintl.com", ignoreCase = true) ||
+                                    ref.contains("bilibili.tv", ignoreCase = true) ||
+                                    ref.contains("bstarstatic.com", ignoreCase = true)
+                                )
+                        }
                         ?: session.referer
 
                     val keepConnectionAlive = if (session.isLive) {
