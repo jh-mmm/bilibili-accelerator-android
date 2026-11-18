@@ -13,7 +13,7 @@ import io.github.jh_mmm.biliaccelerator.R
 
 enum class TopLevelDestination(
     val title: String,
-    @StringRes val titleRes: Int,
+    @param:StringRes val titleRes: Int,
     val unselectedIcon: ImageVector,
     val selectedIcon: ImageVector
 ) {

@@ -17,13 +17,16 @@ class UiPreferencesStore(context: Context) {
     private fun loadPreferences(): UiPreferences {
         val themeModeStr = prefs.getString(KEY_THEME_MODE, UiThemeMode.SYSTEM.name)
         val styleStr = prefs.getString(KEY_STYLE, UiStyle.MIUIX.name)
+        val bottomBarStyleStr = prefs.getString(KEY_BOTTOM_BAR_STYLE, BottomBarStyle.FOLLOW_STYLE.name)
 
         val themeMode = runCatching { UiThemeMode.valueOf(themeModeStr ?: "") }
             .getOrDefault(UiThemeMode.SYSTEM)
         val style = runCatching { UiStyle.valueOf(styleStr ?: "") }
             .getOrDefault(UiStyle.MIUIX)
+        val bottomBarStyle = runCatching { BottomBarStyle.valueOf(bottomBarStyleStr ?: "") }
+            .getOrDefault(BottomBarStyle.FOLLOW_STYLE)
 
-        return UiPreferences(themeMode = themeMode, style = style)
+        return UiPreferences(themeMode = themeMode, style = style, bottomBarStyle = bottomBarStyle)
     }
 
     fun updateThemeMode(mode: UiThemeMode) {
@@ -38,9 +41,16 @@ class UiPreferencesStore(context: Context) {
         _preferences.value = updated
     }
 
+    fun updateBottomBarStyle(bottomBarStyle: BottomBarStyle) {
+        val updated = _preferences.value.copy(bottomBarStyle = bottomBarStyle)
+        prefs.edit().putString(KEY_BOTTOM_BAR_STYLE, bottomBarStyle.name).apply()
+        _preferences.value = updated
+    }
+
     companion object {
         private const val PREFS_NAME = "bili_accelerator_ui_prefs"
         private const val KEY_THEME_MODE = "ui_theme_mode"
         private const val KEY_STYLE = "ui_style"
+        private const val KEY_BOTTOM_BAR_STYLE = "ui_bottom_bar_style"
     }
 }

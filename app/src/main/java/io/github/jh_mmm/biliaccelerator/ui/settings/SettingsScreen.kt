@@ -2,6 +2,7 @@ package io.github.jh_mmm.biliaccelerator.ui.settings
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -60,10 +61,14 @@ import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceGroupCard
 import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceGroupTitle
 import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceSliderItem
 import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceSwitchItem
+import io.github.jh_mmm.biliaccelerator.ui.theme.BottomBarStyle
+import io.github.jh_mmm.biliaccelerator.ui.theme.LocalUiStyle
 import io.github.jh_mmm.biliaccelerator.ui.theme.TagPcdn
 import io.github.jh_mmm.biliaccelerator.ui.theme.UiPreferences
 import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
 import io.github.jh_mmm.biliaccelerator.ui.theme.UiThemeMode
+import io.github.jh_mmm.biliaccelerator.ui.theme.dialogCornerRadius
+import io.github.jh_mmm.biliaccelerator.ui.theme.resolveUseFloatingBottomBar
 import kotlin.math.roundToInt
 
 enum class SettingsSubPage {
@@ -92,6 +97,7 @@ fun SettingsScreen(
     var showCustomCdnDialog by rememberSaveable { mutableStateOf(false) }
     var showMcdnStrategyDialog by rememberSaveable { mutableStateOf(false) }
     var showStyleDialog by rememberSaveable { mutableStateOf(false) }
+    var showBottomBarStyleDialog by rememberSaveable { mutableStateOf(false) }
     var showThemeModeDialog by rememberSaveable { mutableStateOf(false) }
     var showConfirmClearDialog by rememberSaveable { mutableStateOf(false) }
 
@@ -164,6 +170,21 @@ fun SettingsScreen(
         )
     }
 
+    // Dialog 2.5: Select Bottom Bar Style
+    if (showBottomBarStyleDialog) {
+        val bottomBarStyles = BottomBarStyle.values()
+        SingleChoiceDialog(
+            title = stringResource(R.string.label_bottom_bar_style),
+            items = bottomBarStyles.map { it.label },
+            selectedIndex = bottomBarStyles.indexOf(uiPreferences.bottomBarStyle),
+            onSelect = { index ->
+                onUiPreferencesChange(uiPreferences.copy(bottomBarStyle = bottomBarStyles[index]))
+                showBottomBarStyleDialog = false
+            },
+            onDismiss = { showBottomBarStyleDialog = false }
+        )
+    }
+
     // Dialog 3: Select Theme Mode
     if (showThemeModeDialog) {
         val modes = UiThemeMode.values()
@@ -198,12 +219,17 @@ fun SettingsScreen(
                     Text(stringResource(R.string.dialog_cancel))
                 }
             },
-            shape = RoundedCornerShape(20.dp)
+            shape = RoundedCornerShape(LocalUiStyle.current.dialogCornerRadius())
         )
     }
 
     Crossfade(
         targetState = currentSubPage,
+        animationSpec = if (LocalUiStyle.current == UiStyle.MATERIAL3_EXPRESSIVE) {
+            MaterialTheme.motionScheme.defaultEffectsSpec()
+        } else {
+            tween()
+        },
         label = "settings_subpage_crossfade"
     ) { subPage ->
         when (subPage) {
@@ -292,11 +318,11 @@ fun SettingsScreen(
                                     "proxy-tf-all-hw.bilivideo.com" -> "华为云"
                                     else -> config.proxyHost.substringBefore('.').removePrefix("proxy-")
                                 }
-                                val currentMcdnStrategyLabel = when (config.mcdnStrategy.lowercase()) {
+                                val normalizedStrategy = BiliAcceleratorCore.normalizeMcdnStrategy(config.mcdnStrategy)
+                                val currentMcdnStrategyLabel = when (normalizedStrategy) {
                                     "proxy-all" -> "中继全部"
                                     "proxy-v1" -> "仅中继资源"
-                                    "replace" -> "替换为UPOS"
-                                    else -> config.mcdnStrategy
+                                    else -> normalizedStrategy
                                 }
                                 val mcdnSummary = if (!config.proxyMcdn) {
                                     "已停用 MCDN 中继代理 (点击进入策略配置)"
@@ -400,6 +426,17 @@ fun SettingsScreen(
                             PreferenceGroupTitle(stringResource(R.string.group_ui_appearance))
                         }
                         item(key = "card-ui") {
+                            val bottomBarSelectedLabel = when (uiPreferences.bottomBarStyle) {
+                                BottomBarStyle.FOLLOW_STYLE -> {
+                                    val resolved = if (resolveUseFloatingBottomBar(uiPreferences.style, uiPreferences.bottomBarStyle)) {
+                                        "悬浮"
+                                    } else {
+                                        "固定"
+                                    }
+                                    "跟随 ($resolved)"
+                                }
+                                BottomBarStyle.FLOATING, BottomBarStyle.DOCKED -> uiPreferences.bottomBarStyle.label
+                            }
                             PreferenceGroupCard {
                                 PreferenceDropdownItem(
                                     title = stringResource(R.string.label_ui_style),
@@ -407,6 +444,15 @@ fun SettingsScreen(
                                     selectedValue = uiPreferences.style.label,
                                     icon = Icons.Outlined.Palette,
                                     onClick = { showStyleDialog = true }
+                                )
+
+                                PreferenceDivider()
+
+                                PreferenceDropdownItem(
+                                    title = stringResource(R.string.label_bottom_bar_style),
+                                    summary = stringResource(R.string.summary_bottom_bar_style),
+                                    selectedValue = bottomBarSelectedLabel,
+                                    onClick = { showBottomBarStyleDialog = true }
                                 )
 
                                 PreferenceDivider()
@@ -481,11 +527,11 @@ fun SettingsScreen(
 
                                 PreferenceDivider()
 
-                                val currentMcdnStrategyLabel = when (config.mcdnStrategy.lowercase()) {
+                                val normalizedStrategy = BiliAcceleratorCore.normalizeMcdnStrategy(config.mcdnStrategy)
+                                val currentMcdnStrategyLabel = when (normalizedStrategy) {
                                     "proxy-all" -> "中继全部 (proxy-all)"
                                     "proxy-v1" -> "仅中继资源 (/v1/resource/)"
-                                    "replace" -> "直接替换为 UPOS (replace)"
-                                    else -> config.mcdnStrategy
+                                    else -> normalizedStrategy
                                 }
 
                                 PreferenceDropdownItem(
@@ -768,7 +814,7 @@ private fun SingleChoiceDialog(
                 Text("关闭")
             }
         },
-        shape = RoundedCornerShape(20.dp)
+        shape = RoundedCornerShape(LocalUiStyle.current.dialogCornerRadius())
     )
 }
 
@@ -846,7 +892,7 @@ private fun CustomCdnPoolDialog(
                 }
             }
         },
-        shape = RoundedCornerShape(20.dp)
+        shape = RoundedCornerShape(LocalUiStyle.current.dialogCornerRadius())
     )
 }
 
@@ -975,7 +1021,7 @@ private fun ProxyHostDialog(
                 Text("取消")
             }
         },
-        shape = RoundedCornerShape(20.dp)
+        shape = RoundedCornerShape(LocalUiStyle.current.dialogCornerRadius())
     )
 }
 
@@ -985,10 +1031,10 @@ private fun McdnStrategyDialog(
     onSelect: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
+    val normalizedStrategy = BiliAcceleratorCore.normalizeMcdnStrategy(currentStrategy)
     val strategies = listOf(
         "proxy-all" to ("中继代理全部 (默认推荐)" to "通过云厂商官方 CDN 中继所有 MCDN 节点"),
-        "proxy-v1" to ("仅中继资源接口 (/v1/resource/)" to "仅对资源接口走中继代理，常规视频流直接转为主 UPOS 镜像"),
-        "replace" to ("直接替换为 UPOS 镜像" to "不经中继代理，全量重定向至首选 UPOS 镜像")
+        "proxy-v1" to ("仅中继资源接口 (/v1/resource/)" to "仅对资源接口走官方中继代理，其余中继节点原样直连避免 403")
     )
 
     AlertDialog(
@@ -1002,7 +1048,7 @@ private fun McdnStrategyDialog(
             ) {
                 strategies.forEach { (key, info) ->
                     val (label, desc) = info
-                    val isSelected = key.equals(currentStrategy, ignoreCase = true)
+                    val isSelected = key.equals(normalizedStrategy, ignoreCase = true)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1034,6 +1080,6 @@ private fun McdnStrategyDialog(
                 Text("关闭")
             }
         },
-        shape = RoundedCornerShape(20.dp)
+        shape = RoundedCornerShape(LocalUiStyle.current.dialogCornerRadius())
     )
 }

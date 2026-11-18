@@ -62,7 +62,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.util.lerp
 import io.github.jh_mmm.biliaccelerator.ui.theme.LocalUiStyle
-import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
+import io.github.jh_mmm.biliaccelerator.ui.theme.groupCornerRadius
 import io.github.jh_mmm.biliaccelerator.ui.theme.isAcceleratorDarkTheme
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -87,7 +87,7 @@ fun PreferenceGroupCard(
     content: @Composable ColumnScope.() -> Unit
 ) {
     val uiStyle = LocalUiStyle.current
-    val cornerRadius = if (uiStyle == UiStyle.MIUIX) 18.dp else 12.dp
+    val cornerRadius = uiStyle.groupCornerRadius()
 
     Card(
         modifier = modifier.fillMaxWidth(),

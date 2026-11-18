@@ -37,16 +37,20 @@ fun AcceleratorPage(
                 title = {
                     Text(
                         text = title,
-                        fontWeight = if (uiStyle == UiStyle.MIUIX) FontWeight.Bold else FontWeight.SemiBold,
+                        fontWeight = if (uiStyle == UiStyle.MATERIAL3) FontWeight.SemiBold else FontWeight.Bold,
                         letterSpacing = if (uiStyle == UiStyle.MIUIX) 0.5.sp else 0.sp
                     )
                 },
                 navigationIcon = navigationIcon,
                 actions = actions,
                 scrollBehavior = scrollBehavior,
-                colors = TopAppBarDefaults.largeTopAppBarColors(
+                colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.background,
-                    scrolledContainerColor = MaterialTheme.colorScheme.surface
+                    scrolledContainerColor = if (uiStyle == UiStyle.MATERIAL3_EXPRESSIVE) {
+                        MaterialTheme.colorScheme.surfaceContainerLow
+                    } else {
+                        MaterialTheme.colorScheme.surface
+                    }
                 )
             )
         }

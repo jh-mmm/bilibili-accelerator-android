@@ -19,7 +19,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.jh_mmm.biliaccelerator.ui.theme.LocalUiStyle
-import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
+import io.github.jh_mmm.biliaccelerator.ui.theme.cardCornerRadius
 
 @Composable
 fun StatCard(
@@ -29,7 +29,7 @@ fun StatCard(
     modifier: Modifier = Modifier
 ) {
     val uiStyle = LocalUiStyle.current
-    val cornerRadius = if (uiStyle == UiStyle.MIUIX) 16.dp else 12.dp
+    val cornerRadius = uiStyle.cardCornerRadius()
 
     Card(
         modifier = modifier.fillMaxWidth(),

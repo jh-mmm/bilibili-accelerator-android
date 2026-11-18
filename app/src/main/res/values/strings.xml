@@ -28,7 +28,9 @@
     <string name="group_data_diag">数据与诊断</string>
     <string name="group_ui_appearance">界面与外观</string>
     <string name="label_ui_style">界面渲染风格</string>
-    <string name="summary_ui_style">支持 MIUIX 与 Material 3 实时切换</string>
+    <string name="summary_ui_style">支持 MIUIX、Material 3 与 Material 3 Expressive 实时切换</string>
+    <string name="label_bottom_bar_style">底栏显示样式</string>
+    <string name="summary_bottom_bar_style">支持悬浮底栏、固定底栏或跟随界面风格自动切换</string>
     <string name="label_theme_mode">主题外观模式</string>
     <string name="summary_theme_mode">选择浅色、深色或随系统自动切换</string>
     <string name="title_recent_logs">最近拦截与重定向</string>

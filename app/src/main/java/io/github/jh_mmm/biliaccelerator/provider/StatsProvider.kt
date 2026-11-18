@@ -158,7 +158,7 @@ class StatsProvider : ContentProvider() {
                 proxyHost = sp.getString(KEY_PROXY_HOST, "proxy-tf-all-ws.bilivideo.com") ?: "proxy-tf-all-ws.bilivideo.com",
                 blockPcdn = sp.getBoolean(KEY_BLOCK_PCDN, true),
                 proxyMcdn = sp.getBoolean(KEY_PROXY_MCDN, true),
-                mcdnStrategy = sp.getString(KEY_MCDN_STRATEGY, "proxy-all") ?: "proxy-all",
+                mcdnStrategy = BiliAcceleratorCore.normalizeMcdnStrategy(sp.getString(KEY_MCDN_STRATEGY, "proxy-all")),
                 forceUpos = sp.getBoolean(KEY_FORCE_UPOS, false),
                 rewriteAkamai = sp.getBoolean(KEY_REWRITE_AKAMAI, false),
                 portHeuristic = sp.getBoolean(KEY_PORT_HEURISTIC, true),

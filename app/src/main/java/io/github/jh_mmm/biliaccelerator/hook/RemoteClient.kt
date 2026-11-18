@@ -101,7 +101,7 @@ object RemoteClient {
             val json = prefs.getString(XposedServiceProvider.KEY_REMOTE_CONFIG_JSON, null)
             if (!json.isNullOrBlank()) {
                 val cfg = gson.fromJson(json, AcceleratorConfig::class.java) ?: return
-                cachedConfig = cfg
+                cachedConfig = cfg.copy(mcdnStrategy = BiliAcceleratorCore.normalizeMcdnStrategy(cfg.mcdnStrategy))
                 lastConfigFetchTime.set(System.currentTimeMillis())
                 appContext?.let { saveConfigToLocalCache(it, cfg) }
                 syncBtrProxyState(cfg)
@@ -244,7 +244,7 @@ object RemoteClient {
 
                     val json = intent.getStringExtra(StatsProvider.EXTRA_CONFIG_JSON) ?: return
                     val newConfig = runCatching { gson.fromJson(json, AcceleratorConfig::class.java) }.getOrNull() ?: return
-                    cachedConfig = newConfig
+                    cachedConfig = newConfig.copy(mcdnStrategy = BiliAcceleratorCore.normalizeMcdnStrategy(newConfig.mcdnStrategy))
                     lastConfigFetchTime.set(System.currentTimeMillis())
                     saveConfigToLocalCache(context, newConfig)
                     syncBtrProxyState(newConfig)

@@ -38,6 +38,7 @@ class StatsReceiver : BroadcastReceiver() {
             "pcdn-host",
             "mcdn-host",
             "mcdn-v1-pass",
+            "mcdn-relay-pass",
             "force-upos",
             "ok",
             "already-proxied",

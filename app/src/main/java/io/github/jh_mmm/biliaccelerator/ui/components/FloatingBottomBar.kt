@@ -2,13 +2,14 @@ package io.github.jh_mmm.biliaccelerator.ui.components
 
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -30,15 +31,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.jh_mmm.biliaccelerator.ui.navigation.TopLevelDestination
+import io.github.jh_mmm.biliaccelerator.ui.theme.LocalBottomBarStyle
 import io.github.jh_mmm.biliaccelerator.ui.theme.LocalUiStyle
 import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
+import io.github.jh_mmm.biliaccelerator.ui.theme.resolveUseFloatingBottomBar
 
 @Composable
 fun AcceleratorBottomBar(
@@ -48,9 +51,18 @@ fun AcceleratorBottomBar(
     modifier: Modifier = Modifier
 ) {
     val uiStyle = LocalUiStyle.current
+    val bottomBarStyle = LocalBottomBarStyle.current
+    val useFloating = resolveUseFloatingBottomBar(uiStyle, bottomBarStyle)
 
-    when (uiStyle) {
-        UiStyle.MIUIX -> {
+    if (useFloating) {
+        if (uiStyle == UiStyle.MATERIAL3_EXPRESSIVE) {
+            ExpressiveFloatingBottomBar(
+                destinations = destinations,
+                currentDestination = currentDestination,
+                onNavigateToDestination = onNavigateToDestination,
+                modifier = modifier
+            )
+        } else {
             MiuixFloatingBottomBar(
                 destinations = destinations,
                 currentDestination = currentDestination,
@@ -58,13 +70,112 @@ fun AcceleratorBottomBar(
                 modifier = modifier
             )
         }
-        UiStyle.MATERIAL3 -> {
-            Material3BottomBar(
-                destinations = destinations,
-                currentDestination = currentDestination,
-                onNavigateToDestination = onNavigateToDestination,
-                modifier = modifier
-            )
+    } else {
+        Material3BottomBar(
+            destinations = destinations,
+            currentDestination = currentDestination,
+            onNavigateToDestination = onNavigateToDestination,
+            isExpressive = uiStyle == UiStyle.MATERIAL3_EXPRESSIVE,
+            modifier = modifier
+        )
+    }
+}
+
+@Composable
+private fun ExpressiveFloatingBottomBar(
+    destinations: List<TopLevelDestination>,
+    currentDestination: TopLevelDestination,
+    onNavigateToDestination: (TopLevelDestination) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val motionScheme = MaterialTheme.motionScheme
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .padding(horizontal = 20.dp, vertical = 12.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            tonalElevation = 6.dp,
+            shadowElevation = 10.dp,
+            border = BorderStroke(
+                width = 1.dp,
+                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+            ),
+            modifier = Modifier.height(66.dp)
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                destinations.forEach { dest ->
+                    val selected = dest == currentDestination
+                    val pillColor by animateColorAsState(
+                        targetValue = if (selected) {
+                            MaterialTheme.colorScheme.secondaryContainer
+                        } else {
+                            Color.Transparent
+                        },
+                        animationSpec = motionScheme.fastEffectsSpec(),
+                        label = "expressive_pill_bg"
+                    )
+                    val contentColor by animateColorAsState(
+                        targetValue = if (selected) {
+                            MaterialTheme.colorScheme.onSecondaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        animationSpec = motionScheme.fastEffectsSpec(),
+                        label = "expressive_content_color"
+                    )
+                    val iconScale by animateFloatAsState(
+                        targetValue = if (selected) 1.08f else 0.96f,
+                        animationSpec = motionScheme.fastSpatialSpec(),
+                        label = "expressive_icon_scale"
+                    )
+                    val title = stringResource(dest.titleRes)
+
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(pillColor)
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                                onClick = { onNavigateToDestination(dest) }
+                            )
+                            .padding(horizontal = 18.dp, vertical = 10.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (selected) dest.selectedIcon else dest.unselectedIcon,
+                                contentDescription = title,
+                                tint = contentColor,
+                                modifier = Modifier
+                                    .size(22.dp)
+                                    .graphicsLayer {
+                                        scaleX = iconScale
+                                        scaleY = iconScale
+                                    }
+                            )
+                            Text(
+                                text = title,
+                                color = contentColor,
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -158,29 +269,57 @@ private fun Material3BottomBar(
     destinations: List<TopLevelDestination>,
     currentDestination: TopLevelDestination,
     onNavigateToDestination: (TopLevelDestination) -> Unit,
+    isExpressive: Boolean = false,
     modifier: Modifier = Modifier
 ) {
+    val motionScheme = MaterialTheme.motionScheme
     NavigationBar(
         modifier = modifier,
-        containerColor = MaterialTheme.colorScheme.surface,
-        tonalElevation = 3.dp
+        containerColor = if (isExpressive) {
+            MaterialTheme.colorScheme.surfaceContainer
+        } else {
+            MaterialTheme.colorScheme.surface
+        },
+        tonalElevation = if (isExpressive) 4.dp else 3.dp
     ) {
         destinations.forEach { dest ->
             val selected = dest == currentDestination
             val title = stringResource(dest.titleRes)
+            val iconScale by animateFloatAsState(
+                targetValue = if (isExpressive && selected) 1.08f else 1f,
+                animationSpec = motionScheme.fastSpatialSpec(),
+                label = "docked_icon_scale"
+            )
             NavigationBarItem(
                 selected = selected,
                 onClick = { onNavigateToDestination(dest) },
                 icon = {
                     Icon(
                         imageVector = if (selected) dest.selectedIcon else dest.unselectedIcon,
-                        contentDescription = title
+                        contentDescription = title,
+                        modifier = Modifier.graphicsLayer {
+                            scaleX = iconScale
+                            scaleY = iconScale
+                        }
                     )
                 },
-                label = { Text(title) },
+                label = {
+                    Text(
+                        text = title,
+                        fontWeight = if (isExpressive && selected) FontWeight.Bold else FontWeight.Medium
+                    )
+                },
                 colors = NavigationBarItemDefaults.colors(
-                    indicatorColor = MaterialTheme.colorScheme.primaryContainer,
-                    selectedIconColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    indicatorColor = if (isExpressive) {
+                        MaterialTheme.colorScheme.secondaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.primaryContainer
+                    },
+                    selectedIconColor = if (isExpressive) {
+                        MaterialTheme.colorScheme.onSecondaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    },
                     unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             )

@@ -380,24 +380,28 @@ class BiliAcceleratorCoreTest {
         assertTrue(resProxyV1.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
         assertEquals("mcdn-proxy", resProxyV1.reason)
 
-        // 3. replace 策略（直接替换为目标 UPOS 镜像）
+        // 3. 历史遗留 replace 策略不再直接将中继 URL 替换为 UPOS（避免 403），改为走官方中继代理
         val resReplace = BiliAcceleratorCore.rewriteUrl(mcdnUrl, defaultConfig.copy(mcdnStrategy = "replace", targetHost = "upos-sz-mirrorcos.bilivideo.com"))
         assertTrue(resReplace.changed)
-        assertEquals("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s?os=mcdn", resReplace.finalUrl)
-        assertEquals("mcdn-host", resReplace.reason)
+        assertTrue(resReplace.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
+        assertEquals("mcdn-proxy", resReplace.reason)
 
-        // 4. proxyMcdn = false 时：/v1/resource/ 安全放行 (mcdn-v1-pass)，标准 /upgcxcode/ 在 blockPcdn=true 时改写为 UPOS，blockPcdn=false 时放行
+        // 4. proxyMcdn = false 时：/v1/resource/ (mcdn-v1-pass) 与常规中继流 (mcdn-relay-pass) 均原样直连，绝不跨节点替换至 upos-*
         val resV1Disabled = BiliAcceleratorCore.rewriteUrl(mcdnV1Url, defaultConfig.copy(proxyMcdn = false, blockPcdn = true))
         assertFalse(resV1Disabled.changed)
         assertEquals("mcdn-v1-pass", resV1Disabled.reason)
 
         val resDisabledBlockPcdn = BiliAcceleratorCore.rewriteUrl(mcdnUrl, defaultConfig.copy(proxyMcdn = false, blockPcdn = true))
-        assertTrue(resDisabledBlockPcdn.changed)
-        assertEquals("mcdn-host", resDisabledBlockPcdn.reason)
+        assertFalse(resDisabledBlockPcdn.changed)
+        assertEquals("mcdn-relay-pass", resDisabledBlockPcdn.reason)
+
+        val resDisabledForceUpos = BiliAcceleratorCore.rewriteUrl(mcdnUrl, defaultConfig.copy(proxyMcdn = false, blockPcdn = false, forceUpos = true))
+        assertFalse(resDisabledForceUpos.changed)
+        assertEquals("mcdn-relay-pass", resDisabledForceUpos.reason)
 
         val resDisabledPass = BiliAcceleratorCore.rewriteUrl(mcdnUrl, defaultConfig.copy(proxyMcdn = false, blockPcdn = false, forceUpos = false))
         assertFalse(resDisabledPass.changed)
-        assertEquals("ok", resDisabledPass.reason)
+        assertEquals("mcdn-relay-pass", resDisabledPass.reason)
     }
 
     @Test
@@ -469,22 +473,28 @@ class BiliAcceleratorCoreTest {
         val disguisedUrl = "https://edge-p2p-cache.example.com/upgcxcode/54/12/34567.m4s?os=mcdn"
         val explicitMcdnUrl = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/34567.m4s?os=mcdn"
 
-        // 关闭 proxyMcdn 但开启 blockPcdn 时，非 *.mcdn.* 域名的伪装 os=mcdn 节点必须被识别为 PCDN 并拦截改写
-        val cfg = defaultConfig.copy(proxyMcdn = false, blockPcdn = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
+        // proxyMcdn=true 时，无论伪装还是显式 ?os=mcdn 均走官方 proxy-tf-all-* 中继代理
+        val proxyCfg = defaultConfig.copy(proxyMcdn = true, mcdnStrategy = "proxy-all")
+        val resDisguisedProxy = BiliAcceleratorCore.rewriteUrl(disguisedUrl, proxyCfg)
+        assertTrue("Disguised os=mcdn should proxy via proxy-tf-all when proxyMcdn=true", resDisguisedProxy.changed)
+        assertEquals("mcdn-proxy", resDisguisedProxy.reason)
+        assertTrue(resDisguisedProxy.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
+
+        // proxyMcdn=false 时，对齐 BTR #47：禁止将任何 ?os=mcdn / *.mcdn.* 中继签名跨节点替换到 upos-*（避免 100% 403）
+        val cfg = defaultConfig.copy(proxyMcdn = false, blockPcdn = true, forceUpos = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
         val resDisguised = BiliAcceleratorCore.rewriteUrl(disguisedUrl, cfg)
-        assertTrue("Disguised os=mcdn URL should be rewritten when blockPcdn=true", resDisguised.changed)
-        assertTrue("Disguised os=mcdn should be flagged as PCDN", resDisguised.isPcdn)
-        assertEquals("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s?os=mcdn", resDisguised.finalUrl)
+        assertFalse("Disguised os=mcdn URL must NOT be rewritten to upos-* when proxyMcdn=false", resDisguised.changed)
+        assertEquals("mcdn-relay-pass", resDisguised.reason)
+        assertEquals(disguisedUrl, resDisguised.finalUrl)
 
-        // 原生 *.mcdn.bilivideo.cn 在 /upgcxcode/ 路径下受 blockPcdn/forceUpos 控制转为 UPOS
         val resExplicit = BiliAcceleratorCore.rewriteUrl(explicitMcdnUrl, cfg)
-        assertTrue("Explicit *.mcdn.* /upgcxcode/ should fall back to UPOS when proxyMcdn=false and blockPcdn=true", resExplicit.changed)
-        assertEquals("mcdn-host", resExplicit.reason)
+        assertFalse("Explicit *.mcdn.* must NOT be rewritten to upos-* when proxyMcdn=false", resExplicit.changed)
+        assertEquals("mcdn-relay-pass", resExplicit.reason)
+        assertEquals(explicitMcdnUrl, resExplicit.finalUrl)
 
-        // 当同时关闭 blockPcdn 时，伪装 os=mcdn 与显式 MCDN 均允许透传
+        // 当同时关闭 blockPcdn 时，依然保持透传
         val noBlockCfg = defaultConfig.copy(proxyMcdn = false, blockPcdn = false, forceUpos = false)
-        val resPass = BiliAcceleratorCore.rewriteUrl(disguisedUrl, noBlockCfg)
-        assertFalse("Disguised os=mcdn should pass when blockPcdn=false", resPass.changed)
+        assertFalse("Disguised os=mcdn should pass when blockPcdn=false", BiliAcceleratorCore.rewriteUrl(disguisedUrl, noBlockCfg).changed)
         assertFalse("Explicit *.mcdn.* should pass when proxyMcdn=false and blockPcdn=false", BiliAcceleratorCore.rewriteUrl(explicitMcdnUrl, noBlockCfg).changed)
     }
 
@@ -1000,5 +1010,32 @@ class BiliAcceleratorCoreTest {
         assertTrue("Rewritten targetHost mirror must be included", filled.any { it.contains("upos-sz-mirrorcos.bilivideo.com") })
         assertTrue("Original mirrorhw signature must stay preserved as fallback", filled.contains(origHw))
         assertTrue("Original mirrorali signature must stay preserved as fallback", filled.contains(origAli))
+    }
+
+    @Test
+    fun testCosO1InDefaultPoolAndMcdnStrategyNormalization() {
+        assertEquals("proxy-all", BiliAcceleratorCore.normalizeMcdnStrategy("replace"))
+        assertEquals("proxy-all", BiliAcceleratorCore.normalizeMcdnStrategy(null))
+        assertEquals("proxy-all", BiliAcceleratorCore.normalizeMcdnStrategy("invalid-value"))
+        assertEquals("proxy-v1", BiliAcceleratorCore.normalizeMcdnStrategy("PROXY-V1"))
+
+        val defaultSize = AcceleratorConfig().btrCdnPoolSize
+        assertTrue(
+            "upos-sz-mirrorcoso1.bilivideo.com must be in top $defaultSize of INTERLEAVED_CANDIDATE_POOL",
+            BiliAcceleratorCore.INTERLEAVED_CANDIDATE_POOL.take(defaultSize).contains("upos-sz-mirrorcoso1.bilivideo.com")
+        )
+        assertTrue(
+            "upos-sz-mirrorcoso1.bilivideo.com must be in MAINLAND_CANDIDATE_POOL",
+            BiliAcceleratorCore.MAINLAND_CANDIDATE_POOL.contains("upos-sz-mirrorcoso1.bilivideo.com")
+        )
+
+        val relayUrl = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/12/34/56.m4s?os=mcdn"
+        val cleanUpos = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/56.m4s?deadline=1900000000"
+        val backups = BiliAcceleratorCore.filterAndFillBackupUrls(
+            listOf(relayUrl, cleanUpos),
+            defaultConfig.copy(proxyMcdn = false, blockPcdn = true)
+        )
+        assertTrue("Clean UPOS backup must appear before relay fallback", backups.indexOf(cleanUpos) < backups.indexOf(relayUrl))
+        assertTrue("Original relay backup must remain intact instead of UPOS host swap", backups.contains(relayUrl))
     }
 }

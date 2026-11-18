@@ -971,7 +971,7 @@ class PlayerHookBackupTest {
             BtrSessionManager.remove(sid2)
         }
 
-        // 3. Disguised os=mcdn rewritten with mcdnStrategy=replace must NOT synthesize UPOS mirrors and must preserve originalUrl
+        // 3. Disguised os=mcdn with proxyMcdn=false MUST NOT be swapped to upos-* (BTR #47) and must not synthesize UPOS mirrors
         val osMcdnUrl = "https://edge-p2p.example.com/upgcxcode/54/12/99102.m4s?os=mcdn&deadline=${nowSec + 3600}"
         val builder3 = FakeSegmentBuilder()
         val args3 = PlayerHook.rewriteArgIfMedia(
@@ -984,10 +984,35 @@ class PlayerHookBackupTest {
         val sid3 = BtrSessionManager.getSessionForBuilder(builder3)!!
         try {
             val session3 = BtrSessionManager.get(sid3)!!
+            assertEquals("os=mcdn URL must keep original primary URL without UPOS swap", osMcdnUrl, session3.primaryUrl)
             assertTrue("os=mcdn URL must not synthesize extra UPOS mirrors", session3.synthesizedMirrors.isEmpty())
-            assertTrue("Original os=mcdn URL must be kept as 403 fallback", session3.backupUrls.contains(osMcdnUrl))
         } finally {
             BtrSessionManager.remove(sid3)
         }
+
+        // 4. Non-BTR relay URL with official UPOS backup promotes clean official UPOS backup instead of returning unchanged relay
+        val relayBuilder = FakeSegmentBuilder()
+        val nonBtrConfig = btrCfg.copy(enableBtr = false, proxyMcdn = false, blockPcdn = true)
+        val cleanOfficial = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/99103.m4s?deadline=${nowSec + 3600}"
+        val setBackupMethod = FakeSegmentBuilder::class.java.getMethod("setBackupUrls", List::class.java)
+        PlayerHook.interceptSetBackupUrls(
+            builder = relayBuilder,
+            method = setBackupMethod,
+            rawArg = listOf(cleanOfficial),
+            config = nonBtrConfig,
+            onRewrite = null,
+            proceedOriginal = { relayBuilder.setBackupUrls(listOf(cleanOfficial)) },
+            proceedWithArg = { arg ->
+                @Suppress("UNCHECKED_CAST")
+                relayBuilder.setBackupUrls(arg as List<String>)
+            }
+        )
+        val nonBtrArgs = PlayerHook.rewriteArgIfMedia(
+            listOf("https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/99103.m4s?os=mcdn"),
+            relayBuilder,
+            nonBtrConfig,
+            onRewrite = null
+        )
+        assertEquals(cleanOfficial, nonBtrArgs?.get(0))
     }
 }

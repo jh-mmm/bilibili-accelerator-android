@@ -351,7 +351,18 @@ object BtrSessionManager {
             } else {
                 validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
             }
-            // 非中继会话不主动丢弃原列表中的中继/代理备选，而是降级置于末尾作 403 兜底（绝不作为 Donor 合成普通 UPOS）
+            val cleanIsolated = if (isPrimaryRelay) {
+                isolated
+            } else {
+                isolated.filter { !isFallbackOrP2pUrl(it) && !BiliAcceleratorCore.isAkamaiHost(it) }
+            }
+            val akamaiOrP2pFallbacks = if (isPrimaryRelay) {
+                emptyList()
+            } else {
+                isolated.filter { BiliAcceleratorCore.isAkamaiHost(it) } +
+                    isolated.filter { isFallbackOrP2pUrl(it) && !BiliAcceleratorCore.isAkamaiHost(it) }
+            }
+            // 非中继会话不主动丢弃原列表中的中继/代理/PCDN备选，而是降级置于末尾作 403 兜底（绝不作为 Donor 合成普通 UPOS）
             val relayFallbacks = if (isPrimaryRelay) {
                 emptyList()
             } else {
@@ -363,18 +374,25 @@ object BtrSessionManager {
                 config != null || isolated.none { !BiliAcceleratorCore.isAkamaiHost(it) }
             )
             if (shouldSynthesize) {
-                val donor = (isolated + listOf(primaryUrl)).firstOrNull { candidate ->
+                val donor = (cleanIsolated + listOf(primaryUrl)).firstOrNull { candidate ->
                     val ch = hostKeyOf(candidate)
                     !candidate.contains("hdnts=", ignoreCase = true) &&
                         !BiliAcceleratorCore.isRelayUrl(candidate) &&
                         !BiliAcceleratorCore.isAkamaiHost(candidate) &&
+                        !isFallbackOrP2pUrl(candidate) &&
                         !BiliAcceleratorCore.hasDrmSignal(candidate) &&
                         !ch.endsWith(".bstarstatic.com")
                 } ?: primaryUrl
                 synthesizedList = synthesizeCompatibleBackups(donor, config, isEpisode = isEpisode)
-                deduplicateUrlsByHost(isolated + synthesizedList + relayFallbacks, excludeHost = primaryHostLower)
+                deduplicateUrlsByHost(
+                    cleanIsolated + synthesizedList + akamaiOrP2pFallbacks + relayFallbacks,
+                    excludeHost = primaryHostLower
+                )
             } else {
-                deduplicateUrlsByHost(isolated + relayFallbacks, excludeHost = primaryHostLower)
+                deduplicateUrlsByHost(
+                    cleanIsolated + akamaiOrP2pFallbacks + relayFallbacks,
+                    excludeHost = primaryHostLower
+                )
             }
         }
 
@@ -678,6 +696,18 @@ object BtrSessionManager {
         return s
     }
 
+    private fun isFallbackOrP2pUrl(url: String): Boolean {
+        if (url.isBlank() || BiliAcceleratorCore.isRelayUrl(url) || BiliAcceleratorCore.isAkamaiHost(url)) {
+            return false
+        }
+        val parsed = BiliAcceleratorCore.parseUri(url) ?: return false
+        val host = BiliAcceleratorCore.cleanHost(parsed.host).lowercase().substringBefore(':')
+        val port = parsed.port
+        return BiliAcceleratorCore.isKnownP2pHost(host) ||
+            BiliAcceleratorCore.isIpAddress(host) ||
+            (port != -1 && port != 80 && port != 443)
+    }
+
     fun updateBackups(sessionId: String, backups: List<String>) {
         val current = sessions[sessionId] ?: return
         synchronized(current.urlLock) {
@@ -702,6 +732,18 @@ object BtrSessionManager {
                 null
             }
             if (promotedUposDonor != null) {
+                val previousPrimary = current.primaryUrl
+                val previousSynth = current.synthesizedMirrors.toSet()
+                val existingRealNonRelay = current.backupUrls.filter {
+                    it !in previousSynth && !BiliAcceleratorCore.isRelayUrl(it)
+                }
+                val existingRelayAndOrig = buildList {
+                    if (!current.isLive && previousPrimary.isNotBlank() && previousPrimary != promotedUposDonor) {
+                        add(previousPrimary)
+                    }
+                    addAll(current.backupUrls.filter { BiliAcceleratorCore.isRelayUrl(it) })
+                }
+
                 current.primaryUrl = promotedUposDonor
                 val deadlineSec = extractDeadlineSeconds(promotedUposDonor)
                 if (deadlineSec > current.urlDeadlineEpochSec) {
@@ -714,11 +756,20 @@ object BtrSessionManager {
                         isEpisode = current.isEpisode
                     )
                 }
-                val ordinaryBackups = validBackups
-                    .map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }
-                    .filter { !BiliAcceleratorCore.isRelayUrl(it) }
+                val unwrappedIncoming = validBackups.map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }
+                val incomingNonRelay = unwrappedIncoming.filter { !BiliAcceleratorCore.isRelayUrl(it) }
+                val incomingRelay = validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
+                val cleanBackups = (incomingNonRelay + existingRealNonRelay).filter {
+                    !isFallbackOrP2pUrl(it) && !BiliAcceleratorCore.isAkamaiHost(it)
+                }
+                val akamaiFallbacks = (incomingNonRelay + existingRealNonRelay).filter {
+                    BiliAcceleratorCore.isAkamaiHost(it)
+                }
+                val p2pFallbacks = (incomingNonRelay + existingRealNonRelay).filter {
+                    isFallbackOrP2pUrl(it)
+                }
                 current.backupUrls = deduplicateUrlsByHost(
-                    ordinaryBackups + current.synthesizedMirrors,
+                    cleanBackups + current.synthesizedMirrors + akamaiFallbacks + p2pFallbacks + incomingRelay + existingRelayAndOrig,
                     excludeHost = hostKeyOf(current.primaryUrl)
                 )
                 scheduleProactiveRefresh(current)
@@ -738,28 +789,40 @@ object BtrSessionManager {
             if (isolatedBackups.isNotEmpty() || incomingRelayFallbacks.isNotEmpty()) {
                 val primaryHostLower = hostKeyOf(current.primaryUrl)
                 val existingSynth = current.synthesizedMirrors.toSet()
-                val existingRealNonRelay = current.backupUrls.filter { it !in existingSynth && !BiliAcceleratorCore.isRelayUrl(it) }
-                val existingRelayFallbacks = if (!current.isLive && !isPrimaryRelay) {
+                val existingRealNonRelay = if (isPrimaryRelay) {
+                    emptyList()
+                } else {
+                    current.backupUrls.filter { it !in existingSynth && !BiliAcceleratorCore.isRelayUrl(it) }
+                }
+                val existingRelayFallbacks = if (isPrimaryRelay || !current.isLive) {
                     current.backupUrls.filter { BiliAcceleratorCore.isRelayUrl(it) }
                 } else {
                     emptyList()
                 }
+                val cleanIncoming = if (isPrimaryRelay) {
+                    isolatedBackups
+                } else {
+                    isolatedBackups.filter { !isFallbackOrP2pUrl(it) && !BiliAcceleratorCore.isAkamaiHost(it) }
+                }
+                val cleanExisting = existingRealNonRelay.filter {
+                    !isFallbackOrP2pUrl(it) && !BiliAcceleratorCore.isAkamaiHost(it)
+                }
+                val incomingAkamai = if (isPrimaryRelay) emptyList() else isolatedBackups.filter { BiliAcceleratorCore.isAkamaiHost(it) }
+                val existingAkamai = existingRealNonRelay.filter { BiliAcceleratorCore.isAkamaiHost(it) }
+                val incomingP2p = if (isPrimaryRelay) emptyList() else isolatedBackups.filter { isFallbackOrP2pUrl(it) }
+                val existingP2p = existingRealNonRelay.filter { isFallbackOrP2pUrl(it) }
+
                 val shouldKeepSynthesized = !current.isLive && !isPrimaryRelay && (
                     current.config != null ||
                         (current.synthesizedMirrors.isNotEmpty() && isolatedBackups.none { !BiliAcceleratorCore.isAkamaiHost(it) })
                     )
-                current.backupUrls = if (shouldKeepSynthesized) {
-                    val preservedAkamai = current.backupUrls.filter { BiliAcceleratorCore.isAkamaiHost(it) }
-                    deduplicateUrlsByHost(
-                        isolatedBackups + existingRealNonRelay + preservedAkamai + current.synthesizedMirrors + incomingRelayFallbacks + existingRelayFallbacks,
-                        excludeHost = primaryHostLower
-                    )
-                } else {
-                    deduplicateUrlsByHost(
-                        isolatedBackups + existingRealNonRelay + incomingRelayFallbacks + existingRelayFallbacks,
-                        excludeHost = primaryHostLower
-                    )
-                }
+                val synthMirrors = if (shouldKeepSynthesized) current.synthesizedMirrors else emptyList()
+                current.backupUrls = deduplicateUrlsByHost(
+                    cleanIncoming + cleanExisting + synthMirrors +
+                        incomingAkamai + existingAkamai + incomingP2p + existingP2p +
+                        incomingRelayFallbacks + existingRelayFallbacks,
+                    excludeHost = primaryHostLower
+                )
             }
 
             // 若为直播会话，同时同步至直播节点池及逐线路 URL 映射表

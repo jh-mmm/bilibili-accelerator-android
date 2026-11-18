@@ -30,60 +30,60 @@ object BtrHttpClient {
         }
     }
 
-    // 全局基础客户端：开启 HTTP/2 多路复用和 HTTP/1.1，解除单节点并发瓶颈
+    // 全局基础客户端：采用 HTTP/1.1 独立连接池（每并发独立 TCP 通道），避免 HTTP/2 单连接复用导致 16 线程分片与直播流触发 RST_STREAM/GOAWAY 或队头阻塞
     val client: OkHttpClient = OkHttpClient.Builder()
         .dispatcher(createDispatcher(128, 32))
         .connectionPool(connectionPool)
-        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-        .connectTimeout(3500, TimeUnit.MILLISECONDS)
-        .readTimeout(6000, TimeUnit.MILLISECONDS)
-        .writeTimeout(5000, TimeUnit.MILLISECONDS)
+        .protocols(listOf(Protocol.HTTP_1_1))
+        .connectTimeout(8_000, TimeUnit.MILLISECONDS)
+        .readTimeout(20_000, TimeUnit.MILLISECONDS)
+        .writeTimeout(10_000, TimeUnit.MILLISECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(false) // 由 BtrChunkEngine 统一控制 Failover 与熔断
         .build()
 
-    // 音频专属独立客户端：使用独立连接池与独立调度器，低时延优先
+    // 音频专属独立客户端：使用独立连接池与独立调度器，HTTP/1.1 低时延优先
     val audioClient: OkHttpClient = OkHttpClient.Builder()
         .dispatcher(createDispatcher(32, 16))
         .connectionPool(audioConnectionPool)
-        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-        .connectTimeout(3000, TimeUnit.MILLISECONDS)
-        .readTimeout(5000, TimeUnit.MILLISECONDS)
-        .writeTimeout(5000, TimeUnit.MILLISECONDS)
+        .protocols(listOf(Protocol.HTTP_1_1))
+        .connectTimeout(6_000, TimeUnit.MILLISECONDS)
+        .readTimeout(15_000, TimeUnit.MILLISECONDS)
+        .writeTimeout(10_000, TimeUnit.MILLISECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(false)
         .build()
 
-    const val CHUNK_ATTEMPT_CALL_TIMEOUT_MS = 15_000L
+    const val CHUNK_ATTEMPT_CALL_TIMEOUT_MS = 25_000L
 
-    // 单分片拉取专用客户端：附加 15s 总调用超时，防止慢速滴流节点无限占用并发槽位
+    // 单分片拉取专用客户端：附加 25s 总调用超时，防止慢速滴流节点无限占用并发槽位，同时避免大切片正常传输被过紧超时误杀
     val chunkClient: OkHttpClient = client.newBuilder()
         .callTimeout(CHUNK_ATTEMPT_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .build()
 
-    // 音频单分片拉取专用客户端：独立池 + 15s 总调用超时
+    // 音频单分片拉取专用客户端：独立池 + 25s 总调用超时
     val chunkAudioClient: OkHttpClient = audioClient.newBuilder()
         .callTimeout(CHUNK_ATTEMPT_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .build()
 
-    // 探针专用客户端：更紧凑的超时控制，附带总调用超时避免慢节点卡死起播
+    // 探针专用客户端：紧凑超时控制，避免慢节点卡死起播
     val probeClient: OkHttpClient = client.newBuilder()
-        .connectTimeout(3500, TimeUnit.MILLISECONDS)
-        .readTimeout(4500, TimeUnit.MILLISECONDS)
-        .callTimeout(5500, TimeUnit.MILLISECONDS)
+        .connectTimeout(5_000, TimeUnit.MILLISECONDS)
+        .readTimeout(6_000, TimeUnit.MILLISECONDS)
+        .callTimeout(7_000, TimeUnit.MILLISECONDS)
         .build()
 
     // 兜底直连专用客户端
     val fallbackClient: OkHttpClient = client.newBuilder()
-        .connectTimeout(5000, TimeUnit.MILLISECONDS)
-        .readTimeout(8000, TimeUnit.MILLISECONDS)
+        .connectTimeout(8_000, TimeUnit.MILLISECONDS)
+        .readTimeout(20_000, TimeUnit.MILLISECONDS)
         .build()
 
-    // 直播 FLV 长流透传专用客户端：避免上游短暂推流卡顿触发 6s 读超时断流
+    // 直播 FLV 长流透传专用客户端：HTTP/1.1 独立连接 + 30s 读超时，避免上游短暂推流卡顿或 HTTP/2 复用触发断流
     val liveStreamClient: OkHttpClient = client.newBuilder()
-        .connectTimeout(4000, TimeUnit.MILLISECONDS)
+        .connectTimeout(6_000, TimeUnit.MILLISECONDS)
         .readTimeout(30_000, TimeUnit.MILLISECONDS)
         .writeTimeout(10_000, TimeUnit.MILLISECONDS)
         .build()

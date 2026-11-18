@@ -221,9 +221,10 @@ object BtrLocalProxyServer {
                         }
                         ?: session.referer
 
+                    val requestPathOnly = path.substringBefore('?')
                     val keepConnectionAlive = if (session.isLive) {
                         when {
-                            path.contains(".m3u8") -> {
+                            requestPathOnly.endsWith(".m3u8", ignoreCase = true) -> {
                                 BtrLiveEngine.pipePlaylist(
                                     session = session,
                                     requestPath = path,
@@ -236,7 +237,7 @@ object BtrLocalProxyServer {
                                     requestReferer = reqReferer
                                 )
                             }
-                            path.contains(".flv") -> {
+                            requestPathOnly.endsWith(".flv", ignoreCase = true) -> {
                                 BtrLiveEngine.pipeLiveFlvStream(
                                     session = session,
                                     headers = headers,

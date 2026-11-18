@@ -73,7 +73,7 @@ object BiliAcceleratorCore {
                 p.startsWith("com.bstar.")
     }
 
-    // 跨区统一交错候选池（对齐 bilibili-accelerator v0.5.0：不预设地域顺序，保证小池尺寸下大陆与海外节点均被包含，由实测吞吐动态决定优胜者）
+    // 跨区统一交错候选池（对齐 bilibili-accelerator v0.5.0 与 BTR #44：不预设地域顺序，且保证默认 8 节点池包含 upos-sz-mirrorcoso1）
     val INTERLEAVED_CANDIDATE_POOL = listOf(
         "upos-sz-mirrorcos.bilivideo.com",
         "upos-sz-mirrorcosov.bilivideo.com",
@@ -81,9 +81,9 @@ object BiliAcceleratorCore {
         "upos-sz-mirroraliov.bilivideo.com",
         "upos-sz-mirrorhw.bilivideo.com",
         "upos-sz-mirrorhwov.bilivideo.com",
+        "upos-sz-mirrorcoso1.bilivideo.com",
         "upos-tf-all-hw.bilivideo.com",
         "upos-tf-all-tx.bilivideo.com",
-        "upos-sz-mirrorcoso1.bilivideo.com",
         "upos-sz-mirrorbos.bilivideo.com",
         "upos-sz-mirror08c.bilivideo.com",
         "upos-sz-mirrorbd.bilivideo.com"
@@ -93,12 +93,12 @@ object BiliAcceleratorCore {
         "upos-sz-mirrorcos.bilivideo.com",
         "upos-sz-mirrorali.bilivideo.com",
         "upos-sz-mirrorhw.bilivideo.com",
+        "upos-sz-mirrorcoso1.bilivideo.com",
         "upos-tf-all-hw.bilivideo.com",
         "upos-tf-all-tx.bilivideo.com",
         "upos-sz-mirrorcosov.bilivideo.com",
         "upos-sz-mirroraliov.bilivideo.com",
         "upos-sz-mirrorhwov.bilivideo.com",
-        "upos-sz-mirrorcoso1.bilivideo.com",
         "upos-sz-mirrorbos.bilivideo.com",
         "upos-sz-mirror08c.bilivideo.com",
         "upos-sz-mirrorbd.bilivideo.com"
@@ -609,12 +609,18 @@ object BiliAcceleratorCore {
         return fileName.startsWith("audio") || fileName.startsWith("dolby") || fileName.startsWith("flac")
     }
 
+    fun normalizeMcdnStrategy(raw: String?): String {
+        return when (raw?.trim()?.lowercase()) {
+            "proxy-v1" -> "proxy-v1"
+            else -> "proxy-all"
+        }
+    }
+
     fun shouldProxyMcdn(isMcdn: Boolean, path: String, config: AcceleratorConfig): Boolean {
         if (!isMcdn || !config.proxyMcdn) return false
-        return when (config.mcdnStrategy.lowercase()) {
+        return when (normalizeMcdnStrategy(config.mcdnStrategy)) {
             "proxy-all" -> true
-            "proxy-v1" -> path.startsWith("/v1/resource/")
-            "replace" -> false
+            "proxy-v1" -> path.startsWith("/v1/resource/", ignoreCase = true)
             else -> true
         }
     }
@@ -721,9 +727,9 @@ object BiliAcceleratorCore {
                 queryMcdn ||
                 (hasNonDefaultPort && (isBiliFamily || hasBiliMediaSignature || isLive))
 
-        // 1. szbdyd / mountaintoys 调度器：直接恢复 xy_usource 参数所携带的真实原生 CDN 域名（点播与直播通用）
+        // 1. szbdyd / mountaintoys 调度器：仅在未携带 ?os=mcdn 中继签名时恢复 xy_usource 参数所携带的真实原生 CDN 域名
         val isScheduler = isSchedulerHost(hostname)
-        if (isScheduler) {
+        if (isScheduler && !queryMcdn) {
             val rawSource = parsed.queryParam("xy_usource")
             val cleanedSource = cleanHost(rawSource)
             val hostOnly = cleanedSource.substringBefore(':')
@@ -763,76 +769,31 @@ object BiliAcceleratorCore {
             return noChange(original, "drm-protected", isPcdn = false, isMcdn = false, segmentKey = segKey)
         }
 
-        // 2. MCDN 节点处理：
-        // - proxyMcdn=true 时按 proxy-all / proxy-v1 / replace 策略执行（replace 对 /v1/resource/ 安全放行以杜绝 403）
-        // - proxyMcdn=false 时，非 /v1/resource/ 的 *.mcdn.* 节点在 blockPcdn 或 forceUpos 开启下同样替换为 UPOS；
-        //   而 /v1/resource/ 路径因 UPOS 节点不支持并会直接 403，停用代理时保持直连放行
+        // 2. 中继/MCDN 节点防护（对齐上游 BTR #47）：
+        // *.mcdn.*、/v1/resource/、?os=mcdn 携带边缘中继专属签名，移植到普通 UPOS 节点 100% 返回 403；
+        // 因此严禁将任何中继签名地址替换为 upos-* 主机：允许走官方中继代理时按策略代理，否则原样安全放行。
         val isV1Resource = parsed.path.startsWith("/v1/resource/", ignoreCase = true)
         if (isMcdn) {
-            if (config.proxyMcdn) {
-                val shouldProxy = shouldProxyMcdn(true, parsed.path, config)
-                if (shouldProxy) {
-                    val rewritten = parsed.proxyWrap(cleanProxyHost)
-                    if (rewritten != original) {
-                        return RewriteResult(
-                            changed = true,
-                            originalUrl = original,
-                            finalUrl = rewritten,
-                            originalHost = hostname,
-                            targetHost = cleanProxyHost,
-                            reason = "mcdn-proxy",
-                            isPcdn = false,
-                            isMcdn = true,
-                            segmentKey = segKey
-                        )
-                    } else {
-                        return noChange(original, "ok", isMcdn = true, segmentKey = segKey)
-                    }
+            if (config.proxyMcdn && shouldProxyMcdn(true, parsed.path, config)) {
+                val rewritten = parsed.proxyWrap(cleanProxyHost)
+                if (rewritten != original) {
+                    return RewriteResult(
+                        changed = true,
+                        originalUrl = original,
+                        finalUrl = rewritten,
+                        originalHost = hostname,
+                        targetHost = cleanProxyHost,
+                        reason = "mcdn-proxy",
+                        isPcdn = false,
+                        isMcdn = true,
+                        segmentKey = segKey
+                    )
                 } else {
-                    if (isV1Resource) {
-                        return noChange(original, "mcdn-v1-pass", isPcdn = isPcdn, isMcdn = true, segmentKey = segKey)
-                    }
-                    val target = resolveTargetHost(config)
-                    val rewritten = parsed.replaceAuthority(target)
-                    if (rewritten != original) {
-                        return RewriteResult(
-                            changed = true,
-                            originalUrl = original,
-                            finalUrl = rewritten,
-                            originalHost = hostname,
-                            targetHost = target,
-                            reason = "mcdn-host",
-                            isPcdn = false,
-                            isMcdn = true,
-                            segmentKey = segKey
-                        )
-                    } else {
-                        return noChange(original, "ok", isMcdn = true, segmentKey = segKey)
-                    }
+                    return noChange(original, "ok", isMcdn = true, segmentKey = segKey)
                 }
-            } else {
-                if (isV1Resource) {
-                    return noChange(original, "mcdn-v1-pass", isPcdn = false, isMcdn = true, segmentKey = segKey)
-                }
-                if (config.blockPcdn || config.forceUpos) {
-                    val target = resolveTargetHost(config)
-                    val rewritten = parsed.replaceAuthority(target)
-                    if (rewritten != original) {
-                        return RewriteResult(
-                            changed = true,
-                            originalUrl = original,
-                            finalUrl = rewritten,
-                            originalHost = hostname,
-                            targetHost = target,
-                            reason = "mcdn-host",
-                            isPcdn = isPcdn,
-                            isMcdn = true,
-                            segmentKey = segKey
-                        )
-                    }
-                }
-                return noChange(original, "ok", isPcdn = isPcdn, isMcdn = true, segmentKey = segKey)
             }
+            val passReason = if (isV1Resource) "mcdn-v1-pass" else "mcdn-relay-pass"
+            return noChange(original, passReason, isPcdn = isPcdn, isMcdn = true, segmentKey = segKey)
         }
 
         // /v1/resource/ 路径依赖边缘中继鉴权，普通 UPOS 节点不支持并会直接 403；即使非 *.mcdn.* 域名也禁止改写为普通 UPOS
@@ -840,22 +801,25 @@ object BiliAcceleratorCore {
             return noChange(original, "mcdn-v1-pass", isPcdn = isPcdn, isMcdn = false, segmentKey = segKey)
         }
 
-        // 2.5 非 *.mcdn.* 主机但携带 ?os=mcdn 鉴权参数的伪装中继流：开启 proxyMcdn 且命中代理策略时优先走官方中继代理，避免换 UPOS 报 403
-        if (queryMcdn && config.proxyMcdn && shouldProxyMcdn(true, parsed.path, config)) {
-            val rewritten = parsed.proxyWrap(cleanProxyHost)
-            if (rewritten != original) {
-                return RewriteResult(
-                    changed = true,
-                    originalUrl = original,
-                    finalUrl = rewritten,
-                    originalHost = hostname,
-                    targetHost = cleanProxyHost,
-                    reason = "mcdn-proxy",
-                    isPcdn = true,
-                    isMcdn = true,
-                    segmentKey = segKey
-                )
+        // 2.5 非 *.mcdn.* 主机但携带 ?os=mcdn 鉴权参数的伪装中继流：开启 proxyMcdn 且命中代理策略时走官方中继代理；否则原样放行，绝不换 UPOS 报 403
+        if (queryMcdn) {
+            if (config.proxyMcdn && shouldProxyMcdn(true, parsed.path, config)) {
+                val rewritten = parsed.proxyWrap(cleanProxyHost)
+                if (rewritten != original) {
+                    return RewriteResult(
+                        changed = true,
+                        originalUrl = original,
+                        finalUrl = rewritten,
+                        originalHost = hostname,
+                        targetHost = cleanProxyHost,
+                        reason = "mcdn-proxy",
+                        isPcdn = true,
+                        isMcdn = true,
+                        segmentKey = segKey
+                    )
+                }
             }
+            return noChange(original, "mcdn-relay-pass", isPcdn = true, isMcdn = false, segmentKey = segKey)
         }
 
         // 3. Akamai 节点处理：默认放行官方 Akamai 鉴权线路；杜绝非 BTR 模式下直接改写 Host 导致 403 播放失败
@@ -945,19 +909,32 @@ object BiliAcceleratorCore {
         }
 
         // VOD 点播流候选过滤与补全
+        val nonRelayUrls = mutableListOf<String>()
+        val relayFallbackUrls = mutableListOf<String>()
         for (url in rawList) {
             val res = rewriteUrl(url, config)
             if (res.changed) {
                 onRewrite?.invoke(res)
-                filtered.add(res.finalUrl)
+                if (isRelayUrl(res.finalUrl)) {
+                    relayFallbackUrls.add(res.finalUrl)
+                } else {
+                    nonRelayUrls.add(res.finalUrl)
+                }
                 // 对齐 BTR / realzza：改写 Akamai 或 forceUpos 强制改写官方节点时，保留原地址及独立签名作为 403 兜底
                 if (res.reason == "akamai-redirect" || res.reason == "force-upos") {
-                    filtered.add(url)
+                    nonRelayUrls.add(url)
                 }
+            } else if (res.reason == "mcdn-v1-pass" || res.reason == "mcdn-relay-pass") {
+                relayFallbackUrls.add(url)
             } else if (!res.isPcdn || !config.blockPcdn) {
-                filtered.add(url)
+                if (isRelayUrl(url)) {
+                    relayFallbackUrls.add(url)
+                } else {
+                    nonRelayUrls.add(url)
+                }
             }
         }
+        filtered.addAll(nonRelayUrls)
 
         // 优先从原始列表中挑选真正干净的官方 UPOS URL 作为 Donor；仅当原始列表全为 /upgcxcode/ PCDN 并已被改写为 UPOS 时才从已改写列表补充
         val donorUrl = rawList.firstOrNull { isCleanUposDonor(it) }
@@ -980,6 +957,7 @@ object BiliAcceleratorCore {
             }
         }
 
+        filtered.addAll(relayFallbackUrls)
         return filtered.distinct()
     }
 

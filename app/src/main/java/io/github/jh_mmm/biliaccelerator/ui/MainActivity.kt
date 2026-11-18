@@ -170,6 +170,9 @@ class MainActivity : ComponentActivity() {
                         if (newPrefs.themeMode != uiPreferences.themeMode) {
                             uiPreferencesStore.updateThemeMode(newPrefs.themeMode)
                         }
+                        if (newPrefs.bottomBarStyle != uiPreferences.bottomBarStyle) {
+                            uiPreferencesStore.updateBottomBarStyle(newPrefs.bottomBarStyle)
+                        }
                     },
                     onClearStats = {
                         StatsManager.clearStats(this@MainActivity)

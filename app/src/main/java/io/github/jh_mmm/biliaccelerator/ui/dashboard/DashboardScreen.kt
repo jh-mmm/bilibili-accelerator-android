@@ -64,8 +64,10 @@ import io.github.jh_mmm.biliaccelerator.ui.theme.TagSched
 import io.github.jh_mmm.biliaccelerator.ui.theme.TagUpos
 import io.github.jh_mmm.biliaccelerator.ui.theme.TagBtr
 import io.github.jh_mmm.biliaccelerator.ui.theme.TagBtrFailover
-import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
+import io.github.jh_mmm.biliaccelerator.ui.theme.cardCornerRadius
+import io.github.jh_mmm.biliaccelerator.ui.theme.heroCornerRadius
 import io.github.jh_mmm.biliaccelerator.ui.theme.isAcceleratorDarkTheme
+import io.github.jh_mmm.biliaccelerator.ui.theme.itemCornerRadius
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -104,6 +106,7 @@ internal fun resolveUposDisplayName(
     }
     return when (targetHost.lowercase().substringBefore(".")) {
         "upos-sz-mirrorcos" -> "腾讯云国内"
+        "upos-sz-mirrorcoso1" -> "腾讯云国内o1"
         "upos-sz-mirrorali" -> "阿里云国内"
         "upos-sz-mirrorhw" -> "华为云国内"
         "upos-tf-all-hw" -> "华为云全国混流"
@@ -223,7 +226,7 @@ private fun RuntimeStatusCard(
 ) {
     val dark = isAcceleratorDarkTheme()
     val uiStyle = LocalUiStyle.current
-    val cornerRadius = if (uiStyle == UiStyle.MIUIX) 20.dp else 16.dp
+    val cornerRadius = uiStyle.heroCornerRadius()
 
     val containerColor = when (state) {
         ActivationState.ACTIVE_EFFECTIVE -> if (dark) Color(0xFF143320) else Color(0xFFE2F8E7)
@@ -421,7 +424,7 @@ private fun RuntimeDetailsCard(
     onRefresh: () -> Unit
 ) {
     val uiStyle = LocalUiStyle.current
-    val cornerRadius = if (uiStyle == UiStyle.MIUIX) 16.dp else 12.dp
+    val cornerRadius = uiStyle.cardCornerRadius()
 
     val lastHeartbeatFormatted = if (snapshot.lastHeartbeatTimestamp > 0L) {
         LocalDateTime.ofInstant(
@@ -545,7 +548,7 @@ private fun SectionHeader(title: String, count: Int) {
 @Composable
 private fun EmptyLogsCard() {
     val uiStyle = LocalUiStyle.current
-    val cornerRadius = if (uiStyle == UiStyle.MIUIX) 16.dp else 12.dp
+    val cornerRadius = uiStyle.cardCornerRadius()
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -581,7 +584,7 @@ private fun RewriteLogCard(
     onClick: () -> Unit
 ) {
     val uiStyle = LocalUiStyle.current
-    val cornerRadius = if (uiStyle == UiStyle.MIUIX) 14.dp else 10.dp
+    val cornerRadius = uiStyle.itemCornerRadius()
 
     val (tagLabel, tagColor) = when {
         log.reason.contains("熔断") || log.reason.contains("failover") -> "BTR 熔断" to TagBtrFailover

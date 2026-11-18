@@ -45,7 +45,7 @@ import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceDivider
 import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceGroupCard
 import io.github.jh_mmm.biliaccelerator.ui.components.PreferenceGroupTitle
 import io.github.jh_mmm.biliaccelerator.ui.theme.LocalUiStyle
-import io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle
+import io.github.jh_mmm.biliaccelerator.ui.theme.groupCornerRadius
 
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
@@ -56,7 +56,7 @@ fun AboutScreen(
 ) {
     val context = LocalContext.current
     val uiStyle = LocalUiStyle.current
-    val cornerRadius = if (uiStyle == UiStyle.MIUIX) 18.dp else 12.dp
+    val cornerRadius = uiStyle.groupCornerRadius()
 
     val appIcon = remember(context) {
         runCatching {

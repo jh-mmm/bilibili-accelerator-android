@@ -28,6 +28,8 @@ import io.github.jh_mmm.biliaccelerator.hook.HookStatusTracker
 import io.github.jh_mmm.biliaccelerator.provider.XposedServiceProvider
 import io.github.jh_mmm.biliaccelerator.ui.MainActivity
 import io.github.jh_mmm.biliaccelerator.ui.MainActivity.ActivationState
+import io.github.jh_mmm.biliaccelerator.ui.theme.LocalUiStyle
+import io.github.jh_mmm.biliaccelerator.ui.theme.dialogCornerRadius
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -201,6 +203,6 @@ fun StatusDetailDialog(
         } else {
             null
         },
-        shape = RoundedCornerShape(20.dp)
+        shape = RoundedCornerShape(LocalUiStyle.current.dialogCornerRadius())
     )
 }

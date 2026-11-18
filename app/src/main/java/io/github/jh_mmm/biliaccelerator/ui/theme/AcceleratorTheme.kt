@@ -2,9 +2,12 @@ package io.github.jh_mmm.biliaccelerator.ui.theme
 
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ColorScheme
+import androidx.compose.material3.MaterialExpressiveTheme
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Typography
+import androidx.compose.material3.MotionScheme
+import androidx.compose.material3.Shapes
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
@@ -15,6 +18,8 @@ import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
 
 val BiliBlue = Color(0xFF00AEEC)
 val BiliPink = Color(0xFFFB7299)
@@ -111,8 +116,59 @@ private val Material3DarkColorScheme = darkColorScheme(
     outline = Color(0xFF8D9199),
 )
 
+private val ExpressiveShapes = Shapes(
+    extraSmall = RoundedCornerShape(8.dp),
+    small = RoundedCornerShape(12.dp),
+    medium = RoundedCornerShape(18.dp),
+    large = RoundedCornerShape(24.dp),
+    extraLarge = RoundedCornerShape(28.dp),
+    largeIncreased = RoundedCornerShape(26.dp),
+    extraLargeIncreased = RoundedCornerShape(32.dp),
+    extraExtraLarge = RoundedCornerShape(36.dp)
+)
+
 val LocalResolvedDarkTheme = staticCompositionLocalOf { false }
 val LocalUiStyle = staticCompositionLocalOf { UiStyle.MIUIX }
+val LocalBottomBarStyle = staticCompositionLocalOf { BottomBarStyle.FOLLOW_STYLE }
+
+fun resolveUseFloatingBottomBar(
+    style: UiStyle,
+    bottomBarStyle: BottomBarStyle
+): Boolean = when (bottomBarStyle) {
+    BottomBarStyle.FLOATING -> true
+    BottomBarStyle.DOCKED -> false
+    BottomBarStyle.FOLLOW_STYLE -> style == UiStyle.MIUIX || style == UiStyle.MATERIAL3_EXPRESSIVE
+}
+
+fun UiStyle.groupCornerRadius(): Dp = when (this) {
+    UiStyle.MIUIX -> 18.dp
+    UiStyle.MATERIAL3 -> 12.dp
+    UiStyle.MATERIAL3_EXPRESSIVE -> 24.dp
+}
+
+fun UiStyle.cardCornerRadius(): Dp = when (this) {
+    UiStyle.MIUIX -> 16.dp
+    UiStyle.MATERIAL3 -> 12.dp
+    UiStyle.MATERIAL3_EXPRESSIVE -> 22.dp
+}
+
+fun UiStyle.itemCornerRadius(): Dp = when (this) {
+    UiStyle.MIUIX -> 14.dp
+    UiStyle.MATERIAL3 -> 10.dp
+    UiStyle.MATERIAL3_EXPRESSIVE -> 18.dp
+}
+
+fun UiStyle.heroCornerRadius(): Dp = when (this) {
+    UiStyle.MIUIX -> 20.dp
+    UiStyle.MATERIAL3 -> 16.dp
+    UiStyle.MATERIAL3_EXPRESSIVE -> 28.dp
+}
+
+fun UiStyle.dialogCornerRadius(): Dp = when (this) {
+    UiStyle.MIUIX -> 20.dp
+    UiStyle.MATERIAL3 -> 20.dp
+    UiStyle.MATERIAL3_EXPRESSIVE -> 28.dp
+}
 
 @Composable
 fun AcceleratorTheme(
@@ -123,7 +179,7 @@ fun AcceleratorTheme(
     val context = LocalContext.current
 
     val colors: ColorScheme = when (preferences.style) {
-        UiStyle.MATERIAL3 -> {
+        UiStyle.MATERIAL3, UiStyle.MATERIAL3_EXPRESSIVE -> {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
             } else {
@@ -137,12 +193,22 @@ fun AcceleratorTheme(
 
     CompositionLocalProvider(
         LocalResolvedDarkTheme provides darkTheme,
-        LocalUiStyle provides preferences.style
+        LocalUiStyle provides preferences.style,
+        LocalBottomBarStyle provides preferences.bottomBarStyle
     ) {
-        MaterialTheme(
-            colorScheme = colors,
-            content = content
-        )
+        if (preferences.style == UiStyle.MATERIAL3_EXPRESSIVE) {
+            MaterialExpressiveTheme(
+                colorScheme = colors,
+                motionScheme = MotionScheme.expressive(),
+                shapes = ExpressiveShapes,
+                content = content
+            )
+        } else {
+            MaterialTheme(
+                colorScheme = colors,
+                content = content
+            )
+        }
     }
 }
 

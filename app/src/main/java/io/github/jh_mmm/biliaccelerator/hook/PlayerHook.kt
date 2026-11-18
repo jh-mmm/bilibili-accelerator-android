@@ -881,14 +881,18 @@ object PlayerHook {
         clearBuilderBtrState(builderInstance)
         flushDeferredBackups(builderInstance, btrUrl = null)
         builderInstance?.let { builderResolvedNonBtr[it] = true }
-        if (result.changed) {
-            val rawBackups = builderInstance?.let { builderRawBackups[it] }.orEmpty()
-            val cleanOfficialBackup = findPromotableOfficialBackup(originalUrl, result, rawBackups, isLive)
-
+        val rawBackups = builderInstance?.let { builderRawBackups[it] }.orEmpty()
+        val cleanOfficialBackup = if (!isLive && (result.changed || result.isPcdn || result.isMcdn || BiliAcceleratorCore.isRelayUrl(originalUrl))) {
+            findPromotableOfficialBackup(originalUrl, result, rawBackups, isLive)
+        } else {
+            null
+        }
+        if (result.changed || (cleanOfficialBackup != null && cleanOfficialBackup != originalUrl)) {
             val finalUrl = cleanOfficialBackup ?: result.finalUrl
             val finalTargetHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(finalUrl)?.host)
             val reportedResult = if (cleanOfficialBackup != null) {
                 result.copy(
+                    changed = cleanOfficialBackup != originalUrl,
                     finalUrl = finalUrl,
                     targetHost = finalTargetHost,
                     reason = "pcdn-promote"
@@ -982,14 +986,19 @@ object PlayerHook {
             return btrOutcome.btrUrl
         }
         clearBuilderBtrState(playerInstance)
-        if (result.changed) {
-            val rawBackups = playerInstance?.let { builderRawBackups[it] }.orEmpty()
-            val isLive = BiliAcceleratorCore.isLiveMediaUrl("", original)
-            val cleanOfficialBackup = findPromotableOfficialBackup(original, result, rawBackups, isLive)
+        val isLive = BiliAcceleratorCore.isLiveMediaUrl("", original)
+        val rawBackups = playerInstance?.let { builderRawBackups[it] }.orEmpty()
+        val cleanOfficialBackup = if (!isLive && (result.changed || result.isPcdn || result.isMcdn || BiliAcceleratorCore.isRelayUrl(original))) {
+            findPromotableOfficialBackup(original, result, rawBackups, isLive)
+        } else {
+            null
+        }
+        if (result.changed || (cleanOfficialBackup != null && cleanOfficialBackup != original)) {
             val finalUrl = cleanOfficialBackup ?: result.finalUrl
             val finalTargetHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(finalUrl)?.host)
             val reportedResult = if (cleanOfficialBackup != null) {
                 result.copy(
+                    changed = cleanOfficialBackup != original,
                     finalUrl = finalUrl,
                     targetHost = finalTargetHost,
                     reason = "pcdn-promote"

@@ -518,6 +518,40 @@ class ActivationStateTest {
             "MIUIX",
             io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle.MIUIX.label
         )
+        assertEquals(
+            "Material 3 Expressive",
+            io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle.MATERIAL3_EXPRESSIVE.label
+        )
+        assertEquals(
+            "腾讯云国内o1",
+            io.github.jh_mmm.biliaccelerator.ui.dashboard.resolveUposDisplayName(
+                "upos-sz-mirrorcoso1.bilivideo.com"
+            )
+        )
+        assertTrue(
+            io.github.jh_mmm.biliaccelerator.ui.theme.resolveUseFloatingBottomBar(
+                io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle.MATERIAL3_EXPRESSIVE,
+                io.github.jh_mmm.biliaccelerator.ui.theme.BottomBarStyle.FOLLOW_STYLE
+            )
+        )
+        assertFalse(
+            io.github.jh_mmm.biliaccelerator.ui.theme.resolveUseFloatingBottomBar(
+                io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle.MATERIAL3,
+                io.github.jh_mmm.biliaccelerator.ui.theme.BottomBarStyle.FOLLOW_STYLE
+            )
+        )
+        assertTrue(
+            io.github.jh_mmm.biliaccelerator.ui.theme.resolveUseFloatingBottomBar(
+                io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle.MATERIAL3,
+                io.github.jh_mmm.biliaccelerator.ui.theme.BottomBarStyle.FLOATING
+            )
+        )
+        assertFalse(
+            io.github.jh_mmm.biliaccelerator.ui.theme.resolveUseFloatingBottomBar(
+                io.github.jh_mmm.biliaccelerator.ui.theme.UiStyle.MATERIAL3_EXPRESSIVE,
+                io.github.jh_mmm.biliaccelerator.ui.theme.BottomBarStyle.DOCKED
+            )
+        )
     }
 
     @Test
@@ -570,6 +604,21 @@ class ActivationStateTest {
         assertTrue(
             "Mixed batch containing at least one legitimate entry must match onReceive any-semantics",
             io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver.isPayloadLegitimate(mixedBatchJson, null)
+        )
+
+        val relayPassResult = RewriteResult(
+            changed = false,
+            originalUrl = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/11/22/video.m4s?os=mcdn",
+            finalUrl = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/11/22/video.m4s?os=mcdn",
+            originalHost = "xy1x2x3x4xy.mcdn.bilivideo.cn",
+            targetHost = "xy1x2x3x4xy.mcdn.bilivideo.cn",
+            reason = "mcdn-relay-pass",
+            isPcdn = false,
+            isMcdn = true
+        )
+        assertTrue(
+            "mcdn-relay-pass reason must be recognized as legitimate",
+            io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver.isPayloadLegitimate(null, gson.toJson(relayPassResult))
         )
     }
 }

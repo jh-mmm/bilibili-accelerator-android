@@ -2109,4 +2109,104 @@ class BtrEngineTest {
             tGood.interrupt()
         }
     }
+
+    @Test
+    fun testLiveSwapHostPreservesEncodedAuthParamsAndDomesticPoolOnly() {
+        assertFalse(
+            "Live default FMP4 pool must not contain overseas ov-gotcha hosts",
+            BtrLiveCore.KNOWN_FMP4_HOSTS.any { it.contains("ov-gotcha", ignoreCase = true) }
+        )
+        assertTrue(BtrLiveCore.KNOWN_FMP4_HOSTS.contains("d1--cn-gotcha204.bilivideo.com"))
+        assertTrue(BtrLiveCore.KNOWN_FMP4_HOSTS.contains("d1--cn-gotcha208.bilivideo.com"))
+
+        val signedPlaylist =
+            "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123456/live_123_1500/index.m3u8?expires=1700000000&sign=abc%2Fdef%2Bghi%3D%3D&sk=foo%26bar"
+        assertEquals(
+            "Same-host swap must return URL verbatim without decoding query",
+            signedPlaylist,
+            BtrLiveCore.swapHost(signedPlaylist, "d1--cn-gotcha204.bilivideo.com")
+        )
+
+        val swappedPlaylist = BtrLiveCore.swapHost(signedPlaylist, "d1--cn-gotcha208.bilivideo.com")
+        assertEquals(
+            "https://d1--cn-gotcha208.bilivideo.com/live-bvc/123456/live_123_1500/index.m3u8?expires=1700000000&sign=abc%2Fdef%2Bghi%3D%3D&sk=foo%26bar",
+            swappedPlaylist
+        )
+
+        val signedSegment =
+            "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123456/100.m4s?sign=a%2Fb%3Dc&sk=x%2By"
+        val guessed = BtrLiveCore.guessNextSegmentUrl(
+            LiveSegment(name = "100.m4s", url = signedSegment, num = 100L)
+        )
+        assertEquals(
+            "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123456/101.m4s?sign=a%2Fb%3Dc&sk=x%2By",
+            guessed
+        )
+        assertEquals(
+            "https://d1--cn-gotcha208.bilivideo.com/live-bvc/123456/101.m4s?sign=a%2Fb%3Dc&sk=x%2By",
+            BtrLiveCore.swapHost(guessed!!, "d1--cn-gotcha208.bilivideo.com")
+        )
+    }
+
+    @Test
+    fun testBtrHttpClientsUseHttp11AndRelaxedTimeouts() {
+        val clients = listOf(
+            BtrHttpClient.client,
+            BtrHttpClient.audioClient,
+            BtrHttpClient.chunkClient,
+            BtrHttpClient.chunkAudioClient,
+            BtrHttpClient.probeClient,
+            BtrHttpClient.fallbackClient,
+            BtrHttpClient.liveStreamClient
+        )
+        for (c in clients) {
+            assertEquals("OkHttp client must use HTTP/1.1 only", listOf(okhttp3.Protocol.HTTP_1_1), c.protocols)
+        }
+        assertTrue(BtrHttpClient.client.connectTimeoutMillis >= 8_000)
+        assertTrue(BtrHttpClient.client.readTimeoutMillis >= 20_000)
+        assertTrue(BtrHttpClient.audioClient.connectTimeoutMillis >= 6_000)
+        assertTrue(BtrHttpClient.audioClient.readTimeoutMillis >= 15_000)
+        assertTrue(BtrHttpClient.liveStreamClient.readTimeoutMillis >= 30_000)
+    }
+
+    @Test
+    fun testUpdateBackupsPreservesOriginalAndExistingFallbacks() {
+        val rewrittenTarget = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/44401.m4s?deadline=1900000000"
+        val origPcdn = "https://p2p.szbdyd.com:8080/upgcxcode/54/12/44401.m4s?deadline=1900000000"
+        val incomingOfficial = "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/54/12/44401.m4s?deadline=1900000000"
+        val sid = BtrSessionManager.register(
+            primaryUrl = rewrittenTarget,
+            backupUrls = listOf(origPcdn),
+            config = AcceleratorConfig(enableBtr = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
+        )
+        try {
+            BtrSessionManager.updateBackups(sid, listOf(incomingOfficial))
+            val session = BtrSessionManager.get(sid)!!
+            assertTrue("Incoming official backup must be retained", session.backupUrls.contains(incomingOfficial))
+            assertTrue("Original PCDN URL must NOT be overwritten by setBackupUrls()", session.backupUrls.contains(origPcdn))
+            assertTrue("Official backup must precede PCDN fallback", session.backupUrls.indexOf(incomingOfficial) < session.backupUrls.indexOf(origPcdn))
+        } finally {
+            BtrSessionManager.remove(sid)
+        }
+
+        // Promoted MCDN/PCDN session keeps previous primary as tail fallback & merges earlier backups
+        val mcdnPrimary = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/44402.m4s?os=mcdn&deadline=1900000000"
+        val otherRelay = "https://xy9y8y7y6xy.mcdn.bilivideo.cn/upgcxcode/54/12/44402.m4s?os=mcdn&deadline=1900000000"
+        val promotedUpos = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/44402.m4s?deadline=1900000000"
+        val relaySid = BtrSessionManager.register(primaryUrl = mcdnPrimary, backupUrls = listOf(otherRelay))
+        try {
+            BtrSessionManager.updateBackups(relaySid, listOf("https://xy5z5z5z5xy.mcdn.bilivideo.cn/upgcxcode/54/12/44402.m4s?os=mcdn"))
+            assertTrue(
+                "Relay-only updateBackups must accumulate prior relay fallback",
+                BtrSessionManager.get(relaySid)!!.backupUrls.contains(otherRelay)
+            )
+            BtrSessionManager.updateBackups(relaySid, listOf(promotedUpos))
+            val promotedSession = BtrSessionManager.get(relaySid)!!
+            assertEquals(promotedUpos, promotedSession.primaryUrl)
+            assertTrue("Previous MCDN primary must stay preserved as tail fallback after promotion", promotedSession.backupUrls.contains(mcdnPrimary))
+            assertTrue("Existing relay backup must stay preserved after promotion", promotedSession.backupUrls.contains(otherRelay))
+        } finally {
+            BtrSessionManager.remove(relaySid)
+        }
+    }
 }

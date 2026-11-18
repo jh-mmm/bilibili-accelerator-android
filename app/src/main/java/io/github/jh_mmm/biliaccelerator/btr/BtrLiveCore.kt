@@ -153,13 +153,11 @@ class BtrLiveHostPool(
 object BtrLiveCore {
 
     /**
-     * BTR 原版已知 fMP4 HLS 官方镜像集群（支持同源签名跨节点拉取）
+     * BTR 已知国内 fMP4 HLS 官方镜像集群（支持同源签名跨节点拉取，仅保留国内节点避免跨境高延迟或断联）
      */
     val KNOWN_FMP4_HOSTS = listOf(
         "d1--cn-gotcha204.bilivideo.com",
-        "d1--cn-gotcha208.bilivideo.com",
-        "d1--ov-gotcha208.bilivideo.com",
-        "d1--ov-gotcha208b.bilivideo.com"
+        "d1--cn-gotcha208.bilivideo.com"
     )
 
     private val LIVE_HOST_REGEX = Regex("""(?:\.|^)bilivideo\.(com|cn|net)$""", RegexOption.IGNORE_CASE)
@@ -318,20 +316,52 @@ object BtrLiveCore {
         return ParsedM3u8(mapUrl = mapUrl, segments = segments, lastNum = lastNum)
     }
 
+    private fun stripPortFromAuthority(authority: String): String {
+        val trimmed = authority.trim()
+        if (trimmed.startsWith("[")) {
+            val closeIdx = trimmed.indexOf(']')
+            return if (closeIdx > 0) trimmed.substring(0, closeIdx + 1) else trimmed
+        }
+        return if (trimmed.count { it == ':' } == 1) trimmed.substringBefore(':') else trimmed
+    }
+
     fun swapHost(originalUrl: String, newHost: String): String {
         val normalized = unwrapProxyUrl(originalUrl).ifBlank { originalUrl }
+        val cleanNewAuth = BiliAcceleratorCore.cleanHost(newHost)
+        if (cleanNewAuth.isBlank()) return normalized
+        val newHostOnly = stripPortFromAuthority(cleanNewAuth)
+        val hasExplicitPort = cleanNewAuth != newHostOnly
+
+        // 1. Android 运行时优先使用 Uri.Builder.encodedAuthority 保留原始百分比编码（如 %2F/%2B/%3D），防止破坏直播鉴权签名
+        val androidUri = runCatching { android.net.Uri.parse(normalized) }.getOrNull()
+        val androidHost = runCatching { androidUri?.host }.getOrNull()
+        if (androidUri != null && !androidHost.isNullOrBlank()) {
+            if ((!hasExplicitPort && newHostOnly.equals(androidHost, ignoreCase = true)) ||
+                cleanNewAuth.equals(androidUri.encodedAuthority, ignoreCase = true)
+            ) {
+                return normalized
+            }
+            return androidUri.buildUpon()
+                .encodedAuthority(cleanNewAuth)
+                .build()
+                .toString()
+        }
+
+        // 2. JVM 单元测试回退：直接拼接 rawPath / rawQuery / rawFragment，严禁调用会解码重编码的 7 参 URI(...) 构造器
         return try {
             val uri = URI(normalized)
-            val targetPort = if (newHost.equals(uri.host, ignoreCase = true)) uri.port else -1
-            URI(
-                uri.scheme,
-                uri.userInfo,
-                newHost,
-                targetPort, // 跨节点切换时移除异源特殊端口；同主机回落时保留端口
-                uri.path,
-                uri.query,
-                uri.fragment
-            ).toASCIIString()
+            val origHost = uri.host ?: return normalized
+            if ((!hasExplicitPort && newHostOnly.equals(origHost, ignoreCase = true)) ||
+                cleanNewAuth.equals(uri.rawAuthority, ignoreCase = true)
+            ) {
+                return normalized
+            }
+            val scheme = uri.scheme ?: "https"
+            val userInfoPrefix = uri.rawUserInfo?.takeIf { it.isNotEmpty() }?.let { "$it@" } ?: ""
+            val rawPath = uri.rawPath.orEmpty()
+            val rawQuery = uri.rawQuery?.let { "?$it" } ?: ""
+            val rawFragment = uri.rawFragment?.let { "#$it" } ?: ""
+            "$scheme://$userInfoPrefix$cleanNewAuth$rawPath$rawQuery$rawFragment"
         } catch (_: Throwable) {
             normalized
         }
@@ -343,21 +373,29 @@ object BtrLiveCore {
     fun guessNextSegmentUrl(lastSeg: LiveSegment): String? {
         if (lastSeg.num <= 0L) return null
         val nextNum = lastSeg.num + 1L
+        val regex = Regex("""(\d+)(\.m4s)$""", RegexOption.IGNORE_CASE)
+
+        val androidUri = runCatching { android.net.Uri.parse(lastSeg.url) }.getOrNull()
+        val androidRawPath = runCatching { androidUri?.encodedPath }.getOrNull()
+        if (androidUri != null && !androidRawPath.isNullOrBlank()) {
+            val replacedPath = regex.replace(androidRawPath) { "$nextNum${it.groupValues[2]}" }
+            if (replacedPath == androidRawPath) return null
+            return androidUri.buildUpon()
+                .encodedPath(replacedPath)
+                .build()
+                .toString()
+        }
+
         return try {
             val uri = URI(lastSeg.url)
             val path = uri.rawPath ?: return null
-            val regex = Regex("""(\d+)(\.m4s)$""", RegexOption.IGNORE_CASE)
             val replacedPath = regex.replace(path) { "$nextNum${it.groupValues[2]}" }
             if (replacedPath == path) return null
-            URI(
-                uri.scheme,
-                uri.userInfo,
-                uri.host,
-                uri.port,
-                replacedPath,
-                uri.rawQuery,
-                uri.rawFragment
-            ).toASCIIString()
+            val scheme = uri.scheme ?: "https"
+            val rawAuth = uri.rawAuthority ?: return null
+            val rawQuery = uri.rawQuery?.let { "?$it" } ?: ""
+            val rawFragment = uri.rawFragment?.let { "#$it" } ?: ""
+            "$scheme://$rawAuth$replacedPath$rawQuery$rawFragment"
         } catch (_: Throwable) {
             null
         }
