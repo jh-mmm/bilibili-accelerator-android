@@ -918,8 +918,13 @@ object BtrSessionManager {
         if (!path.contains("/upgcxcode/")) return emptyList()
 
         val host = uri.host.lowercase().substringBefore(':')
-        // 中继地址、DRM 加密流、hdnts 绑定签名流与 bstarstatic.com 区域专属流严禁合成普通 UPOS 镜像
-        if (primaryUrl.contains("hdnts=", ignoreCase = true) ||
+        val bareHost = host.removeSurrounding("[", "]")
+        // 本地回环地址、中继地址、DRM 加密流、hdnts 绑定签名流与 bstarstatic.com 区域专属流严禁合成普通 UPOS 镜像
+        if (bareHost == "127.0.0.1" ||
+            bareHost == "localhost" ||
+            bareHost == "::1" ||
+            bareHost == "0:0:0:0:0:0:0:1" ||
+            primaryUrl.contains("hdnts=", ignoreCase = true) ||
             BiliAcceleratorCore.isRelayUrl(primaryUrl) ||
             path.startsWith("/v1/resource/") ||
             BiliAcceleratorCore.hasDrmSignal(primaryUrl) ||

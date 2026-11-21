@@ -2356,4 +2356,109 @@ class BtrEngineTest {
             backupThread.interrupt()
         }
     }
+
+    @Test
+    fun testLoopbackDoesNotSynthesizePublicMirrorsAndChunk403FollowedByBackup404StillRefreshes() {
+        assertTrue(
+            "Loopback 127.0.0.1 must not synthesize public UPOS mirrors",
+            BtrSessionManager.synthesizeCompatibleBackups("http://127.0.0.1:8080/upgcxcode/88/77/test.m4s?deadline=1900000000").isEmpty()
+        )
+        assertTrue(
+            "Loopback localhost must not synthesize public UPOS mirrors",
+            BtrSessionManager.synthesizeCompatibleBackups("http://localhost:8080/upgcxcode/88/77/test.m4s?deadline=1900000000").isEmpty()
+        )
+
+        val fullVideo = ByteArray(140_000) { ((it * 17 + 3) and 0xFF).toByte() }
+        val expired = AtomicInteger(0)
+        val primaryServer = ServerSocket(0, 8, java.net.InetAddress.getByName("127.0.0.1"))
+        val backup404Server = ServerSocket(0, 8, java.net.InetAddress.getByName("127.0.0.1"))
+
+        val tPrimary = Thread {
+            while (!primaryServer.isClosed) {
+                val sock = try { primaryServer.accept() } catch (_: Throwable) { break }
+                Thread {
+                    sock.use { s ->
+                        val reader = s.getInputStream().bufferedReader()
+                        val reqLine = reader.readLine() ?: return@use
+                        var rangeHdr = ""
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                            if (line.startsWith("Range:", ignoreCase = true)) {
+                                rangeHdr = line.substringAfter(':').trim()
+                            }
+                        }
+                        val out = s.getOutputStream()
+                        if (expired.get() == 1 && !reqLine.contains("fresh=ok")) {
+                            out.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                            out.flush()
+                            return@use
+                        }
+                        val parts = rangeHdr.removePrefix("bytes=").split("-")
+                        val start = parts.getOrNull(0)?.toIntOrNull() ?: 0
+                        val end = minOf(parts.getOrNull(1)?.toIntOrNull() ?: (fullVideo.size - 1), fullVideo.size - 1)
+                        val len = (end - start + 1).coerceAtLeast(0)
+                        val hdr = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes $start-$end/${fullVideo.size}\r\nContent-Length: $len\r\nConnection: close\r\n\r\n"
+                        out.write(hdr.toByteArray())
+                        out.write(fullVideo, start, len)
+                        out.flush()
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val tBackup404 = Thread {
+            while (!backup404Server.isClosed) {
+                val sock = try { backup404Server.accept() } catch (_: Throwable) { break }
+                Thread {
+                    sock.use { s ->
+                        val reader = s.getInputStream().bufferedReader()
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                        }
+                        val out = s.getOutputStream()
+                        out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                        out.flush()
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+        }.apply { isDaemon = true; start() }
+
+        var sid = ""
+        try {
+            BtrLocalProxyServer.start()
+            val port = BtrLocalProxyServer.port
+            val nowSec = System.currentTimeMillis() / 1000L
+            val initialPrimary = "http://127.0.0.1:${primaryServer.localPort}/upgcxcode/88/77/mixed403404.m4s?deadline=${nowSec + 600}"
+            val backup404 = "http://localhost:${backup404Server.localPort}/upgcxcode/88/77/mixed403404.m4s?deadline=${nowSec + 600}"
+            val refreshedPrimary = "http://127.0.0.1:${primaryServer.localPort}/upgcxcode/88/77/mixed403404.m4s?deadline=${nowSec + 3600}&fresh=ok"
+
+            sid = BtrSessionManager.register(initialPrimary, listOf(backup404))
+            BtrSessionManager.attachRefreshProvider(sid) {
+                BtrSessionManager.refreshSignatureIfSamePath(refreshedPrimary, emptyList())
+                true
+            }
+
+            // Warm totalLength metadata
+            val cInit = java.net.URL("http://127.0.0.1:$port/stream/$sid/v.m4s").openConnection() as java.net.HttpURLConnection
+            cInit.setRequestProperty("Range", "bytes=0-1023")
+            assertEquals(206, cInit.responseCode)
+            assertEquals(1024, cInit.inputStream.use { it.readBytes() }.size)
+
+            // Expire primary (403) while backup returns 404 -> sawForbidden403 must still trigger refresh
+            expired.set(1)
+            val cSeek = java.net.URL("http://127.0.0.1:$port/stream/$sid/v.m4s").openConnection() as java.net.HttpURLConnection
+            cSeek.setRequestProperty("Range", "bytes=70000-110000")
+            assertEquals(206, cSeek.responseCode)
+            val received = cSeek.inputStream.use { it.readBytes() }
+            assertTrue(fullVideo.copyOfRange(70_000, 110_001).contentEquals(received))
+        } finally {
+            if (sid.isNotBlank()) BtrSessionManager.remove(sid)
+            runCatching { primaryServer.close() }
+            runCatching { backup404Server.close() }
+            tPrimary.interrupt()
+            tBackup404.interrupt()
+        }
+    }
 }

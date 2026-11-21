@@ -2188,13 +2188,14 @@ object BtrChunkEngine {
                 (session.unmeasuredTrialWaited.incrementAndGet() % 4 == 0)
             )
         val lastHttpCode = AtomicInteger(0)
+        val sawForbidden403 = AtomicBoolean(false)
         var didRefresh403 = false
         val triedUrlsInPiece = java.util.Collections.synchronizedSet(HashSet<String>())
         var round = 0
 
         while (round < PIECE_ROUNDS) {
             if (isClientAborted.get() || task.isSuccess) break
-            if (round > 0 && lastHttpCode.get() != 403) {
+            if (round > 0 && !sawForbidden403.get() && lastHttpCode.get() != 403) {
                 concurrencyController?.onSlow()
             }
 
@@ -2285,6 +2286,7 @@ object BtrChunkEngine {
                                     counterpartCallHolder = primaryCallRef,
                                     streamCallKey = streamCallKey,
                                     lastHttpCode = lastHttpCode,
+                                    sawForbidden403 = sawForbidden403,
                                     isClientAborted = isClientAborted
                                 )
                             }
@@ -2308,6 +2310,7 @@ object BtrChunkEngine {
                     counterpartCallHolder = hedgeCallRef,
                     streamCallKey = streamCallKey,
                     lastHttpCode = lastHttpCode,
+                    sawForbidden403 = sawForbidden403,
                     isClientAborted = isClientAborted
                 )
             } finally {
@@ -2334,7 +2337,7 @@ object BtrChunkEngine {
                 }
                 for (url in remainingUrls) {
                     if (isClientAborted.get() || task.isSuccess) break
-                    if (lastHttpCode.get() == 403 && isUrlExpired(session) && didRefresh403) break
+                    if ((sawForbidden403.get() || lastHttpCode.get() == 403) && isUrlExpired(session) && didRefresh403) break
                     triedUrlsInPiece.add(url)
                     val singleCallRef = AtomicReference<Call?>(null)
                     tryAttemptFetch(
@@ -2351,6 +2354,7 @@ object BtrChunkEngine {
                         counterpartCallHolder = null,
                         streamCallKey = streamCallKey,
                         lastHttpCode = lastHttpCode,
+                        sawForbidden403 = sawForbidden403,
                         isClientAborted = isClientAborted
                     )
                     if (task.isSuccess) break
@@ -2359,17 +2363,18 @@ object BtrChunkEngine {
 
             if (task.isSuccess || isClientAborted.get()) break
 
-            if (lastHttpCode.get() == 403 && !didRefresh403 &&
+            if ((sawForbidden403.get() || lastHttpCode.get() == 403) && !didRefresh403 &&
                 BtrSessionManager.maybeTriggerProactiveRefresh(session, forceOnAuthFailure = true)
             ) {
                 didRefresh403 = true
+                sawForbidden403.set(false)
                 lastHttpCode.set(0)
                 triedUrlsInPiece.clear()
                 continue
             }
 
             if (round + 1 < PIECE_ROUNDS) {
-                if (lastHttpCode.get() == 403 && isUrlExpired(session)) {
+                if ((sawForbidden403.get() || lastHttpCode.get() == 403) && isUrlExpired(session)) {
                     task.lastHttpCode = 403
                     break
                 }
@@ -2389,7 +2394,7 @@ object BtrChunkEngine {
 
         // 最终直连兜底尝试
         val latestUrls = session.currentCandidateUrls()
-        if (!task.isSuccess && !isClientAborted.get() && latestUrls.isNotEmpty() && !(lastHttpCode.get() == 403 && isUrlExpired(session))) {
+        if (!task.isSuccess && !isClientAborted.get() && latestUrls.isNotEmpty() && !((sawForbidden403.get() || lastHttpCode.get() == 403) && isUrlExpired(session))) {
             val sortedFallback = sortUrlsByHealthAndSpeed(latestUrls, task.index, session)
             val fallbackCandidate = sortedFallback.firstOrNull { u ->
                 val h = extractHostname(u)
@@ -2409,7 +2414,7 @@ object BtrChunkEngine {
         }
 
         if (!task.isSuccess && !isClientAborted.get()) {
-            task.lastHttpCode = lastHttpCode.get()
+            task.lastHttpCode = if (sawForbidden403.get()) 403 else lastHttpCode.get()
             task.isFailed = true
             task.errorMessage = "All candidate CDNs failed for range ${task.startByte}-${task.endByte}"
         }
@@ -2429,6 +2434,7 @@ object BtrChunkEngine {
         counterpartCallHolder: AtomicReference<Call?>?,
         streamCallKey: String,
         lastHttpCode: AtomicInteger? = null,
+        sawForbidden403: AtomicBoolean? = null,
         isClientAborted: AtomicBoolean? = null
     ) {
         if (hasWinner.get() || task.isSuccess || isClientAborted?.get() == true) return
@@ -2591,6 +2597,9 @@ object BtrChunkEngine {
                     }
                 } else if (code >= 400) {
                     lastHttpCode?.set(code)
+                    if (code == 403) {
+                        sawForbidden403?.set(true)
+                    }
                     val isNodeFault = session.banList.recordHttpFailure(url, host, code)
                     if (code == 412 || code == 429) {
                         concurrencyController?.onPushback()
