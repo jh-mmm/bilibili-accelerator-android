@@ -183,7 +183,7 @@ class StatsProvider : ContentProvider() {
                 .putString(KEY_PROXY_HOST, config.proxyHost)
                 .putBoolean(KEY_BLOCK_PCDN, config.blockPcdn)
                 .putBoolean(KEY_PROXY_MCDN, config.proxyMcdn)
-                .putString(KEY_MCDN_STRATEGY, config.mcdnStrategy)
+                .putString(KEY_MCDN_STRATEGY, BiliAcceleratorCore.normalizeMcdnStrategy(config.mcdnStrategy))
                 .putBoolean(KEY_FORCE_UPOS, config.forceUpos)
                 .putBoolean(KEY_REWRITE_AKAMAI, config.rewriteAkamai)
                 .putBoolean(KEY_PORT_HEURISTIC, config.portHeuristic)

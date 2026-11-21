@@ -657,6 +657,7 @@ object BtrLiveEngine {
             val startTime = System.currentTimeMillis()
             val call = BtrHttpClient.client.newCall(req)
             state.activeCalls.add(call)
+            var headersSent = false
             try {
                 call.execute().use { resp ->
                     if (!resp.isSuccessful) {
@@ -690,6 +691,7 @@ object BtrLiveEngine {
                         headerBuilder.append("Content-Length: ${bodyBytes.size}\r\n")
                         headerBuilder.append("$connHeader\r\n\r\n")
 
+                        headersSent = true
                         clientOut.write(headerBuilder.toString().toByteArray(Charsets.US_ASCII))
                         if (!isHeadOnly) {
                             clientOut.write(bodyBytes)
@@ -741,6 +743,7 @@ object BtrLiveEngine {
                     headerBuilder.append("Content-Length: ${bodyBytes.size}\r\n")
                     headerBuilder.append("$connHeader\r\n\r\n")
 
+                    headersSent = true
                     clientOut.write(headerBuilder.toString().toByteArray(Charsets.US_ASCII))
                     if (!isHeadOnly) {
                         clientOut.write(bodyBytes)
@@ -749,6 +752,10 @@ object BtrLiveEngine {
                     return keepAlive
                 }
             } catch (t: Throwable) {
+                if (headersSent) {
+                    Log.i(TAG, "Live playlist client write interrupted on $candHost: ${t.message}")
+                    return false
+                }
                 lastErrorCode = 502
                 lastErrorMessage = "Bad Gateway - Live Playlist Unreachable"
                 if (candHost.isNotBlank()) pool.failure(candHost, 0L)
@@ -996,6 +1003,7 @@ object BtrLiveEngine {
         val targetUrl = BtrLiveCore.unwrapProxyUrl(rawTargetUrl).ifBlank { rawTargetUrl }
 
         state.urgentInflight.incrementAndGet()
+        var headersSent = false
         return try {
             val segment = downloadLiveSegment(
                 session = session,
@@ -1016,6 +1024,7 @@ object BtrLiveEngine {
                 headerBuilder.append("Connection: close\r\n\r\n")
             }
 
+            headersSent = true
             clientOut.write(headerBuilder.toString().toByteArray(Charsets.US_ASCII))
             if (!isHeadOnly) {
                 clientOut.write(segment.bytes)
@@ -1023,8 +1032,12 @@ object BtrLiveEngine {
             clientOut.flush()
             keepAlive
         } catch (t: Throwable) {
-            Log.e(TAG, "Failed to serve live segment: ${t.message}")
-            sendError(clientOut, 502, "Bad Gateway - Live Segment Unreachable")
+            if (headersSent) {
+                Log.i(TAG, "Live segment client write interrupted: ${t.message}")
+            } else {
+                Log.e(TAG, "Failed to serve live segment: ${t.message}")
+                sendError(clientOut, 502, "Bad Gateway - Live Segment Unreachable")
+            }
             false
         } finally {
             if (state.urgentInflight.decrementAndGet() == 0) {

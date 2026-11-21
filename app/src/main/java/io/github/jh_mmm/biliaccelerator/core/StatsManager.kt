@@ -532,7 +532,7 @@ object StatsManager {
         sb.appendLine("【当前配置】")
         sb.appendLine("加速开关: ${if (config.enabled) "已启用" else "已关闭"}")
         sb.appendLine("首选 UPOS 镜像: ${config.targetHost}")
-        sb.appendLine("MCDN 官方代理: ${if (config.proxyMcdn) "开启 (中继: ${config.proxyHost}, 策略: ${config.mcdnStrategy})" else "关闭"}")
+        sb.appendLine("MCDN 官方代理: ${if (config.proxyMcdn) "开启 (中继: ${config.proxyHost}, 策略: ${BiliAcceleratorCore.normalizeMcdnStrategy(config.mcdnStrategy)})" else "关闭"}")
         sb.appendLine("PCDN 拦截: ${if (config.blockPcdn) "已开启" else "已关闭"}")
         sb.appendLine("强制统一线路: ${if (config.forceUpos) "开启" else "关闭"}")
         sb.appendLine("端口启发式: ${if (config.portHeuristic) "开启" else "关闭"}")

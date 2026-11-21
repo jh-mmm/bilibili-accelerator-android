@@ -1037,5 +1037,12 @@ class BiliAcceleratorCoreTest {
         )
         assertTrue("Clean UPOS backup must appear before relay fallback", backups.indexOf(cleanUpos) < backups.indexOf(relayUrl))
         assertTrue("Original relay backup must remain intact instead of UPOS host swap", backups.contains(relayUrl))
+
+        val diag = StatsManager.buildDiagnosticReport(
+            defaultConfig.copy(proxyMcdn = true, mcdnStrategy = "replace"),
+            "2.0.0-preview.3 (200)"
+        )
+        assertTrue("Diagnostic report must normalize legacy replace strategy to proxy-all", diag.contains("策略: proxy-all"))
+        assertFalse("Diagnostic report must not display removed replace strategy", diag.contains("策略: replace"))
     }
 }

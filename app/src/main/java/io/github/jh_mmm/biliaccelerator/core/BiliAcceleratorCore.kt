@@ -30,7 +30,7 @@ data class AcceleratorConfig(
     val proxyHost: String = "proxy-tf-all-ws.bilivideo.com",
     val blockPcdn: Boolean = true,
     val proxyMcdn: Boolean = true,
-    val mcdnStrategy: String = "proxy-all", // proxy-all | proxy-v1 | replace
+    val mcdnStrategy: String = "proxy-all", // proxy-all | proxy-v1
     val forceUpos: Boolean = false,
     val rewriteAkamai: Boolean = false,
     val portHeuristic: Boolean = true,

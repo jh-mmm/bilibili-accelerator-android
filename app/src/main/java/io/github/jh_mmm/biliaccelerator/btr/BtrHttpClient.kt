@@ -8,7 +8,7 @@ import java.util.concurrent.TimeUnit
 
 object BtrHttpClient {
 
-    // 连接池复用：支持高达 32 个空闲 HTTP/2 或 Keep-Alive 连接，保持 5 分钟活性
+    // 连接池复用：支持高达 32 个空闲 HTTP/1.1 Keep-Alive 连接，保持 5 分钟活性
     private val connectionPool = ConnectionPool(
         maxIdleConnections = 32,
         keepAliveDuration = 5,

@@ -2209,4 +2209,151 @@ class BtrEngineTest {
             BtrSessionManager.remove(relaySid)
         }
     }
+
+    @Test
+    fun testLivePipePlaylistAndSegmentDoNotRetryOrSend502AfterHeadersSent() {
+        val m3u8Body = "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:2.0,\nseg0.ts\n"
+        val primaryHits = java.util.concurrent.atomic.AtomicInteger(0)
+        val backupHits = java.util.concurrent.atomic.AtomicInteger(0)
+
+        fun startM3u8Server(hits: java.util.concurrent.atomic.AtomicInteger): Pair<java.net.ServerSocket, Thread> {
+            val ss = java.net.ServerSocket(0, 8, java.net.InetAddress.getByName("127.0.0.1"))
+            val t = Thread {
+                while (!ss.isClosed) {
+                    try {
+                        val s = ss.accept()
+                        hits.incrementAndGet()
+                        s.use {
+                            val br = java.io.BufferedReader(java.io.InputStreamReader(it.getInputStream()))
+                            while (true) {
+                                val line = br.readLine() ?: break
+                                if (line.isEmpty()) break
+                            }
+                            val bodyBytes = m3u8Body.toByteArray(Charsets.UTF_8)
+                            val resp = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: ${bodyBytes.size}\r\nConnection: close\r\n\r\n"
+                            val out = it.getOutputStream()
+                            out.write(resp.toByteArray(Charsets.US_ASCII))
+                            out.write(bodyBytes)
+                            out.flush()
+                        }
+                    } catch (_: Throwable) {
+                        break
+                    }
+                }
+            }.apply { isDaemon = true; start() }
+            return ss to t
+        }
+
+        val (primarySs, primaryThread) = startM3u8Server(primaryHits)
+        val (backupSs, backupThread) = startM3u8Server(backupHits)
+        var sid = ""
+        try {
+            val primaryUrl = "http://127.0.0.1:${primarySs.localPort}/live-bvc/100/index.m3u8"
+            val backupUrl = "http://localhost:${backupSs.localPort}/live-bvc/100/index.m3u8"
+            sid = BtrSessionManager.register(
+                primaryUrl = primaryUrl,
+                backupUrls = listOf(backupUrl),
+                isLive = true
+            )
+            val session = BtrSessionManager.get(sid)!!
+            session.liveHostPool!!.success("localhost", 10.0, 0.0)
+            session.liveHostUrls["127.0.0.1"] = primaryUrl
+            session.liveHostUrls["localhost"] = backupUrl
+
+            val playlistCapture = java.io.ByteArrayOutputStream()
+            val failOnSecondWritePlaylist = object : java.io.OutputStream() {
+                private var writes = 0
+                override fun write(b: Int) {
+                    playlistCapture.write(b)
+                }
+                override fun write(b: ByteArray, off: Int, len: Int) {
+                    writes++
+                    if (writes == 2) {
+                        throw java.io.IOException("Simulated client disconnect mid-playlist")
+                    }
+                    playlistCapture.write(b, off, len)
+                }
+            }
+
+            val playlistKeepAlive = BtrLiveEngine.pipePlaylist(
+                session = session,
+                requestPath = "/stream/$sid.m3u8",
+                headers = emptyMap(),
+                clientOut = failOnSecondWritePlaylist,
+                proxyPort = 18080,
+                keepAlive = true
+            )
+            assertFalse("Client disconnect after headers must close connection", playlistKeepAlive)
+            assertEquals("Primary host must be hit once", 1, primaryHits.get())
+            assertEquals("Must NOT retry backup host after headers were sent", 0, backupHits.get())
+            val primaryStatus = session.liveHostPool!!.status().firstOrNull { it.host == "127.0.0.1" }?.state
+            assertEquals("Healthy upstream must NOT be penalized for client disconnect", "healthy", primaryStatus)
+            val playlistText = playlistCapture.toString("US-ASCII")
+            assertTrue("Playlist headers must contain 200 OK", playlistText.startsWith("HTTP/1.1 200 OK"))
+            assertFalse("Must NOT append 502 after 200 OK headers", playlistText.contains("502"))
+
+            // Part B: pipeSegment client disconnect after headers sent must NOT append 502
+            val segUrl = "http://127.0.0.1:${primarySs.localPort}/live-bvc/100/seg1.m4s"
+            BtrLiveEngine.putCacheForTest(
+                segUrl,
+                CachedLiveSegment(byteArrayOf(1, 2, 3, 4), "video/iso.segment", "127.0.0.1"),
+                sid
+            )
+            val segCapture = java.io.ByteArrayOutputStream()
+            val failOnSecondWriteSeg = object : java.io.OutputStream() {
+                private var writes = 0
+                override fun write(b: Int) {
+                    segCapture.write(b)
+                }
+                override fun write(b: ByteArray, off: Int, len: Int) {
+                    writes++
+                    if (writes == 2) {
+                        throw java.io.IOException("Simulated client disconnect mid-segment")
+                    }
+                    segCapture.write(b, off, len)
+                }
+            }
+            val encodedSeg = java.net.URLEncoder.encode(segUrl, "UTF-8")
+            val segKeepAlive = BtrLiveEngine.pipeSegment(
+                session = session,
+                requestPath = "/stream/$sid/segment.m4s?url=$encodedSeg",
+                headers = emptyMap(),
+                clientOut = failOnSecondWriteSeg,
+                keepAlive = true
+            )
+            assertFalse("Segment disconnect after headers must close connection", segKeepAlive)
+            val segText = segCapture.toString("US-ASCII")
+            assertTrue("Segment headers must contain 200 OK", segText.startsWith("HTTP/1.1 200 OK"))
+            assertFalse("Segment must NOT append 502 after 200 OK headers", segText.contains("502"))
+
+            // Part C: pipeSegment upstream failure BEFORE headers sent MUST still return standard HTTP 502
+            val errOut = java.io.ByteArrayOutputStream()
+            val deadPort = java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1")).use { it.localPort }
+            val missingSegUrl = "http://127.0.0.1:$deadPort/live-bvc/100/missing.m4s"
+            val deadSid = BtrSessionManager.register(primaryUrl = missingSegUrl, isLive = true)
+            try {
+                val deadSession = BtrSessionManager.get(deadSid)!!
+                val errKeepAlive = BtrLiveEngine.pipeSegment(
+                    session = deadSession,
+                    requestPath = "/stream/$deadSid/segment.m4s?url=${java.net.URLEncoder.encode(missingSegUrl, "UTF-8")}",
+                    headers = emptyMap(),
+                    clientOut = errOut,
+                    keepAlive = true
+                )
+                assertFalse(errKeepAlive)
+                assertTrue(
+                    "Upstream failure before headers must return HTTP/1.1 502",
+                    errOut.toString("US-ASCII").startsWith("HTTP/1.1 502")
+                )
+            } finally {
+                BtrSessionManager.remove(deadSid)
+            }
+        } finally {
+            if (sid.isNotBlank()) BtrSessionManager.remove(sid)
+            runCatching { primarySs.close() }
+            runCatching { backupSs.close() }
+            primaryThread.interrupt()
+            backupThread.interrupt()
+        }
+    }
 }
